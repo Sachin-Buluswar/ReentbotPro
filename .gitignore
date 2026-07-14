@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.eggs/
+*.egg
+.python-version
+
+# Tools / caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.tox/
+.nox/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.dmypy.json
+dmypy.json
+
+# Environment / secrets
+.env*
+.reentbotpro/
+/config.json
+/auth.json
+
+# OS
+.DS_Store
+._*
+
+# Audit output (may contain sensitive findings)
+findings/
+findings-*/
+findings-*.log
+*.log
+perf-run-logs/
+/report.md
+/findings.json
+/campaign/
+/experiments/
+
+# Keys
+*.pem
+*.key
+*.p12
+*.pfx
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code
+.claude/
