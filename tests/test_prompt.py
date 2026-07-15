@@ -261,7 +261,7 @@ class PromptCapitalGuidanceTests(unittest.TestCase):
         # The live/fork RPC model is Alchemy/Etherscan-first and chain-aware:
         #   (a) endpoints derive per chain from the Alchemy key + recorded chain,
         #   (b) ETH_RPC_URL / --rpc-url is only an explicit override,
-        #   (c) neither ETH_RPC_URL nor --chain is required for live tools,
+        #   (c) no run-level target-chain setting exists,
         #   (d) chain assumptions and multi-chain bindings are recorded, and
         #   (e) a scope may span multiple chains (never collapsed to one).
         prompt = build_system_prompt()
@@ -271,17 +271,20 @@ class PromptCapitalGuidanceTests(unittest.TestCase):
         self.assertIn("derives a chain-specific RPC endpoint", collapsed)
         # (b) ETH_RPC_URL / --rpc-url is an explicit override only.
         self.assertIn(
-            "`ETH_RPC_URL` / `--rpc-url` is an explicit override only", prompt
+            "`ETH_RPC_URL` / `--rpc-url` is an explicit endpoint override only",
+            prompt,
         )
-        # (c) Live tools do not require ETH_RPC_URL or --chain.
-        self.assertIn("You do not need `ETH_RPC_URL` or `--chain`", prompt)
+        # (c) The agent discovers per-target chains; no run-level hint exists.
+        self.assertIn("No run-level target-chain setting is required or available", prompt)
+        self.assertNotIn("`--chain`", prompt)
+        self.assertNotIn("the run default", prompt)
         # (d) Chain assumptions and multi-chain bindings are recorded.
         self.assertIn("Record each chain assumption and multi-chain binding", prompt)
         self.assertIn("per-target chain bindings", collapsed)
         # (e) A scope may span multiple chains, never collapsed onto one.
         self.assertIn("A scope may span multiple chains", prompt)
         self.assertIn(
-            "rather than collapsing the run onto a single chain", collapsed
+            "rather than collapsing the run onto a single assumed chain", collapsed
         )
 
     def test_prompt_documents_submission_gate_recovery_path(self):
@@ -430,7 +433,8 @@ class PromptCapitalGuidanceTests(unittest.TestCase):
         # ETH_RPC_URL / --rpc-url is an explicit override only, never the live
         # default.
         self.assertIn(
-            "`ETH_RPC_URL` / `--rpc-url` is an explicit override only", prompt
+            "`ETH_RPC_URL` / `--rpc-url` is an explicit endpoint override only",
+            prompt,
         )
         # Multi-chain bindings are recorded.
         self.assertIn("per-target chain bindings", prompt)

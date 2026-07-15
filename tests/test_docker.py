@@ -192,7 +192,7 @@ class AuditContainerWriteFileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(env["ETH_RPC_URL"], "https://rpc.example")
         self.assertEqual(env["ETHERSCAN_API_KEY"], "etherscan-key")
 
-    async def test_start_passes_alchemy_etherscan_and_default_chain_env(self):
+    async def test_start_passes_rpc_and_provider_credentials(self):
         container = StartRecordingAuditContainer()
 
         with tempfile.TemporaryDirectory() as source_dir:
@@ -201,23 +201,21 @@ class AuditContainerWriteFileTests(unittest.IsolatedAsyncioTestCase):
                 rpc_url="https://rpc.example",
                 alchemy_api_key="alchemy-key",
                 etherscan_api_key="etherscan-key",
-                default_network="base-mainnet",
-                default_chain_id=8453,
             )
 
         env = container.client.containers.run_kwargs["environment"]
         # The legacy ETH_RPC_URL seed still works when an endpoint is supplied.
         self.assertEqual(env["ETH_RPC_URL"], "https://rpc.example")
-        # The persistent credential model + default-chain hints are forwarded.
+        # The persistent credential model is forwarded without chain settings.
         self.assertEqual(env["ALCHEMY_API_KEY"], "alchemy-key")
         self.assertEqual(env["ETHERSCAN_API_KEY"], "etherscan-key")
-        self.assertEqual(env["REENTBOT_DEFAULT_NETWORK"], "base-mainnet")
-        self.assertEqual(env["REENTBOT_DEFAULT_CHAIN_ID"], "8453")
+        self.assertNotIn("REENTBOT_DEFAULT_NETWORK", env)
+        self.assertNotIn("REENTBOT_DEFAULT_CHAIN_ID", env)
 
     async def test_start_without_rpc_still_forwards_alchemy_key(self):
         # A bare Alchemy key with no derived endpoint: the container starts
-        # without ETH_RPC_URL but still receives the key and chain hints so the
-        # agent can derive an endpoint after it infers the chain.
+        # without ETH_RPC_URL but still receives the key so the agent can derive
+        # an endpoint after it infers the chain.
         container = StartRecordingAuditContainer()
 
         with tempfile.TemporaryDirectory() as source_dir:
@@ -225,20 +223,18 @@ class AuditContainerWriteFileTests(unittest.IsolatedAsyncioTestCase):
                 source_dir,
                 rpc_url=None,
                 alchemy_api_key="alchemy-key",
-                default_network="arb-mainnet",
-                default_chain_id="42161",
             )
 
         env = container.client.containers.run_kwargs["environment"]
         self.assertNotIn("ETH_RPC_URL", env)
         self.assertEqual(env["ALCHEMY_API_KEY"], "alchemy-key")
-        self.assertEqual(env["REENTBOT_DEFAULT_NETWORK"], "arb-mainnet")
-        self.assertEqual(env["REENTBOT_DEFAULT_CHAIN_ID"], "42161")
+        self.assertNotIn("REENTBOT_DEFAULT_NETWORK", env)
+        self.assertNotIn("REENTBOT_DEFAULT_CHAIN_ID", env)
 
     async def test_start_no_chain_forwards_both_keys_without_eth_rpc_url(self):
         # The canonical no-chain startup: both keys forwarded so in-container
         # tooling can derive an endpoint later, but no ETH_RPC_URL and no
-        # default-chain hints are injected when no chain is known.
+        # target-chain settings are never injected.
         container = StartRecordingAuditContainer()
 
         with tempfile.TemporaryDirectory() as source_dir:

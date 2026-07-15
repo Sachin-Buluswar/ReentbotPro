@@ -254,14 +254,14 @@ def resolve_alchemy_api_key(
     environ: dict[str, str] | None = None,
     config: dict[str, Any] | None = None,
 ) -> tuple[str | None, str | None]:
-    """Resolve a bare Alchemy API key and a best-effort primary network.
+    """Resolve a bare Alchemy API key and any explicit endpoint network.
 
     Precedence: explicit ``ALCHEMY_API_KEY`` env var, then local config
     (``alchemy_api_key`` or ``api_keys.alchemy``), then the key embedded in a
     resolved or configured Alchemy RPC URL. Returns ``(api_key, network)`` where
     ``network`` is the subdomain parsed from an Alchemy URL when available, else
-    ``None`` (callers default to ``eth-mainnet``). Returns ``(None, None)`` when
-    no Alchemy key can be found.
+    ``None``; callers still bind target chains from per-call/campaign context.
+    Returns ``(None, None)`` when no Alchemy key can be found.
     """
     env = environ if environ is not None else os.environ
     cfg = config if config is not None else load_local_config()
@@ -532,55 +532,6 @@ def normalize_chain_hint(
     return None
 
 
-def resolve_default_chain_hint(
-    *,
-    environ: dict[str, str] | None = None,
-    config: dict[str, Any] | None = None,
-) -> tuple[str | None, int | None, str | None]:
-    """Resolve a run-level default chain hint as ``(network, chain_id, source)``.
-
-    Precedence: ``REENTBOT_DEFAULT_NETWORK`` / ``REENTBOT_DEFAULT_CHAIN_ID`` env
-    vars, then local config ``default_network`` / ``default_chain`` /
-    ``default_chain_id``. This is a *run-level* fallback only — a deliberately
-    weak signal that callers consult after explicit args, fork context, and the
-    chain registry, so a single configured default never collapses a multi-chain
-    scope. Returns ``(None, None, None)`` when no default is configured.
-    """
-    env = environ if environ is not None else os.environ
-    cfg = config if config is not None else load_local_config()
-
-    env_net = _nonempty_string(env.get("REENTBOT_DEFAULT_NETWORK"))
-    env_cid_raw = env.get("REENTBOT_DEFAULT_CHAIN_ID")
-    env_cid = (
-        _nonempty_string(env_cid_raw)
-        if isinstance(env_cid_raw, str)
-        else env_cid_raw
-    )
-    if env_net or env_cid not in (None, ""):
-        network = resolve_alchemy_network(env_net, env_cid)
-        cid = resolve_chain_id(env_net, env_cid)
-        if network or cid is not None:
-            source = (
-                "env:REENTBOT_DEFAULT_NETWORK"
-                if env_net
-                else "env:REENTBOT_DEFAULT_CHAIN_ID"
-            )
-            return network, cid, source
-
-    cfg_net = _nonempty_string(cfg.get("default_network")) or _nonempty_string(
-        cfg.get("default_chain")
-    )
-    cfg_cid = cfg.get("default_chain_id")
-    if cfg_net or cfg_cid is not None:
-        network = resolve_alchemy_network(cfg_net, cfg_cid)
-        cid = resolve_chain_id(cfg_net, cfg_cid)
-        if network or cid is not None:
-            source = "config:default_network" if cfg_net else "config:default_chain_id"
-            return network, cid, source
-
-    return None, None, None
-
-
 # ── Chain-aware RPC endpoint resolution ──────────────────────────────────
 #
 # resolve_rpc_endpoint is the canonical resolver. Given an optional target
@@ -588,8 +539,8 @@ def resolve_default_chain_hint(
 # correct per-chain Alchemy node URL from a bare ALCHEMY_API_KEY, while still
 # honoring explicit overrides (--rpc-url, ETH_RPC_URL, per-chain or top-level
 # config rpc_urls). A bare key is never silently treated as Ethereum mainnet:
-# the caller must supply a chain, configure a default chain, or opt in with
-# allow_default_mainnet=True (which flags the result assumed_default_mainnet).
+# the caller must supply a chain or opt in with allow_default_mainnet=True
+# (which flags the result assumed_default_mainnet).
 #
 # resolve_rpc_url above is the demoted legacy path: explicit overrides only.
 
@@ -697,8 +648,8 @@ def resolve_rpc_endpoint(
     chain-specific config ``rpc_urls`` entry > top-level config
     ``rpc_url``/``eth_rpc_url`` > Alchemy URL derived from a bare key plus the
     resolved chain > (only with ``allow_default_mainnet``) a derived eth-mainnet
-    URL > nothing. The target chain comes from ``network``/``chain_id``, falling
-    back to config ``default_network``/``default_chain``/``default_chain_id``.
+    URL > nothing. The target chain comes only from ``network``/``chain_id``;
+    run-level default-chain configuration is intentionally unsupported.
     """
     env = environ if environ is not None else os.environ
 
@@ -718,18 +669,10 @@ def resolve_rpc_endpoint(
 
     cfg = config if config is not None else load_local_config()
 
-    # Determine the effective chain: explicit args win, then config defaults,
-    # then (only if allowed) an assumed Ethereum mainnet fallback.
+    # Determine the effective chain from explicit args, then (only if allowed)
+    # an assumed Ethereum mainnet fallback.
     effective_network: Any = network
     effective_chain_id: Any = chain_id
-    if effective_network is None and effective_chain_id is None:
-        cfg_network = _nonempty_string(cfg.get("default_network")) or _nonempty_string(
-            cfg.get("default_chain")
-        )
-        cfg_chain_id = cfg.get("default_chain_id")
-        if cfg_network is not None or cfg_chain_id is not None:
-            effective_network = cfg_network
-            effective_chain_id = cfg_chain_id
 
     assumed_default_mainnet = False
     if (

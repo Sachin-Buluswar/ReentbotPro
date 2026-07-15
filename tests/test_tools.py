@@ -22065,7 +22065,7 @@ class AlchemyRedactionTests(unittest.TestCase):
 class AlchemyToolTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         reset_alchemy_runtime()
-        set_alchemy_runtime(_KEY, "eth-mainnet")
+        set_alchemy_runtime(_KEY)
 
     def tearDown(self):
         reset_alchemy_runtime()
@@ -22088,7 +22088,12 @@ class AlchemyToolTests(unittest.IsolatedAsyncioTestCase):
         }
         http = self._http((200, {"jsonrpc": "2.0", "id": 1, "result": frame}))
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
-            out = await execute_tool("trace_onchain_tx", {"tx_hash": _TX_HASH}, container, [])
+            out = await execute_tool(
+                "trace_onchain_tx",
+                {"tx_hash": _TX_HASH, "network": "eth-mainnet"},
+                container,
+                [],
+            )
         digest = json.loads(out)
         self.assertTrue(digest["ok"])
         self.assertEqual(digest["method"], "debug_traceTransaction")
@@ -22107,7 +22112,8 @@ class AlchemyToolTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
             out = await execute_tool(
                 "simulate_call",
-                {"to": _ADDR_B, "data": "0xabcd", "block": "0x10", "state_overrides": overrides},
+                {"to": _ADDR_B, "data": "0xabcd", "block": "0x10",
+                 "state_overrides": overrides, "network": "eth-mainnet"},
                 container, [],
             )
         self.assertTrue(json.loads(out)["ok"])
@@ -22134,9 +22140,19 @@ class AlchemyToolTests(unittest.IsolatedAsyncioTestCase):
         container = FakeContainer()
         http = self._http((403, {"error": {"message": "forbidden"}}))
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
-            out1 = await execute_tool("trace_onchain_tx", {"tx_hash": _TX_HASH}, container, [])
+            out1 = await execute_tool(
+                "trace_onchain_tx",
+                {"tx_hash": _TX_HASH, "network": "eth-mainnet"},
+                container,
+                [],
+            )
             # Same family (trace_debug) + network: must short-circuit, no 2nd call.
-            out2 = await execute_tool("simulate_call", {"to": _ADDR_B}, container, [])
+            out2 = await execute_tool(
+                "simulate_call",
+                {"to": _ADDR_B, "network": "eth-mainnet"},
+                container,
+                [],
+            )
         d1, d2 = json.loads(out1), json.loads(out2)
         self.assertTrue(d1.get("degraded"))
         self.assertEqual(d1["error"], "unavailable")
@@ -22150,7 +22166,8 @@ class AlchemyToolTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
             out = await execute_tool(
                 "enumerate_callers",
-                {"address": _ADDR_A, "from_block": "0x10", "to_block": "0x20"},
+                {"address": _ADDR_A, "from_block": "0x10", "to_block": "0x20",
+                 "network": "eth-mainnet"},
                 container, [],
             )
         digest = json.loads(out)
@@ -22162,7 +22179,12 @@ class AlchemyToolTests(unittest.IsolatedAsyncioTestCase):
         body = {"error": {"code": -32602, "message": "invalid argument: bad block"}}
         http = self._http((200, body))
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
-            out = await execute_tool("state_diff", {"tx_hash": _TX_HASH}, container, [])
+            out = await execute_tool(
+                "state_diff",
+                {"tx_hash": _TX_HASH, "network": "eth-mainnet"},
+                container,
+                [],
+            )
         digest = json.loads(out)
         self.assertEqual(digest["error"], "rpc_error")
         self.assertNotIn("degraded", digest)
@@ -22178,7 +22200,7 @@ class AlchemyToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(digest["network"], "base-mainnet")
         self.assertIn("base-mainnet.g.alchemy.com", http.call_args.args[0])
 
-    async def test_default_network_follows_record_fork_context(self):
+    async def test_inferred_network_follows_record_fork_context(self):
         container = FakeContainer()
         prefix = _CAMPAIGN_ID_PREFIXES["fork_context"]
         container.files["/workspace/campaign/state.json"] = json.dumps(
@@ -22195,12 +22217,7 @@ class AlchemyToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(digest["network"], "arb-mainnet")
         self.assertIn("arb-mainnet.g.alchemy.com", http.call_args.args[0])
 
-    async def test_run_level_default_chain_is_overridden_per_call(self):
-        # A configured run-level default chain (from --chain / default_chain) is
-        # only a fallback, never a lock: an explicit per-call network for a
-        # DIFFERENT chain still wins, so a multi-chain scope is not pinned.
-        reset_alchemy_runtime()
-        set_alchemy_runtime(_KEY, "base-mainnet")  # run-level default = Base
+    async def test_explicit_per_call_chain_selects_requested_network(self):
         container = FakeContainer()
         http = self._http((200, {"result": {"name": "X", "symbol": "X", "decimals": 18}}))
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
@@ -22215,7 +22232,12 @@ class AlchemyToolTests(unittest.IsolatedAsyncioTestCase):
         container = FakeContainer()
         http = self._http((200, {"result": {"type": "CALL", "to": _ADDR_B, "calls": []}}))
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
-            await execute_tool("trace_onchain_tx", {"tx_hash": _TX_HASH}, container, [])
+            await execute_tool(
+                "trace_onchain_tx",
+                {"tx_hash": _TX_HASH, "network": "eth-mainnet"},
+                container,
+                [],
+            )
         self.assertEqual(host_tools_mod._ALCHEMY_USAGE["cu"], 40)
         self.assertEqual(host_tools_mod._ALCHEMY_USAGE["calls"], 1)
 
@@ -22223,10 +22245,20 @@ class AlchemyToolTests(unittest.IsolatedAsyncioTestCase):
         container = FakeContainer()
         http = self._http((200, {"result": {}}))
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
-            bad_hash = await execute_tool("trace_onchain_tx", {"tx_hash": "0x123"}, container, [])
-            missing_to = await execute_tool("simulate_call", {}, container, [])
+            bad_hash = await execute_tool(
+                "trace_onchain_tx",
+                {"tx_hash": "0x123", "network": "eth-mainnet"},
+                container,
+                [],
+            )
+            missing_to = await execute_tool(
+                "simulate_call", {"network": "eth-mainnet"}, container, []
+            )
             missing_block = await execute_tool(
-                "enumerate_callers", {"address": _ADDR_A}, container, []
+                "enumerate_callers",
+                {"address": _ADDR_A, "network": "eth-mainnet"},
+                container,
+                [],
             )
         self.assertEqual(json.loads(bad_hash)["error"], "bad_arguments")
         self.assertEqual(json.loads(missing_to)["error"], "bad_arguments")
@@ -22245,7 +22277,10 @@ class AlchemyToolTests(unittest.IsolatedAsyncioTestCase):
         )
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
             out = await execute_tool(
-                "get_asset_transfers", {"address": _ADDR_A, "direction": "both"}, container, []
+                "get_asset_transfers",
+                {"address": _ADDR_A, "direction": "both", "network": "eth-mainnet"},
+                container,
+                [],
             )
         digest = json.loads(out)
         self.assertTrue(digest["ok"])
@@ -22260,7 +22295,12 @@ class AlchemyToolTests(unittest.IsolatedAsyncioTestCase):
                           "prices": [{"currency": "USD", "value": "1.00"}]}]}
         http = self._http((200, body))
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
-            out = await execute_tool("get_token_prices", {"addresses": [_ADDR_A]}, container, [])
+            out = await execute_tool(
+                "get_token_prices",
+                {"addresses": [_ADDR_A], "network": "eth-mainnet"},
+                container,
+                [],
+            )
         digest = json.loads(out)
         self.assertEqual(digest["prices_usd"][_ADDR_A], "1.00")
         url = http.call_args.args[0]
@@ -22277,7 +22317,12 @@ class AlchemyToolTests(unittest.IsolatedAsyncioTestCase):
         http = self._http((200, body))
         txs = [{"from": _ADDR_A, "to": _ADDR_B, "value": "0x1"}, {"from": _ADDR_B, "to": _ADDR_A}]
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
-            out = await execute_tool("simulate_sequence", {"transactions": txs}, container, [])
+            out = await execute_tool(
+                "simulate_sequence",
+                {"transactions": txs, "network": "eth-mainnet"},
+                container,
+                [],
+            )
         digest = json.loads(out)
         self.assertEqual(digest["tx_count"], 2)
         self.assertEqual(digest["result_count"], 2)
@@ -22294,7 +22339,12 @@ class AlchemyToolTests(unittest.IsolatedAsyncioTestCase):
         }}
         http = self._http((200, {"result": result}))
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
-            out = await execute_tool("state_diff", {"tx_hash": _TX_HASH}, container, [])
+            out = await execute_tool(
+                "state_diff",
+                {"tx_hash": _TX_HASH, "network": "eth-mainnet"},
+                container,
+                [],
+            )
         digest = json.loads(out)
         self.assertEqual(digest["changed_addresses"], 2)
         top = digest["top_changes"][0]
@@ -22306,7 +22356,12 @@ class AlchemyToolTests(unittest.IsolatedAsyncioTestCase):
         container = FakeContainer()
         boom = mock.AsyncMock(side_effect=RuntimeError(f"connect to .../v2/{_KEY} failed"))
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=boom):
-            out = await execute_tool("get_token_info", {"address": _ADDR_A}, container, [])
+            out = await execute_tool(
+                "get_token_info",
+                {"address": _ADDR_A, "network": "eth-mainnet"},
+                container,
+                [],
+            )
         digest = json.loads(out)
         self.assertEqual(digest["error"], "request_failed")
         self.assertNotIn(_KEY, out)
@@ -22329,16 +22384,9 @@ class EtherscanToolTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         reset_etherscan_runtime()
         set_etherscan_runtime(_ETHERSCAN_KEY)
-        # The Etherscan chain id is now resolved, not defaulted to 1. These tests
-        # model a run whose default chain is Ethereum mainnet (set via the shared
-        # Alchemy runtime, where the CLI records the run default), so a
-        # no-network get_contract_source resolves to mainnet intentionally.
-        reset_alchemy_runtime()
-        set_alchemy_runtime(_KEY, "eth-mainnet")
 
     def tearDown(self):
         reset_etherscan_runtime()
-        reset_alchemy_runtime()
 
     @staticmethod
     def _http(*responses):
@@ -22362,12 +22410,17 @@ class EtherscanToolTests(unittest.IsolatedAsyncioTestCase):
         }]
         http = self._http(self._ok(result))
         with mock.patch.object(host_tools_mod, "_etherscan_http_get", new=http):
-            out = await execute_tool("get_contract_source", {"address": _ADDR_A}, container, [])
+            out = await execute_tool(
+                "get_contract_source",
+                {"address": _ADDR_A, "network": "eth-mainnet"},
+                container,
+                [],
+            )
         digest = json.loads(out)
         self.assertTrue(digest["ok"])
         self.assertTrue(digest["is_verified"])
         self.assertEqual(digest["contract_name"], "Vault")
-        self.assertEqual(digest["chain_id"], 1)  # default mainnet
+        self.assertEqual(digest["chain_id"], 1)
         self.assertFalse(digest["is_proxy"])
         # Request shape
         params = http.call_args.args[1]
@@ -22385,7 +22438,12 @@ class EtherscanToolTests(unittest.IsolatedAsyncioTestCase):
         result = [{"SourceCode": "", "ABI": "Contract source code not verified"}]
         http = self._http(self._ok(result))
         with mock.patch.object(host_tools_mod, "_etherscan_http_get", new=http):
-            out = await execute_tool("get_contract_source", {"address": _ADDR_A}, container, [])
+            out = await execute_tool(
+                "get_contract_source",
+                {"address": _ADDR_A, "network": "eth-mainnet"},
+                container,
+                [],
+            )
         digest = json.loads(out)
         self.assertTrue(digest["ok"])
         self.assertFalse(digest["is_verified"])
@@ -22399,7 +22457,12 @@ class EtherscanToolTests(unittest.IsolatedAsyncioTestCase):
                  "CompilerVersion": "v0.8.20", "Proxy": "0", "Implementation": ""}]
         http = self._http(self._ok(proxy), self._ok(impl))
         with mock.patch.object(host_tools_mod, "_etherscan_http_get", new=http):
-            out = await execute_tool("get_contract_source", {"address": _ADDR_A}, container, [])
+            out = await execute_tool(
+                "get_contract_source",
+                {"address": _ADDR_A, "network": "eth-mainnet"},
+                container,
+                [],
+            )
         digest = json.loads(out)
         self.assertTrue(digest["is_proxy"])
         self.assertEqual(digest["implementation"], _ADDR_B)
@@ -22455,7 +22518,7 @@ class EtherscanToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(out)["error"], "invalid_network")
         http.assert_not_called()
 
-    async def test_default_chain_follows_fork_context(self):
+    async def test_inferred_chain_follows_fork_context(self):
         container = FakeContainer()
         prefix = _CAMPAIGN_ID_PREFIXES["fork_context"]
         container.files["/workspace/campaign/state.json"] = json.dumps(
@@ -22473,8 +22536,8 @@ class EtherscanToolTests(unittest.IsolatedAsyncioTestCase):
 
 class HostToolChainResolutionTests(unittest.IsolatedAsyncioTestCase):
     """Host-side Alchemy/Etherscan tools resolve the target chain from campaign
-    signals — explicit args, fork context, chain-registry binding, run default —
-    and never silently fall back to Ethereum mainnet when no chain is inferred."""
+    signals — explicit args, fork context, and chain-registry binding — and never
+    silently fall back to Ethereum mainnet when no chain is inferred."""
 
     def setUp(self):
         reset_alchemy_runtime()
@@ -22510,7 +22573,7 @@ class HostToolChainResolutionTests(unittest.IsolatedAsyncioTestCase):
     # ── A. No chain inferred -> chain_not_inferred, no request made ──────────
 
     async def test_trace_onchain_tx_no_chain_returns_chain_not_inferred(self):
-        set_alchemy_runtime(_KEY, None)  # key configured, but no run-default chain
+        set_alchemy_runtime(_KEY)
         container = FakeContainer()
         http = self._http((200, {"result": {}}))
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
@@ -22521,7 +22584,7 @@ class HostToolChainResolutionTests(unittest.IsolatedAsyncioTestCase):
         http.assert_not_called()
 
     async def test_get_contract_source_no_chain_returns_chain_not_inferred(self):
-        set_etherscan_runtime(_ETHERSCAN_KEY)  # etherscan key, but no run-default chain
+        set_etherscan_runtime(_ETHERSCAN_KEY)
         container = FakeContainer()
         http = self._http((200, {"status": "1", "message": "OK", "result": [{}]}))
         with mock.patch.object(host_tools_mod, "_etherscan_http_get", new=http):
@@ -22531,7 +22594,7 @@ class HostToolChainResolutionTests(unittest.IsolatedAsyncioTestCase):
         http.assert_not_called()
 
     async def test_observed_tx_miner_no_chain_returns_chain_not_inferred(self):
-        set_alchemy_runtime(_KEY, None)
+        set_alchemy_runtime(_KEY)
         container = FakeContainer()
         http = self._http((200, {"result": []}))
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
@@ -22548,7 +22611,7 @@ class HostToolChainResolutionTests(unittest.IsolatedAsyncioTestCase):
     # ── B. Explicit chain selection always wins ─────────────────────────────
 
     async def test_explicit_chain_id_selects_base(self):
-        set_alchemy_runtime(_KEY, "eth-mainnet")  # run default mainnet; explicit id wins
+        set_alchemy_runtime(_KEY)
         container = FakeContainer()
         http = self._http((200, {"result": {"name": "X", "symbol": "X", "decimals": 18}}))
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
@@ -22560,7 +22623,7 @@ class HostToolChainResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("base-mainnet.g.alchemy.com", http.call_args.args[0])
 
     async def test_explicit_eth_mainnet_is_intentional(self):
-        set_alchemy_runtime(_KEY, "base-mainnet")  # run default base; explicit mainnet wins
+        set_alchemy_runtime(_KEY)
         container = FakeContainer()
         http = self._http((200, {"result": {"name": "X", "symbol": "X", "decimals": 18}}))
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
@@ -22571,22 +22634,10 @@ class HostToolChainResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(digest["network"], "eth-mainnet")
         self.assertIn("eth-mainnet.g.alchemy.com", http.call_args.args[0])
 
-    # ── C. Run-level default chain ──────────────────────────────────────────
-
-    async def test_run_default_chain_drives_host_tool(self):
-        set_alchemy_runtime(_KEY, "base-mainnet")
-        container = FakeContainer()
-        http = self._http((200, {"result": {"name": "X", "symbol": "X", "decimals": 18}}))
-        with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
-            out = await execute_tool("get_token_info", {"address": _ADDR_A}, container, [])
-        digest = json.loads(out)
-        self.assertEqual(digest["network"], "base-mainnet")
-        self.assertIn("base-mainnet.g.alchemy.com", http.call_args.args[0])
-
-    # ── D. Latest recorded fork context (beats run default) ─────────────────
+    # ── C. Latest recorded fork context ──────────────────────────────────────
 
     async def test_latest_fork_context_drives_host_tool(self):
-        set_alchemy_runtime(_KEY, "eth-mainnet")  # run default mainnet; fork context wins
+        set_alchemy_runtime(_KEY)
         container = FakeContainer()
         self._record_fork(container, network="base", chain_id=8453)
         http = self._http((200, {"result": {"type": "CALL", "to": _ADDR_B, "calls": []}}))
@@ -22596,10 +22647,10 @@ class HostToolChainResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(digest["network"], "base-mainnet")
         self.assertIn("base-mainnet.g.alchemy.com", http.call_args.args[0])
 
-    # ── E. Chain-registry target binding (beats run default) ────────────────
+    # ── D. Chain-registry target binding ────────────────────────────────────
 
     async def test_registry_single_chain_binds_target(self):
-        set_alchemy_runtime(_KEY, "eth-mainnet")  # run default mainnet; registry binding wins
+        set_alchemy_runtime(_KEY)
         container = FakeContainer()
         await self._write_registry(container, [
             {"network": "base-mainnet", "chain_id": 8453,
@@ -22613,7 +22664,7 @@ class HostToolChainResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("base-mainnet.g.alchemy.com", http.call_args.args[0])
 
     async def test_registry_multi_chain_target_is_ambiguous(self):
-        set_alchemy_runtime(_KEY, "eth-mainnet")
+        set_alchemy_runtime(_KEY)
         container = FakeContainer()
         await self._write_registry(container, [
             {"network": "base-mainnet", "chain_id": 8453,
@@ -22631,7 +22682,7 @@ class HostToolChainResolutionTests(unittest.IsolatedAsyncioTestCase):
         http.assert_not_called()
 
     async def test_explicit_chain_resolves_registry_ambiguity(self):
-        set_alchemy_runtime(_KEY, "eth-mainnet")
+        set_alchemy_runtime(_KEY)
         container = FakeContainer()
         await self._write_registry(container, [
             {"network": "base-mainnet", "chain_id": 8453, "deployments": [{"address": _ADDR_A}]},
@@ -22646,12 +22697,12 @@ class HostToolChainResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(digest["network"], "arb-mainnet")
         self.assertIn("arb-mainnet.g.alchemy.com", http.call_args.args[0])
 
-    # ── F. Etherscan chain id is inferred, not defaulted to 1 ───────────────
+    # ── E. Etherscan chain id is inferred, not defaulted to 1 ───────────────
 
     async def test_etherscan_uses_inferred_base_chainid(self):
         set_etherscan_runtime(_ETHERSCAN_KEY)
-        set_alchemy_runtime(_KEY, "base-mainnet")  # run default base
         container = FakeContainer()
+        self._record_fork(container, network="base", chain_id=8453)
         body = (200, {"status": "1", "message": "OK", "result": [
             {"SourceCode": "contract X {}", "ABI": "[]", "ContractName": "X",
              "CompilerVersion": "v0.8.20", "Proxy": "0"}]})
@@ -22662,10 +22713,10 @@ class HostToolChainResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(digest["chain_id"], 8453)
         self.assertEqual(http.call_args.args[1]["chainid"], 8453)
 
-    # ── Per-token-network price calls need no single default chain ──────────
+    # ── Per-token-network price calls need no single inferred chain ─────────
 
-    async def test_get_token_prices_per_token_networks_need_no_default(self):
-        set_alchemy_runtime(_KEY, None)  # no run default; per-token networks suffice
+    async def test_get_token_prices_per_token_networks_need_no_single_chain(self):
+        set_alchemy_runtime(_KEY)
         container = FakeContainer()
         body = {"data": [{"network": "base-mainnet", "address": _ADDR_A,
                           "prices": [{"currency": "USD", "value": "2.50"}]}]}
@@ -22773,7 +22824,7 @@ class ObservedTxKeccakTests(unittest.TestCase):
 class ObservedTxMinerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         reset_alchemy_runtime()
-        set_alchemy_runtime(_KEY, "eth-mainnet")
+        set_alchemy_runtime(_KEY)
 
     def tearDown(self):
         reset_alchemy_runtime()
@@ -22829,7 +22880,8 @@ class ObservedTxMinerTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
             out = await execute_tool(
                 "observed_tx_miner",
-                {"address": _ADDR_B, "from_block": "0x10", "to_block": "0x20"},
+                {"address": _ADDR_B, "from_block": "0x10", "to_block": "0x20",
+                 "network": "eth-mainnet"},
                 container, [],
             )
         self.assertEqual(json.loads(out)["error"], "bad_arguments")
@@ -22864,7 +22916,7 @@ class ObservedTxMinerTests(unittest.IsolatedAsyncioTestCase):
                 "observed_tx_miner",
                 {"address": _ADDR_B, "function": "transfer", "abi": abi,
                  "from_block": "0x10", "to_block": "0x3000",
-                 "action_space": "as-001"},
+                 "action_space": "as-001", "network": "eth-mainnet"},
                 container, [],
             )
         digest = json.loads(out)
@@ -22915,7 +22967,7 @@ class ObservedTxMinerTests(unittest.IsolatedAsyncioTestCase):
                 "observed_tx_miner",
                 {"address": _ADDR_B, "selector": "0xa9059cbb",
                  "from_block": "0x10", "to_block": "0x20",
-                 "include_transfers": False},
+                 "include_transfers": False, "network": "eth-mainnet"},
                 container, [],
             )
         digest = json.loads(out)
@@ -22938,7 +22990,8 @@ class ObservedTxMinerTests(unittest.IsolatedAsyncioTestCase):
             out = await execute_tool(
                 "observed_tx_miner",
                 {"address": _ADDR_B, "function": "transfer(address,uint256)",
-                 "from_block": "0x10", "to_block": "0x20", "include_transfers": False},
+                 "from_block": "0x10", "to_block": "0x20", "include_transfers": False,
+                 "network": "eth-mainnet"},
                 container, [],
             )
         sample = json.loads(out)["samples"][0]
@@ -22953,7 +23006,8 @@ class ObservedTxMinerTests(unittest.IsolatedAsyncioTestCase):
             out = await execute_tool(
                 "observed_tx_miner",
                 {"address": _ADDR_B, "selector": "0xa9059cbb",
-                 "from_block": "0x10", "to_block": "0x20"},
+                 "from_block": "0x10", "to_block": "0x20",
+                 "network": "eth-mainnet"},
                 container, [],
             )
         digest = json.loads(out)
@@ -22970,7 +23024,8 @@ class ObservedTxMinerTests(unittest.IsolatedAsyncioTestCase):
             out = await execute_tool(
                 "observed_tx_miner",
                 {"address": _ADDR_B, "selector": "0xa9059cbb",
-                 "from_block": "0x10", "to_block": "0x20"},
+                 "from_block": "0x10", "to_block": "0x20",
+                 "network": "eth-mainnet"},
                 container, [],
             )
         digest = json.loads(out)
@@ -22991,7 +23046,8 @@ class ObservedTxMinerTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(host_tools_mod, "_alchemy_http_post", new=http):
             out = await execute_tool(
                 "observed_tx_miner",
-                {"address": _ADDR_B, "selector": "0xa9059cbb", "include_transfers": False},
+                {"address": _ADDR_B, "selector": "0xa9059cbb", "include_transfers": False,
+                 "network": "eth-mainnet"},
                 container, [],
             )
         digest = json.loads(out)
@@ -23014,7 +23070,8 @@ class ObservedTxMinerTests(unittest.IsolatedAsyncioTestCase):
             out = await execute_tool(
                 "observed_tx_miner",
                 {"address": _ADDR_B, "selector": "0xa9059cbb",
-                 "from_block": "0x10", "to_block": "0x20", "include_transfers": False},
+                 "from_block": "0x10", "to_block": "0x20", "include_transfers": False,
+                 "network": "eth-mainnet"},
                 container, [],
             )
         digest = json.loads(out)
@@ -24926,7 +24983,7 @@ class ResolveToolRpcEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(endpoint.url)
         self.assertEqual(endpoint.source, "ambiguous_chain_registry")
 
-    async def test_fork_context_used_over_run_default(self):
+    async def test_fork_context_used_when_legacy_default_env_is_present(self):
         endpoint = await _resolve_tool_rpc_endpoint(
             FakeContainer(),
             {},
@@ -24940,7 +24997,7 @@ class ResolveToolRpcEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(endpoint.network, "arb-mainnet")
         self.assertEqual(endpoint.source, "fork_context")
 
-    async def test_run_default_used_only_without_better_context(self):
+    async def test_legacy_default_chain_env_is_ignored(self):
         endpoint = await _resolve_tool_rpc_endpoint(
             FakeContainer(),
             {},
@@ -24950,8 +25007,11 @@ class ResolveToolRpcEndpointTests(unittest.IsolatedAsyncioTestCase):
             },
             config={},
         )
-        self.assertEqual(endpoint.network, "base-mainnet")
-        self.assertEqual(endpoint.source, "env:REENTBOT_DEFAULT_NETWORK")
+        self.assertIsNone(endpoint.network)
+        self.assertIsNone(endpoint.chain_id)
+        self.assertIsNone(endpoint.url)
+        self.assertEqual(endpoint.provider, "none")
+        self.assertEqual(endpoint.source, "none")
 
     async def test_no_chain_with_alchemy_key_returns_no_endpoint(self):
         endpoint = await _resolve_tool_rpc_endpoint(
@@ -25473,8 +25533,8 @@ class GeneratedSequenceForkRpcDocsTests(unittest.IsolatedAsyncioTestCase):
 
 class ToolRpcResolutionWiringTests(unittest.IsolatedAsyncioTestCase):
     """The state/economics tools resolve RPC via the shared chain-aware resolver
-    (explicit args > fork context > registry binding > run defaults), never an
-    implicit global default, and keep raw key-bearing URLs out of artifacts."""
+    (explicit args > fork context > registry binding > latest fork context), never
+    an implicit global default, and keep key-bearing URLs out of artifacts."""
 
     KEY = "alchemy-test-key"
     ALCHEMY_ENV = {"ALCHEMY_API_KEY": KEY}

@@ -875,7 +875,7 @@ TOOLS = [
                             "run_experiment derives chain-specific Alchemy "
                             "endpoints from network/chain_id, fork_context, "
                             "experiment metadata, chain registry, latest fork "
-                            "context, or run defaults, and injects ETH_RPC_URL "
+                            "context, and injects ETH_RPC_URL "
                             "(plus RPC_URL_<chain_id>/RPC_URL_<NETWORK>) per chain."
                         ),
                     },
@@ -999,7 +999,7 @@ TOOLS = [
                             "Advanced explicit RPC URL override applied to every "
                             "replay command; else chain-specific endpoints are "
                             "derived from the sequence's chain metadata, "
-                            "network/chain_id, fork_context, or run defaults (same "
+                            "network/chain_id, or fork_context (same "
                             "resolution as run_experiment)."
                         ),
                     },
@@ -1190,8 +1190,8 @@ TOOLS = [
                         "type": "string",
                         "description": (
                             "Explicit RPC URL override; else derived per-chain "
-                            "from network/chain_id, fork_context, registry, or "
-                            "run defaults."
+                            "from network/chain_id, fork_context, registry, or the "
+                            "latest recorded fork context."
                         ),
                     },
                     "network": {
@@ -1419,7 +1419,7 @@ TOOLS = [
                         "description": (
                             "Explicit RPC URL override for validation; else "
                             "derived per-chain from network/chain_id, registry, "
-                            "or run defaults."
+                            "or the latest recorded fork context."
                         ),
                     },
                     "contracts": {
@@ -1526,7 +1526,7 @@ TOOLS = [
                             "Explicit RPC URL override for on-chain reserve "
                             "lookups; else derived per-chain from "
                             "network/chain_id, fork_context, registry, or "
-                            "run defaults."
+                            "the latest recorded fork context."
                         ),
                     },
                     "network": {
@@ -1606,7 +1606,7 @@ TOOLS = [
                             "Explicit RPC URL override for provider liquidity "
                             "lookups; else derived per-chain from "
                             "network/chain_id, fork_context, registry, or "
-                            "run defaults."
+                            "the latest recorded fork context."
                         ),
                     },
                     "network": {
@@ -3863,8 +3863,8 @@ TOOLS = [
                         },
                         "description": "Explicit [{network, address}] pairs (overrides addresses).",
                     },
-                    "network": {"type": "string", "description": "Optional default chain for addresses[] (subdomain/name/id); per-token networks override; else chain_not_inferred."},
-                    "chain_id": {"type": "integer", "description": "Optional default chain id for addresses[] (e.g. 8453); alternative to network."},
+                    "network": {"type": "string", "description": "Optional shared chain for addresses[] (subdomain/name/id); per-token networks override; else chain_not_inferred."},
+                    "chain_id": {"type": "integer", "description": "Optional shared chain id for addresses[] (e.g. 8453); alternative to network."},
                 },
                 "required": [],
             },
