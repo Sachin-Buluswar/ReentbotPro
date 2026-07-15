@@ -20,7 +20,6 @@ from reentbotpro.config import (
     resolve_alchemy_api_key,
     resolve_alchemy_network,
     resolve_chain_id,
-    resolve_default_chain_hint,
     resolve_etherscan_api_key,
     resolve_rpc_endpoint,
     resolve_rpc_url,
@@ -448,15 +447,19 @@ class ResolveRpcEndpointTests(unittest.TestCase):
         self.assertEqual(endpoint.network, "arb-mainnet")
         self.assertEqual(endpoint.chain_id, 42161)
 
-    def test_config_default_chain_seeds_derivation(self):
+    def test_legacy_default_chain_keys_do_not_seed_derivation(self):
         endpoint = resolve_rpc_endpoint(
             environ={},
-            config={"alchemy_api_key": self.KEY, "default_chain": "base"},
+            config={
+                "alchemy_api_key": self.KEY,
+                "default_chain": "base",
+                "default_network": "arb-mainnet",
+                "default_chain_id": 10,
+            },
         )
-        self.assertEqual(
-            endpoint.url, f"https://base-mainnet.g.alchemy.com/v2/{self.KEY}"
-        )
-        self.assertEqual(endpoint.network, "base-mainnet")
+        self.assertIsNone(endpoint.url)
+        self.assertIsNone(endpoint.network)
+        self.assertIsNone(endpoint.chain_id)
         self.assertFalse(endpoint.assumed_default_mainnet)
 
     def test_returns_none_endpoint_when_nothing_resolvable(self):
@@ -526,16 +529,16 @@ class LocalConfigWriteTests(unittest.TestCase):
     def test_merge_into_absent_config_creates_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
-            merged = merge_local_config({"default_chain": "base"}, path)
-            self.assertEqual(merged, {"default_chain": "base"})
+            merged = merge_local_config({"model": "gpt-test"}, path)
+            self.assertEqual(merged, {"model": "gpt-test"})
             self.assertTrue(path.exists())
 
     def test_merge_overrides_existing_key(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
-            save_local_config({"default_chain": "ethereum"}, path)
-            merged = merge_local_config({"default_chain": "base"}, path)
-            self.assertEqual(merged["default_chain"], "base")
+            save_local_config({"model": "gpt-old"}, path)
+            merged = merge_local_config({"model": "gpt-new"}, path)
+            self.assertEqual(merged["model"], "gpt-new")
 
 
 class ChainFromExplorerUrlTests(unittest.TestCase):
@@ -606,35 +609,6 @@ class NormalizeChainHintTests(unittest.TestCase):
     def test_unrecognized_returns_none(self):
         self.assertIsNone(normalize_chain_hint("not a chain"))
         self.assertIsNone(normalize_chain_hint(None))
-
-
-class ResolveDefaultChainHintTests(unittest.TestCase):
-    def test_env_network_takes_precedence(self):
-        net, cid, source = resolve_default_chain_hint(
-            environ={"REENTBOT_DEFAULT_NETWORK": "base"},
-            config={"default_chain": "arbitrum"},
-        )
-        self.assertEqual((net, cid), ("base-mainnet", 8453))
-        self.assertEqual(source, "env:REENTBOT_DEFAULT_NETWORK")
-
-    def test_env_chain_id(self):
-        net, cid, source = resolve_default_chain_hint(
-            environ={"REENTBOT_DEFAULT_CHAIN_ID": "42161"}, config={}
-        )
-        self.assertEqual((net, cid), ("arb-mainnet", 42161))
-        self.assertEqual(source, "env:REENTBOT_DEFAULT_CHAIN_ID")
-
-    def test_config_default_used_when_no_env(self):
-        net, cid, source = resolve_default_chain_hint(
-            environ={}, config={"default_network": "optimism"}
-        )
-        self.assertEqual((net, cid), ("opt-mainnet", 10))
-        self.assertEqual(source, "config:default_network")
-
-    def test_none_when_nothing_configured(self):
-        self.assertEqual(
-            resolve_default_chain_hint(environ={}, config={}), (None, None, None)
-        )
 
 
 if __name__ == "__main__":

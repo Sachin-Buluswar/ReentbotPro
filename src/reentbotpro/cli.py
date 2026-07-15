@@ -24,10 +24,7 @@ from reentbotpro.config import (
     ResolvedRpcEndpoint,
     load_local_config,
     merge_local_config,
-    parse_alchemy_url,
     resolve_alchemy_api_key,
-    resolve_alchemy_network,
-    resolve_chain_id,
     resolve_etherscan_api_key,
     resolve_rpc_endpoint,
     resolve_rpc_url,
@@ -71,53 +68,14 @@ def _resolve_context_budgets(
     return calculate_max_context(context_window), report_budget, False
 
 
-def _resolve_chain_defaults(
-    *,
-    cli_chain: str | None,
-    cli_chain_id: str | int | None,
-    config: dict,
-    explicit_rpc_url: str | None,
-) -> tuple[str | None, int | None]:
-    """Resolve the run-level default chain as ``(alchemy_network, chain_id)``.
-
-    Precedence: CLI ``--chain``/``--network``, then CLI ``--chain-id``, then local
-    config (``default_network`` / ``default_chain`` / ``default_chain_id``), then
-    the network embedded in an explicit Alchemy RPC override. Either element is
-    ``None`` when it cannot be determined; both are ``None`` when no chain hint
-    exists at all, in which case the agent infers the chain during recon.
-    """
-    # 1 & 2: CLI flags. ``--chain`` drives the subdomain, ``--chain-id`` the id;
-    # passing both to the resolvers lets either one alone determine the chain.
-    network = resolve_alchemy_network(cli_chain, cli_chain_id)
-    chain_id = resolve_chain_id(cli_chain, cli_chain_id)
-    if network or chain_id is not None:
-        return network, chain_id
-
-    # 3: local config defaults.
-    cfg_network = config.get("default_network") or config.get("default_chain")
-    cfg_chain_id = config.get("default_chain_id")
-    network = resolve_alchemy_network(cfg_network, cfg_chain_id)
-    chain_id = resolve_chain_id(cfg_network, cfg_chain_id)
-    if network or chain_id is not None:
-        return network, chain_id
-
-    # 4: network embedded in an explicit Alchemy RPC override (--rpc-url/ETH_RPC_URL).
-    parsed = parse_alchemy_url(explicit_rpc_url)
-    if parsed:
-        return resolve_alchemy_network(parsed[0]), resolve_chain_id(parsed[0])
-
-    # 5: nothing known — the agent records the chain during recon / fork context.
-    return None, None
-
-
 def _rpc_metadata(
     endpoint: ResolvedRpcEndpoint, *, alchemy_configured: bool
 ) -> dict:
     """Machine-readable RPC provenance for ``findings.json``.
 
     Captures how (and whether) a run-level endpoint was resolved so a report or
-    downstream tool can see the provider, target chain, and override status
-    without parsing a URL.
+    downstream tool can see the provider, any network encoded by the endpoint,
+    and override status without parsing a URL.
     """
     return {
         "configured": endpoint.url is not None,
@@ -138,8 +96,6 @@ class _RunRpcConfig:
     endpoint: ResolvedRpcEndpoint
     alchemy_key: str | None
     etherscan_key: str | None
-    default_network: str | None
-    default_chain_id: int | None
     explicit_rpc_url: str | None
     rpc_meta: dict
 
@@ -147,35 +103,23 @@ class _RunRpcConfig:
 def _resolve_run_rpc(
     *,
     cli_rpc_url: str | None,
-    cli_chain: str | None,
-    cli_chain_id: str | int | None,
     config: dict,
     environ: dict[str, str] | None = None,
 ) -> _RunRpcConfig:
-    """Resolve credentials, the target chain, and the run-level RPC endpoint.
+    """Resolve credentials and the optional run-level RPC override.
 
-    The persistent credential model is Alchemy/Etherscan-first: a bare Alchemy key
-    plus a known chain derives the chain-specific node URL. ``--rpc-url`` /
-    ``ETH_RPC_URL`` / config ``rpc_url`` remain explicit advanced overrides via the
-    legacy :func:`resolve_rpc_url` path. ``allow_default_mainnet`` is intentionally
-    off: a bare key with no known chain yields no URL, and the agent derives one
-    once it infers the chain (the container still receives the bare key).
+    The persistent credential model is Alchemy/Etherscan-first. ``--rpc-url`` /
+    ``ETH_RPC_URL`` / config ``rpc_url`` remain explicit advanced overrides via
+    the legacy :func:`resolve_rpc_url` path. A bare Alchemy key yields no startup
+    URL; tools derive chain-specific endpoints after the agent binds each target.
     """
     explicit_rpc_url = resolve_rpc_url(cli_rpc_url, environ=environ, config=config)
     alchemy_key, _ = resolve_alchemy_api_key(
         explicit_rpc_url, environ=environ, config=config
     )
     etherscan_key = resolve_etherscan_api_key(environ=environ, config=config)
-    default_network, default_chain_id = _resolve_chain_defaults(
-        cli_chain=cli_chain,
-        cli_chain_id=cli_chain_id,
-        config=config,
-        explicit_rpc_url=explicit_rpc_url,
-    )
     endpoint = resolve_rpc_endpoint(
         cli_rpc_url=explicit_rpc_url or cli_rpc_url,
-        network=default_network,
-        chain_id=default_chain_id,
         allow_default_mainnet=False,
         environ=environ,
         config=config,
@@ -184,8 +128,6 @@ def _resolve_run_rpc(
         endpoint=endpoint,
         alchemy_key=alchemy_key,
         etherscan_key=etherscan_key,
-        default_network=default_network,
-        default_chain_id=default_chain_id,
         explicit_rpc_url=explicit_rpc_url,
         rpc_meta=_rpc_metadata(endpoint, alchemy_configured=bool(alchemy_key)),
     )
@@ -356,7 +298,6 @@ def _interactive_setup(
     max_time: int,
     alchemy_key: str | None,
     etherscan_key: str | None,
-    default_network: str | None,
     explicit_rpc_url: str | None,
     verbosity: str | None = None,
     default_verbosity: str = "partial",
@@ -364,13 +305,11 @@ def _interactive_setup(
 ) -> dict:
     """Prompt for missing configuration values interactively.
 
-    The normal path asks only for the Alchemy and Etherscan keys; the target
-    chain is inferred from scope/deployment metadata at audit time. The default
-    chain and the explicit RPC URL are optional advanced hints, offered together
-    behind a single opt-in gate (default no) and only when not already supplied
-    via flags/env/config. Anything the user types here (and that was not already
-    supplied by env/config) is offered for persistence to local config so it
-    need not be re-entered. Key values are never echoed back.
+    The target chain or chains are inferred from scope/deployment metadata at
+    audit time. The normal path asks only for the Alchemy and Etherscan keys;
+    an explicit RPC URL remains available behind an opt-in advanced prompt.
+    Newly entered credentials can be persisted to local config. Key values are
+    never echoed back.
     """
     config: dict = {}
     persist: dict = {}
@@ -426,49 +365,31 @@ def _interactive_setup(
                 "  [dim]Skipped — get_contract_source won't be available.[/]"
             )
 
-    # Chain selection is inferred from scope/deployment metadata, so the normal
-    # path asks only for keys. The default chain and the explicit RPC override
-    # are optional advanced hints; values already supplied via flags/env/config
-    # are used as-is and shown, never re-prompted.
+    # Chain selection is inferred from scope/deployment metadata. An explicit RPC
+    # override remains available for custom/local nodes, but it does not select a
+    # target chain for the agent.
     console.print(
-        "\n  [cyan]Target chain will be inferred from scope/deployment "
-        "metadata.[/]\n  [dim]Use --chain or config default_chain only as an "
-        "optional hint.[/]"
+        "\n  [cyan]Target chain(s) will be inferred from scope/deployment "
+        "metadata.[/]"
     )
-    config["default_chain"] = default_network
-    if default_network:
-        console.print(f"  [green]Default chain hint:[/] {default_network}")
     config["rpc_url"] = explicit_rpc_url
     if explicit_rpc_url:
         console.print(
             "  [dim]Using explicit RPC override from flags/env/config.[/]"
         )
 
-    # Offer the advanced gate only when an advanced value is still unset. It
-    # defaults to no, keeping the normal path to keys only; default_chain is
-    # persisted only when explicitly entered here.
-    need_default_chain = default_network is None
-    need_rpc_override = explicit_rpc_url is None
-    if need_default_chain or need_rpc_override:
+    # Keep the explicit RPC override behind a default-no advanced gate.
+    if explicit_rpc_url is None:
         answer = console.input(
-            "\n  [dim]Configure optional advanced defaults "
-            "(default chain, RPC override)?[/] \\[y/[not bold blue]N[/]]: "
+            "\n  [dim]Configure an optional explicit RPC override?[/] "
+            "\\[y/[not bold blue]N[/]]: "
         ).strip().lower()
         if answer in ("y", "yes"):
-            if need_default_chain:
-                entered = console.input(
-                    "\n  Default chain/network (e.g. base, arbitrum, "
-                    "eth-mainnet; optional — press Enter to skip): "
-                ).strip()
-                if entered:
-                    config["default_chain"] = entered
-                    persist["default_chain"] = entered
-            if need_rpc_override:
-                entered = console.input(
-                    "\n  Explicit RPC URL override "
-                    "(optional — press Enter to skip): "
-                ).strip()
-                config["rpc_url"] = entered or None
+            entered = console.input(
+                "\n  Explicit RPC URL override "
+                "(optional — press Enter to skip): "
+            ).strip()
+            config["rpc_url"] = entered or None
 
     # Model
     if model:
@@ -537,7 +458,7 @@ def _interactive_setup(
                 break
             console.print("  [not bold red]Invalid choice — must be off, partial, or full[/]")
 
-    # Persist newly entered credentials/defaults so the user need not re-enter
+    # Persist newly entered credentials so the user need not re-enter
     # them each run. Only values typed just now (never an existing env/config key)
     # are in ``persist``, so the merge cannot clobber a key the user already had.
     if persist:
@@ -577,8 +498,6 @@ async def _run(
     rpc_url: str | None,
     no_chat: bool,
     verbosity: str | None,
-    chain: str | None = None,
-    chain_id: str | None = None,
     context_window: int | None = None,
     max_context: int | None = None,
     reasoning: str | None = None,
@@ -598,19 +517,17 @@ async def _run(
     if model is None:
         model = os.environ.get("REENTBOTPRO_MODEL")
 
-    # Load local config once and reuse it for credentials, the target chain, and
-    # the RPC endpoint. A malformed config never breaks startup here.
+    # Load local config once and reuse it for credentials and the RPC endpoint.
+    # A malformed config never breaks startup here.
     try:
         local_config = load_local_config()
     except ValueError:
         local_config = {}
 
-    # Resolve the Alchemy/Etherscan-first credential model + chain + endpoint from
-    # CLI flags, environment, and local config.
+    # Resolve the Alchemy/Etherscan-first credential model and optional explicit
+    # endpoint from CLI flags, environment, and local config.
     rpc_cfg = _resolve_run_rpc(
         cli_rpc_url=rpc_url,
-        cli_chain=chain,
-        cli_chain_id=chain_id,
         config=local_config,
     )
 
@@ -623,12 +540,11 @@ async def _run(
             max_time=max_time_seconds,
             alchemy_key=rpc_cfg.alchemy_key,
             etherscan_key=rpc_cfg.etherscan_key,
-            default_network=rpc_cfg.default_network,
             explicit_rpc_url=rpc_cfg.explicit_rpc_url,
             verbosity=verbosity,
             reasoning=reasoning,
         )
-        # Re-resolve the endpoint with any credentials/chain the user just entered.
+        # Re-resolve the endpoint with any credentials/RPC override just entered.
         # Newly typed keys may not be in env/config (the user can decline to save),
         # so layer them onto an effective config before deriving the endpoint.
         effective_config = dict(local_config)
@@ -638,8 +554,6 @@ async def _run(
             effective_config["etherscan_api_key"] = config["etherscan_key"]
         rpc_cfg = _resolve_run_rpc(
             cli_rpc_url=config.get("rpc_url") or rpc_url,
-            cli_chain=config.get("default_chain") or chain,
-            cli_chain_id=chain_id,
             config=effective_config,
         )
     else:
@@ -654,12 +568,10 @@ async def _run(
     api_key = config.get("api_key")
     model = config["model"]
     max_time = config["max_time"]
-    # The run-level RPC posture: chain-aware endpoint, credentials, provenance.
+    # The run-level RPC posture: optional override, credentials, provenance.
     endpoint = rpc_cfg.endpoint
     alchemy_key = rpc_cfg.alchemy_key
     etherscan_key = rpc_cfg.etherscan_key
-    default_network = rpc_cfg.default_network
-    default_chain_id = rpc_cfg.default_chain_id
     rpc_url = endpoint.url
     rpc_meta = rpc_cfg.rpc_meta
 
@@ -685,13 +597,11 @@ async def _run(
 
     display = Display(console=console, verbosity=verbosity)
 
-    # Configure host-side runtimes. Alchemy enhanced-API tools (trace/debug,
-    # simulation, transfers, token, prices) need the bare key; the agent still
-    # selects the chain per call / from record_fork_context, so the default
-    # network here is only a last-resort fallback. Etherscan's verified-source
-    # tool needs only its key (one key works across all V2 chains). Both degrade
-    # cleanly when unset.
-    set_alchemy_runtime(alchemy_key, default_network or endpoint.network)
+    # Configure host-side runtimes. Alchemy enhanced-API tools receive the bare
+    # key and select a chain only from per-call/campaign context. Etherscan's
+    # verified-source tool needs only its key (one key works across all V2 chains).
+    # Both degrade cleanly when unset.
+    set_alchemy_runtime(alchemy_key)
     set_etherscan_runtime(etherscan_key)
 
     if alchemy_key:
@@ -735,8 +645,8 @@ async def _run(
         "reasoning": reasoning.display_effort,
         "rpc_provider": endpoint.provider,
         "rpc_is_override": endpoint.is_override,
-        "chain_network": default_network or endpoint.network,
-        "chain_id": default_chain_id if default_chain_id is not None else endpoint.chain_id,
+        "chain_network": endpoint.network,
+        "chain_id": endpoint.chain_id,
         "alchemy": bool(alchemy_key),
         "etherscan": bool(etherscan_key),
     })
@@ -760,9 +670,8 @@ async def _run(
         sys.exit(1)
     display.status(f"Using {client.provider_name}")
 
-    # Start container. Pass the bare credentials and resolved default-chain hints
-    # so in-container tooling can derive a chain-specific endpoint even when no
-    # ETH_RPC_URL was pre-derived (a bare key with no known chain).
+    # Start the container with the bare credentials. In-container tooling derives
+    # chain-specific endpoints from campaign context after target discovery.
     container = AuditContainer(image_name=image)
     try:
         await container.start(
@@ -771,8 +680,6 @@ async def _run(
             on_status=display.status,
             alchemy_api_key=alchemy_key,
             etherscan_api_key=etherscan_key,
-            default_network=default_network,
-            default_chain_id=default_chain_id,
         )
 
         # Build system prompt
@@ -950,30 +857,12 @@ async def _run(
 @click.option("--output", default="./findings", help="Output directory for findings and report")
 @click.option("--image", default="reentbotpro-tools", help="Docker image name")
 @click.option(
-    "--chain",
-    "--network",
-    "chain",
-    default=None,
-    help=(
-        "Default target chain/network, e.g. base, base-mainnet, arbitrum, "
-        "eth-mainnet. Used to derive Alchemy RPC URLs when --rpc-url is not "
-        "supplied."
-    ),
-)
-@click.option(
-    "--chain-id",
-    default=None,
-    help=(
-        "Default target chain id, e.g. 8453 for Base. Used to derive Alchemy RPC "
-        "URLs when --rpc-url is not supplied."
-    ),
-)
-@click.option(
     "--rpc-url",
     default=None,
     help=(
         "Advanced explicit RPC endpoint override. Usually not needed when "
-        "ALCHEMY_API_KEY and --chain/--chain-id are configured."
+        "Alchemy is configured; tools derive per-chain endpoints after target "
+        "discovery."
     ),
 )
 @click.option("--no-chat", is_flag=True, help="Skip interactive chat after audit")
@@ -1009,8 +898,6 @@ def main(
     max_time,
     output,
     image,
-    chain,
-    chain_id,
     rpc_url,
     no_chat,
     verbosity,
@@ -1027,8 +914,6 @@ def main(
         max_time=max_time,
         output=output,
         image=image,
-        chain=chain,
-        chain_id=chain_id,
         rpc_url=rpc_url,
         no_chat=no_chat,
         verbosity=verbosity,

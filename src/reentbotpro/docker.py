@@ -115,18 +115,15 @@ class AuditContainer:
         *,
         alchemy_api_key: str | None = None,
         etherscan_api_key: str | None = None,
-        default_network: str | None = None,
-        default_chain_id: int | str | None = None,
     ) -> None:
         """Start a container with source_dir mounted at /audit.
 
         Beyond an explicit ``rpc_url`` (set as ``ETH_RPC_URL`` for cast/anvil),
-        the container receives the persistent credential model: the bare Alchemy
-        and Etherscan keys plus the resolved default-chain hints. With those, the
-        in-container tooling can derive a chain-specific endpoint even when no
-        ``ETH_RPC_URL`` was pre-derived (a bare key with no known chain). Key
-        injection is deliberately simple here — explicit args win over
-        ``extra_env``, which wins over the host process environment.
+        the container receives the persistent credential model: bare Alchemy and
+        Etherscan keys. In-container tooling derives chain-specific endpoints from
+        target/campaign context. Key injection is deliberately simple here —
+        explicit args win over ``extra_env``, which wins over the host process
+        environment.
         """
         client = self._get_client()
         await self.ensure_image(on_status=on_status)
@@ -146,11 +143,6 @@ class AuditContainer:
             value = explicit or extra.get(name) or os.environ.get(name)
             if value:
                 env_vars[name] = value
-        if default_network:
-            env_vars["REENTBOT_DEFAULT_NETWORK"] = default_network
-        if default_chain_id is not None and str(default_chain_id).strip():
-            env_vars["REENTBOT_DEFAULT_CHAIN_ID"] = str(default_chain_id)
-
         if on_status:
             on_status("Starting container...")
 

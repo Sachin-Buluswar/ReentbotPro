@@ -16,7 +16,6 @@ from reentbotpro.cli import (
     _build_findings_data,
     _copy_container_tree,
     _interactive_setup,
-    _resolve_chain_defaults,
     _resolve_context_budgets,
     _resolve_run_rpc,
     _rpc_metadata,
@@ -59,18 +58,12 @@ class CliSurfaceTests(unittest.TestCase):
         self.assertIsNone(params["max_context"].default)
         self.assertIsNone(params["context_window"].default)
 
-    def test_chain_options_present_and_rpc_url_is_advanced_override(self):
+    def test_chain_options_removed_and_rpc_url_is_advanced_override(self):
         params = _params_by_name(main)
-        # --chain doubles as --network and lands on the `chain` param.
-        self.assertIn("chain", params)
-        self.assertEqual(params["chain"].opts, ["--chain", "--network"])
-        self.assertIsNone(params["chain"].default)
-        self.assertIn("chain_id", params)
-        self.assertEqual(params["chain_id"].opts, ["--chain-id"])
-        self.assertIsNone(params["chain_id"].default)
-        # --rpc-url is now framed as an advanced explicit override.
+        self.assertNotIn("chain", params)
+        self.assertNotIn("chain_id", params)
         self.assertIn("Advanced", params["rpc_url"].help)
-        self.assertIn("ALCHEMY_API_KEY", params["rpc_url"].help)
+        self.assertIn("per-chain", params["rpc_url"].help)
 
 
 class ResolveContextBudgetsTests(unittest.TestCase):
@@ -285,116 +278,14 @@ class CampaignArtifactCopyTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('"partial": true', saved)
 
 
-class ResolveChainDefaultsTests(unittest.TestCase):
-    """Run-level target-chain precedence: CLI > config > parsed Alchemy URL."""
-
-    def test_cli_chain_wins_over_config(self):
-        net, cid = _resolve_chain_defaults(
-            cli_chain="base",
-            cli_chain_id=None,
-            config={"default_chain": "arbitrum"},
-            explicit_rpc_url=None,
-        )
-        self.assertEqual(net, "base-mainnet")
-        self.assertEqual(cid, 8453)
-
-    def test_cli_chain_id_used_when_no_chain_name(self):
-        net, cid = _resolve_chain_defaults(
-            cli_chain=None,
-            cli_chain_id="42161",
-            config={},
-            explicit_rpc_url=None,
-        )
-        self.assertEqual(net, "arb-mainnet")
-        self.assertEqual(cid, 42161)
-
-    def test_config_default_used_when_no_cli_flags(self):
-        net, cid = _resolve_chain_defaults(
-            cli_chain=None,
-            cli_chain_id=None,
-            config={"default_network": "optimism"},
-            explicit_rpc_url=None,
-        )
-        self.assertEqual(net, "opt-mainnet")
-        self.assertEqual(cid, 10)
-
-    def test_config_default_chain_id_seeds_chain(self):
-        net, cid = _resolve_chain_defaults(
-            cli_chain=None,
-            cli_chain_id=None,
-            config={"default_chain_id": 8453},
-            explicit_rpc_url=None,
-        )
-        self.assertEqual(net, "base-mainnet")
-        self.assertEqual(cid, 8453)
-
-    def test_network_parsed_from_explicit_alchemy_url(self):
-        net, cid = _resolve_chain_defaults(
-            cli_chain=None,
-            cli_chain_id=None,
-            config={},
-            explicit_rpc_url="https://base-mainnet.g.alchemy.com/v2/key",
-        )
-        self.assertEqual(net, "base-mainnet")
-        self.assertEqual(cid, 8453)
-
-    def test_none_when_nothing_known(self):
-        net, cid = _resolve_chain_defaults(
-            cli_chain=None,
-            cli_chain_id=None,
-            config={},
-            explicit_rpc_url="https://mainnet.infura.io/v3/xyz",
-        )
-        self.assertIsNone(net)
-        self.assertIsNone(cid)
-
-
 class ResolveRunRpcTests(unittest.TestCase):
-    """The Alchemy/Etherscan-first credential + chain + endpoint resolution."""
+    """Alchemy/Etherscan credentials plus an optional explicit endpoint."""
 
     KEY = "alchemy-test-key"
 
-    def test_chain_flag_plus_alchemy_key_derives_base_endpoint(self):
+    def test_bare_alchemy_key_yields_no_url_but_keeps_key(self):
         cfg = _resolve_run_rpc(
             cli_rpc_url=None,
-            cli_chain="base",
-            cli_chain_id=None,
-            config={},
-            environ={"ALCHEMY_API_KEY": self.KEY},
-        )
-        self.assertEqual(cfg.default_network, "base-mainnet")
-        self.assertEqual(cfg.default_chain_id, 8453)
-        self.assertEqual(
-            cfg.endpoint.url, f"https://base-mainnet.g.alchemy.com/v2/{self.KEY}"
-        )
-        self.assertEqual(cfg.endpoint.provider, "alchemy")
-        self.assertEqual(cfg.alchemy_key, self.KEY)
-        self.assertEqual(cfg.rpc_meta["provider"], "alchemy")
-        self.assertEqual(cfg.rpc_meta["network"], "base-mainnet")
-        self.assertEqual(cfg.rpc_meta["chain_id"], 8453)
-        self.assertEqual(cfg.rpc_meta["source"], "alchemy_api_key")
-        self.assertTrue(cfg.rpc_meta["configured"])
-        self.assertFalse(cfg.rpc_meta["override"])
-
-    def test_chain_id_flag_plus_alchemy_key_derives_base_endpoint(self):
-        cfg = _resolve_run_rpc(
-            cli_rpc_url=None,
-            cli_chain=None,
-            cli_chain_id="8453",
-            config={},
-            environ={"ALCHEMY_API_KEY": self.KEY},
-        )
-        self.assertEqual(cfg.default_network, "base-mainnet")
-        self.assertEqual(cfg.default_chain_id, 8453)
-        self.assertEqual(
-            cfg.endpoint.url, f"https://base-mainnet.g.alchemy.com/v2/{self.KEY}"
-        )
-
-    def test_no_chain_with_alchemy_key_yields_no_url_but_keeps_key(self):
-        cfg = _resolve_run_rpc(
-            cli_rpc_url=None,
-            cli_chain=None,
-            cli_chain_id=None,
             config={},
             environ={"ALCHEMY_API_KEY": self.KEY},
         )
@@ -408,8 +299,6 @@ class ResolveRunRpcTests(unittest.TestCase):
     def test_explicit_rpc_url_overrides_derived_alchemy(self):
         cfg = _resolve_run_rpc(
             cli_rpc_url="https://explicit.example",
-            cli_chain="base",
-            cli_chain_id=None,
             config={},
             environ={"ALCHEMY_API_KEY": self.KEY},
         )
@@ -422,8 +311,6 @@ class ResolveRunRpcTests(unittest.TestCase):
     def test_eth_rpc_url_env_is_an_explicit_override(self):
         cfg = _resolve_run_rpc(
             cli_rpc_url=None,
-            cli_chain="base",
-            cli_chain_id=None,
             config={},
             environ={"ALCHEMY_API_KEY": self.KEY, "ETH_RPC_URL": "https://env.example"},
         )
@@ -431,75 +318,46 @@ class ResolveRunRpcTests(unittest.TestCase):
         self.assertTrue(cfg.endpoint.is_override)
         self.assertEqual(cfg.explicit_rpc_url, "https://env.example")
 
-    def test_local_config_alchemy_key_and_default_chain(self):
+    def test_legacy_default_chain_config_is_ignored(self):
         cfg = _resolve_run_rpc(
             cli_rpc_url=None,
-            cli_chain=None,
-            cli_chain_id=None,
-            config={"alchemy_api_key": self.KEY, "default_chain": "arbitrum"},
+            config={
+                "alchemy_api_key": self.KEY,
+                "default_chain": "arbitrum",
+                "default_network": "base-mainnet",
+                "default_chain_id": 10,
+            },
             environ={},
         )
-        self.assertEqual(cfg.default_network, "arb-mainnet")
-        self.assertEqual(cfg.default_chain_id, 42161)
-        self.assertEqual(
-            cfg.endpoint.url, f"https://arb-mainnet.g.alchemy.com/v2/{self.KEY}"
-        )
+        self.assertIsNone(cfg.endpoint.url)
+        self.assertIsNone(cfg.endpoint.network)
+        self.assertIsNone(cfg.endpoint.chain_id)
         self.assertEqual(cfg.alchemy_key, self.KEY)
 
     def test_etherscan_key_resolved_from_config(self):
         cfg = _resolve_run_rpc(
             cli_rpc_url=None,
-            cli_chain="base",
-            cli_chain_id=None,
             config={"etherscan_api_key": "escan"},
             environ={},
         )
         self.assertEqual(cfg.etherscan_key, "escan")
 
-    def test_local_config_keys_only_no_default_chain_is_valid(self):
+    def test_local_config_keys_only_is_valid(self):
         # The normal setup: only Alchemy + Etherscan keys, no chain anywhere.
         # Resolution must succeed and derive no endpoint, while keeping both keys
         # so the agent can derive one once it infers the chain during recon.
         cfg = _resolve_run_rpc(
             cli_rpc_url=None,
-            cli_chain=None,
-            cli_chain_id=None,
             config={"alchemy_api_key": self.KEY, "etherscan_api_key": "escan"},
             environ={},
         )
         self.assertIsNone(cfg.endpoint.url)
         self.assertEqual(cfg.endpoint.provider, "none")
-        self.assertIsNone(cfg.default_network)
-        self.assertIsNone(cfg.default_chain_id)
         self.assertEqual(cfg.alchemy_key, self.KEY)
         self.assertEqual(cfg.etherscan_key, "escan")
         self.assertFalse(cfg.rpc_meta["configured"])
         self.assertTrue(cfg.rpc_meta["alchemy_key_configured"])
         self.assertFalse(cfg.rpc_meta["assumed_default_mainnet"])
-
-    def test_default_chain_is_a_hint_not_a_single_chain_lock(self):
-        # A configured default_chain seeds RPC derivation but is only a hint: the
-        # endpoint is a derivation (is_override=False), not a hard explicit lock,
-        # and no provenance flag pins the audit to one chain. Per-call and
-        # fork-context chains still override it at the host-tool layer (see
-        # AlchemyToolTests in test_tools.py).
-        cfg = _resolve_run_rpc(
-            cli_rpc_url=None,
-            cli_chain=None,
-            cli_chain_id=None,
-            config={"alchemy_api_key": self.KEY, "default_chain": "base"},
-            environ={},
-        )
-        self.assertEqual(cfg.default_network, "base-mainnet")
-        self.assertEqual(
-            cfg.endpoint.url, f"https://base-mainnet.g.alchemy.com/v2/{self.KEY}"
-        )
-        self.assertEqual(cfg.endpoint.provider, "alchemy")
-        self.assertFalse(cfg.endpoint.is_override)
-        self.assertFalse(cfg.rpc_meta["override"])
-        self.assertNotIn("locked", cfg.rpc_meta)
-        self.assertNotIn("single_chain", cfg.rpc_meta)
-
 
 class RpcMetadataTests(unittest.TestCase):
     def test_metadata_captures_provider_and_chain(self):
@@ -656,17 +514,15 @@ class InteractiveSetupTests(unittest.TestCase):
         reasoning="high",
     )
 
-    def test_normal_path_prompts_for_keys_not_default_chain(self):
+    def test_normal_path_prompts_for_keys_and_infers_chains(self):
         # Normal setup with missing keys: it prompts for the Alchemy and
-        # Etherscan keys, surfaces the chain-inference message, and does NOT ask
-        # for a default chain — that lives behind the advanced gate, declined
-        # here (empty answers → gate defaults to no).
+        # Etherscan keys and surfaces the chain-inference message. The optional
+        # explicit RPC override is declined here (empty answer defaults to no).
         console = ScriptedConsole(answers=[])
         config = _interactive_setup(
             console,
             alchemy_key=None,
             etherscan_key=None,
-            default_network=None,
             explicit_rpc_url=None,
             **self.BASE_KWARGS,
         )
@@ -675,28 +531,23 @@ class InteractiveSetupTests(unittest.TestCase):
         self.assertTrue(any("Etherscan API key" in p for p in console.prompts))
         # The legacy "Ethereum RPC URL" prompt is gone from the normal path.
         self.assertFalse(any("Ethereum RPC URL" in p for p in console.prompts))
-        # Default chain is not a normal-path question; the only gate offered is
-        # the opt-in for advanced defaults, which was declined.
         self.assertFalse(any("Default chain" in p for p in console.prompts))
         self.assertTrue(
-            any("advanced defaults" in p.lower() for p in console.prompts)
+            any("explicit RPC override" in p for p in console.prompts)
         )
         # The chain-inference message is shown.
         joined = " ".join(console.outputs)
         self.assertIn("inferred from scope/deployment", joined)
-        # Nothing entered and advanced declined → no chain/override resolved.
-        self.assertIsNone(config["default_chain"])
+        # Nothing entered and the override declined.
         self.assertIsNone(config["rpc_url"])
 
-    def test_declining_advanced_persists_keys_without_default_chain(self):
-        # Keys entered, advanced declined: both keys persist, default_chain does
-        # not get written.
+    def test_declining_rpc_override_persists_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"REENTBOTPRO_HOME": tmp}, clear=False):
                 console = ScriptedConsole(answers=[
                     "alchemy-test-key",    # Alchemy key
                     "etherscan-test-key",  # Etherscan key
-                    "n",                   # advanced defaults: decline
+                    "n",                   # explicit RPC override: decline
                     "",                    # max time: default
                     "",                    # persist confirmation: yes
                 ])
@@ -704,36 +555,31 @@ class InteractiveSetupTests(unittest.TestCase):
                     console,
                     alchemy_key=None,
                     etherscan_key=None,
-                    default_network=None,
                     explicit_rpc_url=None,
                     **self.BASE_KWARGS,
                 )
 
                 self.assertEqual(config["alchemy_key"], "alchemy-test-key")
                 self.assertEqual(config["etherscan_key"], "etherscan-test-key")
-                self.assertIsNone(config["default_chain"])
 
                 saved = load_local_config()
                 self.assertEqual(saved["alchemy_api_key"], "alchemy-test-key")
                 self.assertEqual(saved["etherscan_api_key"], "etherscan-test-key")
-                self.assertNotIn("default_chain", saved)
+                self.assertNotIn("rpc_url", saved)
 
             # Key values are never echoed back to the console.
             joined = " ".join(console.outputs)
             self.assertNotIn("alchemy-test-key", joined)
             self.assertNotIn("etherscan-test-key", joined)
 
-    def test_advanced_setup_persists_default_chain(self):
-        # Opting into advanced defaults and supplying a default chain writes it
-        # to local config alongside the keys.
+    def test_advanced_setup_applies_rpc_override_to_current_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"REENTBOTPRO_HOME": tmp}, clear=False):
                 console = ScriptedConsole(answers=[
                     "alchemy-test-key",    # Alchemy key
                     "etherscan-test-key",  # Etherscan key
-                    "y",                   # advanced defaults: opt in
-                    "base",                # default chain
-                    "",                    # advanced RPC override: skip
+                    "y",                   # explicit RPC override: opt in
+                    "https://rpc.example", # RPC override
                     "",                    # max time: default
                     "",                    # persist confirmation: yes
                 ])
@@ -741,17 +587,16 @@ class InteractiveSetupTests(unittest.TestCase):
                     console,
                     alchemy_key=None,
                     etherscan_key=None,
-                    default_network=None,
                     explicit_rpc_url=None,
                     **self.BASE_KWARGS,
                 )
 
-                self.assertEqual(config["default_chain"], "base")
+                self.assertEqual(config["rpc_url"], "https://rpc.example")
 
                 saved = load_local_config()
                 self.assertEqual(saved["alchemy_api_key"], "alchemy-test-key")
                 self.assertEqual(saved["etherscan_api_key"], "etherscan-test-key")
-                self.assertEqual(saved["default_chain"], "base")
+                self.assertNotIn("rpc_url", saved)
 
     def test_declining_persistence_writes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -759,7 +604,7 @@ class InteractiveSetupTests(unittest.TestCase):
                 console = ScriptedConsole(answers=[
                     "alchemy-test-key",  # Alchemy key
                     "",                  # Etherscan key: skip
-                    "n",                 # advanced defaults: decline
+                    "n",                 # explicit RPC override: decline
                     "",                  # max time: default
                     "n",                 # persist confirmation: decline
                 ])
@@ -767,7 +612,6 @@ class InteractiveSetupTests(unittest.TestCase):
                     console,
                     alchemy_key=None,
                     etherscan_key=None,
-                    default_network=None,
                     explicit_rpc_url=None,
                     **self.BASE_KWARGS,
                 )
@@ -776,23 +620,17 @@ class InteractiveSetupTests(unittest.TestCase):
     def test_existing_keys_are_not_reprompted_or_persisted(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"REENTBOTPRO_HOME": tmp}, clear=False):
-                # Both keys present and a default chain already resolved (an
-                # optional hint) → the only advanced value left is the RPC
-                # override. Answers cover the advanced gate (declined) and max
-                # time.
-                console = ScriptedConsole(answers=["", ""])  # advanced gate, max time
+                # Answers cover the explicit-RPC gate (declined) and max time.
+                console = ScriptedConsole(answers=["", ""])
                 config = _interactive_setup(
                     console,
                     alchemy_key="existing-alchemy",
                     etherscan_key="existing-etherscan",
-                    default_network="base-mainnet",
                     explicit_rpc_url=None,
                     **self.BASE_KWARGS,
                 )
                 self.assertEqual(config["alchemy_key"], "existing-alchemy")
                 self.assertEqual(config["etherscan_key"], "existing-etherscan")
-                # An already-resolved default chain is used as a hint, unprompted.
-                self.assertEqual(config["default_chain"], "base-mainnet")
                 # Nothing newly typed → nothing persisted, no confirmation prompt.
                 self.assertEqual(load_local_config(), {})
                 joined_prompts = " ".join(console.prompts)
@@ -855,49 +693,19 @@ class RunWiringTests(unittest.IsolatedAsyncioTestCase):
                     findings = json.load(f)
         return fake_container, mock_alchemy, mock_etherscan, findings
 
-    async def test_chain_flag_derives_endpoint_and_forwards_everything(self):
-        container, mock_alchemy, mock_etherscan, findings = await self._invoke_run(
-            env_extra={"ALCHEMY_API_KEY": "alchemy-key", "ETHERSCAN_API_KEY": "etherscan-key"},
-            api_key="sk-test",
-            rpc_url=None,
-            chain="base",
-            chain_id=None,
-        )
-
-        self.assertEqual(
-            container.start_kwargs["rpc_url"],
-            "https://base-mainnet.g.alchemy.com/v2/alchemy-key",
-        )
-        self.assertEqual(container.start_kwargs["alchemy_api_key"], "alchemy-key")
-        self.assertEqual(container.start_kwargs["etherscan_api_key"], "etherscan-key")
-        self.assertEqual(container.start_kwargs["default_network"], "base-mainnet")
-        self.assertEqual(container.start_kwargs["default_chain_id"], 8453)
-
-        # set_alchemy_runtime gets the resolved default network from --chain.
-        mock_alchemy.assert_called_once_with("alchemy-key", "base-mainnet")
-        mock_etherscan.assert_called_once_with("etherscan-key")
-
-        # findings.json carries structured rpc provenance.
-        self.assertEqual(findings["rpc"]["provider"], "alchemy")
-        self.assertEqual(findings["rpc"]["network"], "base-mainnet")
-        self.assertEqual(findings["rpc"]["chain_id"], 8453)
-        self.assertEqual(findings["rpc"]["source"], "alchemy_api_key")
-        self.assertTrue(findings["rpc"]["configured"])
-
-    async def test_no_chain_starts_without_eth_rpc_but_with_alchemy_key(self):
+    async def test_bare_alchemy_key_starts_without_eth_rpc(self):
         container, mock_alchemy, _, findings = await self._invoke_run(
             env_extra={"ALCHEMY_API_KEY": "alchemy-key"},
             api_key="sk-test",
             rpc_url=None,
-            chain=None,
-            chain_id=None,
         )
 
         # No chain known → no derived endpoint, but the key is still forwarded.
         self.assertIsNone(container.start_kwargs["rpc_url"])
         self.assertEqual(container.start_kwargs["alchemy_api_key"], "alchemy-key")
-        self.assertIsNone(container.start_kwargs["default_network"])
-        self.assertIsNone(container.start_kwargs["default_chain_id"])
+        self.assertNotIn("default_network", container.start_kwargs)
+        self.assertNotIn("default_chain_id", container.start_kwargs)
+        mock_alchemy.assert_called_once_with("alchemy-key")
         self.assertEqual(findings["rpc"]["provider"], "none")
         self.assertFalse(findings["rpc"]["configured"])
         self.assertTrue(findings["rpc"]["alchemy_key_configured"])
@@ -913,17 +721,14 @@ class RunWiringTests(unittest.IsolatedAsyncioTestCase):
             },
             api_key="sk-test",
             rpc_url=None,
-            chain=None,
-            chain_id=None,
         )
 
         self.assertIsNone(container.start_kwargs["rpc_url"])
         self.assertEqual(container.start_kwargs["alchemy_api_key"], "alchemy-key")
         self.assertEqual(container.start_kwargs["etherscan_api_key"], "etherscan-key")
-        self.assertIsNone(container.start_kwargs["default_network"])
-        self.assertIsNone(container.start_kwargs["default_chain_id"])
-        # Host runtimes are configured even with no chain (fallback network None).
-        mock_alchemy.assert_called_once_with("alchemy-key", None)
+        self.assertNotIn("default_network", container.start_kwargs)
+        self.assertNotIn("default_chain_id", container.start_kwargs)
+        mock_alchemy.assert_called_once_with("alchemy-key")
         mock_etherscan.assert_called_once_with("etherscan-key")
         # Provenance: not configured, both keys present, no mainnet assumption.
         self.assertEqual(findings["rpc"]["provider"], "none")
@@ -936,8 +741,6 @@ class RunWiringTests(unittest.IsolatedAsyncioTestCase):
             env_extra={"ALCHEMY_API_KEY": "alchemy-key"},
             api_key="sk-test",
             rpc_url="https://explicit.example",
-            chain="base",
-            chain_id=None,
         )
         self.assertEqual(container.start_kwargs["rpc_url"], "https://explicit.example")
         self.assertEqual(findings["rpc"]["provider"], "explicit")
@@ -950,11 +753,9 @@ class RunWiringTests(unittest.IsolatedAsyncioTestCase):
             env_extra={"ALCHEMY_API_KEY": "alchemy-key"},
             no_chat=False,
             api_key="sk-test",
-            rpc_url=None,
-            chain="base",
-            chain_id=None,
+            rpc_url="https://base-mainnet.g.alchemy.com/v2/alchemy-key",
         )
-        self.assertEqual(findings["rpc"]["provider"], "alchemy")
+        self.assertEqual(findings["rpc"]["provider"], "explicit")
         self.assertEqual(findings["rpc"]["network"], "base-mainnet")
 
 

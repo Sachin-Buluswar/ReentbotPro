@@ -63,10 +63,10 @@ the setup wizard is shown unless `--no-chat` is used. Its on-chain credential
 portion collects only your Alchemy and Etherscan keys — the target chain is
 inferred from scope/deployment metadata at audit time — and offers to save them
 to local config so you do not re-enter them each run. The wizard also collects
-run settings such as model, reasoning, time limit, and verbosity. A default chain
-and an explicit RPC override are optional advanced defaults behind a single
-opt-in prompt (default no). In non-interactive mode, the CLI uses flags,
-environment variables, and defaults without prompting.
+run settings such as model, reasoning, time limit, and verbosity. An explicit RPC
+override is available behind an advanced opt-in prompt (default no). In
+non-interactive mode, the CLI uses flags, environment variables, and defaults
+without prompting.
 
 ### Normal setup
 
@@ -107,7 +107,8 @@ no endpoint and the container starts without `ETH_RPC_URL`, but still receives t
 bare key, so the chain-aware tools select a chain per call once recon fixes it.
 When no chain can be inferred the on-chain tools return `chain_not_inferred`
 rather than querying mainnet — a mainnet endpoint is used only when the chain is
-explicitly set or recorded. Spend is governed by your Alchemy account usage limits.
+inferred or explicitly recorded. Spend is governed by your Alchemy account usage
+limits.
 
 The Etherscan key powers **verified contract source** lookups with
 `get_contract_source` (`ETHERSCAN_API_KEY` or `api_keys.etherscan`) over
@@ -116,34 +117,6 @@ verified Solidity, ABI, and
 proxy→implementation, the source-truth complement to Alchemy's runtime data.
 Mainnet verified source is free on Etherscan; some L2s may require a paid Etherscan
 plan (the tool degrades cleanly without it).
-
-### Optional: target-chain hint
-
-You normally do not set a chain. Use this when you already know the target chain
-or want to force a branch/run toward one chain; the agent can otherwise infer
-chains from scope/deployment metadata:
-
-```bash
-reentbotpro ./target --chain base
-reentbotpro ./target --chain-id 8453
-```
-
-`--chain` / `--network` accepts a name like `base`, an Alchemy subdomain like
-`base-mainnet`, or a chain id; `--chain-id` takes the numeric id. To persist the
-hint, add `default_chain` (or `default_network` / `default_chain_id`) to local
-config:
-
-```json
-{
-  "alchemy_api_key": "<ALCHEMY_API_KEY>",
-  "etherscan_api_key": "<ETHERSCAN_API_KEY>",
-  "default_chain": "base"
-}
-```
-
-`default_chain` is a hint, not a requirement and not a single-chain constraint.
-Multi-chain scopes can override it per target, branch, fork context, or
-experiment.
 
 ### Advanced: explicit RPC override
 
@@ -218,10 +191,6 @@ reentbotpro ./contracts --model gpt-5.6-terra
 reentbotpro ./contracts --context-window 1000000
 # Pin a hard cap on retained history (default auto-sizes per turn to tools in use)
 reentbotpro ./contracts --max-context 200000
-
-# Optional: hint the target chain (otherwise inferred from scope/deployment metadata)
-reentbotpro ./contracts --chain base
-reentbotpro ./contracts --chain-id 8453
 
 # Advanced: explicit RPC endpoint override for a custom/local/non-Alchemy node
 reentbotpro ./contracts --rpc-url http://127.0.0.1:8545

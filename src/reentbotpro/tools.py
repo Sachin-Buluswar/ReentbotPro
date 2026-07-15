@@ -27,7 +27,6 @@ from reentbotpro.config import (  # noqa: F401
     normalize_chain_hint,
     resolve_alchemy_network,
     resolve_chain_id,
-    resolve_default_chain_hint,
     resolve_rpc_endpoint,
 )
 
@@ -10700,14 +10699,13 @@ async def _load_fork_context(
 
 # ── Chain / deployment registry + tool-side RPC resolution ────────────────
 #
-# The agent starts with no chain bound (no manual --chain for normal use).
+# The agent starts with no chain bound and infers per-target bindings during recon.
 # These helpers infer chain/deployment context from the target repo, persist a
 # compact, durable campaign registry artifact, and give tools a single shared,
 # campaign-aware RPC resolver. The pure chain-name/id/explorer normalization
 # lives in config; this layer adds repo scanning, the artifact contract, and
-# the precedence that blends explicit args, fork context, the registry, and
-# run-level defaults — without ever collapsing a multi-chain scope into one
-# global default chain.
+# the precedence that blends explicit args, fork context, and the registry
+# without ever collapsing a multi-chain scope into one global chain.
 
 _CHAIN_REGISTRY_DIR = "/workspace/campaign/chain-registry"
 _CHAIN_REGISTRY_PATH = f"{_CHAIN_REGISTRY_DIR}/registry.json"
@@ -11346,11 +11344,10 @@ async def _resolve_tool_rpc_endpoint(
       3. explicit ``fork_context`` network/chain_id
       4. unambiguous target/deployment binding from the latest chain registry
       5. latest recorded fork context for the branch/target
-      6. ``REENTBOT_DEFAULT_NETWORK`` / ``REENTBOT_DEFAULT_CHAIN_ID`` (or config)
-      7. ``ALCHEMY_API_KEY`` + the resolved chain (and per-chain config rpc_urls)
-      8. explicit ``ETH_RPC_URL`` fallback (a chain-agnostic global, deliberately
+      6. ``ALCHEMY_API_KEY`` + the resolved chain (and per-chain config rpc_urls)
+      7. explicit ``ETH_RPC_URL`` fallback (a chain-agnostic global, deliberately
          demoted below a correctly resolved chain)
-      9. nothing, unless ``allow_default_mainnet`` opts into assumed mainnet
+      8. nothing, unless ``allow_default_mainnet`` opts into assumed mainnet
 
     A target that the registry maps to multiple chains is never resolved
     arbitrarily — it returns ``provider="none"`` with source
@@ -11450,15 +11447,7 @@ async def _resolve_tool_rpc_endpoint(
             )
             source = "latest_fork_context"
 
-    # 6: run-level default chain hint (env first, then config) — a weak fallback.
-    if network is None and chain_id is None:
-        default_net, default_cid, default_src = resolve_default_chain_hint(
-            environ=env, config=cfg
-        )
-        if default_net or default_cid is not None:
-            network, chain_id, source = default_net, default_cid, default_src
-
-    # 7: derive the endpoint for the resolved chain (per-chain config + Alchemy),
+    # 6: derive the endpoint for the resolved chain (per-chain config + Alchemy),
     #    with ETH_RPC_URL stripped so a chain-agnostic global cannot jump ahead of
     #    a correctly resolved chain, and without an assumed mainnet.
     tool_env = {key: value for key, value in env.items() if key != "ETH_RPC_URL"}
@@ -11474,7 +11463,7 @@ async def _resolve_tool_rpc_endpoint(
             endpoint = dataclasses.replace(endpoint, source=source)
         return endpoint
 
-    # 8: explicit ETH_RPC_URL fallback (demoted below a resolved-chain endpoint).
+    # 7: explicit ETH_RPC_URL fallback (demoted below a resolved-chain endpoint).
     eth_rpc = _coerce_nonempty(env.get("ETH_RPC_URL"))
     if eth_rpc:
         fallback = resolve_rpc_endpoint(
@@ -11482,7 +11471,7 @@ async def _resolve_tool_rpc_endpoint(
         )
         return dataclasses.replace(fallback, source="ETH_RPC_URL")
 
-    # 9: nothing resolvable — only assume mainnet when the caller opts in.
+    # 8: nothing resolvable — only assume mainnet when the caller opts in.
     if allow_default_mainnet:
         return resolve_rpc_endpoint(
             allow_default_mainnet=True, environ=tool_env, config=cfg
@@ -11629,8 +11618,8 @@ async def _chain_unresolved_response(
 # request from a bare key, so they need a resolved *chain* (network + chain id),
 # not an RPC URL. These helpers resolve that chain from the same campaign signals
 # as the run-experiment / live-probe resolvers above — explicit args, an explicit
-# or recorded fork context, an unambiguous chain-registry target binding, then the
-# run default — and inject it into the tool's args at dispatch time. When no chain
+# or recorded fork context, or an unambiguous chain-registry target binding, and
+# inject it into the tool's args at dispatch time. When no chain
 # can be inferred the call short-circuits with a structured chain_not_inferred /
 # chain_ambiguous error before any request is made, so a host tool never silently
 # falls back to Ethereum mainnet.
@@ -11659,7 +11648,6 @@ async def _resolve_host_tool_chain(
     fork_context: dict | None = None,
     target_addresses: list | None = None,
     target_names: list | None = None,
-    run_default_network: str | None = None,
     registry: dict | None = None,
 ) -> _HostToolChain:
     """Resolve a host-side live tool's *inferred* target chain (no RPC URL).
@@ -11671,7 +11659,6 @@ async def _resolve_host_tool_chain(
       1. an explicit ``fork_context`` argument's network/chain_id
       2. an unambiguous target-address/name binding in the latest chain registry
       3. the latest recorded fork context
-      4. the run-level default network (CLI/config), if any
 
     A target the registry maps to several chains yields ``status="ambiguous"``
     with the candidate chains, never an arbitrary pick. When nothing resolves the
@@ -11721,11 +11708,6 @@ async def _resolve_host_tool_chain(
         net, cid = _canonical_chain(latest.get("network"), latest.get("chain_id"))
         return _HostToolChain(net, cid, "latest_fork_context", "resolved")
 
-    # 4: the run-level default chain (a deliberately weak fallback).
-    if _has_chain_signal(run_default_network):
-        net, cid = _canonical_chain(run_default_network)
-        return _HostToolChain(net, cid, "run_default", "resolved")
-
     return _HostToolChain(None, None, "none", "not_inferred")
 
 
@@ -11768,13 +11750,13 @@ def _host_tool_chain_targets(tool: str, args: dict) -> list[str]:
     return out
 
 
-def _host_tool_requires_default_chain(tool: str, args: dict) -> bool:
-    """Whether a host tool needs a resolved default chain to run.
+def _host_tool_requires_single_chain(tool: str, args: dict) -> bool:
+    """Whether a host tool needs one resolved chain to run.
 
     Almost always True. The exception is ``get_token_prices`` when every
     requested token already carries its own network and no bare ``addresses[]``
     are given: that call is fully chain-specified per entry, so it must not be
-    blocked for lack of a single default chain.
+    blocked for lack of one shared chain.
     """
     if tool != "get_token_prices":
         return True
@@ -11846,8 +11828,6 @@ async def _prepare_host_tool_chain(
     / ``chain_ambiguous`` JSON string and the host tool is never called — so no
     request is made and Ethereum mainnet is never silently queried.
 
-    ``alchemy_runtime_default_network`` is bound by the host_tools import at the
-    foot of this module.
     """
     prepared = dict(args or {})
 
@@ -11871,8 +11851,8 @@ async def _prepare_host_tool_chain(
         return prepared, None
 
     # A call already chain-specified per entry (get_token_prices tokens[]) needs
-    # no single default chain; let it run.
-    if not _host_tool_requires_default_chain(tool, prepared):
+    # no single shared chain; let it run.
+    if not _host_tool_requires_single_chain(tool, prepared):
         return prepared, None
 
     fork_context = await _resolve_fork_context_arg(
@@ -11882,7 +11862,6 @@ async def _prepare_host_tool_chain(
         container,
         fork_context=fork_context,
         target_addresses=_host_tool_chain_targets(tool, prepared),
-        run_default_network=alchemy_runtime_default_network(),
     )
     if resolution.status == "resolved":
         if resolution.network:
@@ -12067,7 +12046,7 @@ async def _resolve_chain_registry_arg(
 # endpoints. Rather than depend on one global ETH_RPC_URL baked into the
 # container at startup, it derives the endpoint(s) the run needs — from explicit
 # args, the experiment's sequence/workbench chain metadata, a deployment chain
-# binding, the latest fork context, or run defaults — and injects them as
+# binding, or the latest fork context — and injects them as
 # per-exec env vars. Single-chain experiments still get ETH_RPC_URL (for the
 # generated `vm.envString("ETH_RPC_URL")` fork tests); multi-chain experiments
 # additionally get RPC_URL_<chain_id> / RPC_URL_<NETWORK> per declared chain.
@@ -12348,7 +12327,7 @@ async def _resolve_experiment_rpc_endpoints(
     ``chain_id`` args, an explicit ``fork_context`` arg, the experiment's
     sequence/workbench chain metadata (``primary_chain``/``required_chains``/
     chain-bound ``target_addresses``/legacy ``fork`` block), a deployment chain
-    binding, the latest recorded fork context, then run defaults — and resolves a
+    binding, then the latest recorded fork context — and resolves a
     per-chain Alchemy endpoint for each. Single-chain runs reuse the canonical
     single-target resolver verbatim; only a metadata-declared multi-chain run
     takes the dedicated grouping path.
@@ -12456,8 +12435,8 @@ async def _resolve_experiment_rpc_endpoints(
         return _experiment_rpc_plan(primary=primary, endpoints=endpoints)
 
     # Fallback: only a command marker signalled intent — let the single-target
-    # resolver try a deployment binding, the latest fork context, run defaults,
-    # then an explicit ETH_RPC_URL.
+    # resolver try a deployment binding, the latest fork context, then an explicit
+    # ETH_RPC_URL.
     return await _resolve_experiment_single_chain(
         container,
         args,
@@ -12516,8 +12495,8 @@ async def _plan_live_probe_chains(
       binding for that item;
     * otherwise each item's chain comes from its registry deployment binding — a
       binding to several chains is ``ambiguous`` (never chosen arbitrarily);
-    * an unbound item falls back to the latest fork context, then the run-level
-      default chain, else it is ``unbound``.
+    * an unbound item falls back to the latest fork context, else it is
+      ``unbound``.
 
     Returns ``{"assignments": [...], "groups": {key: {...}}, "override": bool}``.
     Each group is ``{"network", "chain_id", "source", "endpoint"}``.
@@ -12576,8 +12555,7 @@ async def _plan_live_probe_chains(
         explicit_source = "fork_context"
     has_explicit = explicit_net is not None or explicit_cid is not None
 
-    # A weak run-level fallback chain (latest fork context, then run default),
-    # consulted only for items with no registry binding.
+    # The latest fork context is a fallback for items with no registry binding.
     fallback_net = fallback_cid = fallback_source = None
     latest = await _latest_fork_context(container)
     if latest and _has_chain_signal(latest.get("network"), latest.get("chain_id")):
@@ -12585,16 +12563,6 @@ async def _plan_live_probe_chains(
             latest.get("network"), latest.get("chain_id")
         )
         fallback_source = "latest_fork_context"
-    else:
-        default_net, default_cid, default_source = resolve_default_chain_hint(
-            environ=env, config=cfg
-        )
-        if default_net or default_cid is not None:
-            fallback_net, fallback_cid, fallback_source = (
-                default_net,
-                default_cid,
-                default_source,
-            )
 
     chain_refs: dict[str, tuple] = {}
 
@@ -49819,7 +49787,6 @@ from reentbotpro.host_tools import (  # noqa: F401, E402
     _etherscan_get_contract_source,
     _redact_alchemy,
     alchemy_key_configured,
-    alchemy_runtime_default_network,
     etherscan_key_configured,
     reset_alchemy_runtime,
     reset_etherscan_runtime,

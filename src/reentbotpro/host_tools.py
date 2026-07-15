@@ -104,39 +104,27 @@ _ALCHEMY_UNAVAILABLE_MARKERS = (
 # Module-level runtime state, set once per run by the CLI and reset by tests.
 _ALCHEMY_RUNTIME = {
     "api_key": None,
-    "primary_network": None,
 }
 _ALCHEMY_USAGE = {"cu": 0, "calls": 0}
 _ALCHEMY_CAPABILITY: dict = {}
 
 # Returned (by Alchemy/Etherscan host tools) when no target chain can be
-# inferred from explicit args, a fork context, a chain-registry binding, or a
-# run default. The host tools never silently query Ethereum mainnet instead.
+# inferred from explicit args, a fork context, or a chain-registry binding. The
+# host tools never silently query Ethereum mainnet instead.
 _CHAIN_NOT_INFERRED_MESSAGE = (
     "No target chain was inferred. Pass network/chain_id, record a fork_context, "
     "or rely on a chain-registry target binding."
 )
 
 
-def set_alchemy_runtime(api_key, primary_network=None) -> None:
-    """Configure the host-side Alchemy tools for this run (called by the CLI).
-
-    primary_network is only a last-resort fallback chain. It may carry an
-    optional run-level default chain (from ``--chain`` / ``--chain-id`` or local
-    config ``default_chain`` / ``default_network``) or a network parsed from an
-    explicit Alchemy rpc_url; it is often None when no chain has been inferred
-    yet. It is never a hard lock: the agent drives chain selection per call and
-    via record_fork_context, both of which override this fallback, so a
-    multi-chain scope is never pinned to one chain.
-    """
+def set_alchemy_runtime(api_key) -> None:
+    """Configure the host-side Alchemy credential for this run."""
     _ALCHEMY_RUNTIME["api_key"] = api_key or None
-    _ALCHEMY_RUNTIME["primary_network"] = primary_network or None
 
 
 def reset_alchemy_runtime() -> None:
     """Reset all host-side Alchemy state (test helper)."""
     _ALCHEMY_RUNTIME["api_key"] = None
-    _ALCHEMY_RUNTIME["primary_network"] = None
     _ALCHEMY_USAGE["cu"] = 0
     _ALCHEMY_USAGE["calls"] = 0
     _ALCHEMY_CAPABILITY.clear()
@@ -147,30 +135,9 @@ def alchemy_key_configured() -> bool:
     return bool(_ALCHEMY_RUNTIME.get("api_key"))
 
 
-def alchemy_runtime_default_network() -> str | None:
-    """The run-level default Alchemy network for this run, or None.
-
-    This is the chain the CLI resolved for the run (``--chain`` / ``--chain-id``
-    / local-config default / a network parsed from an explicit Alchemy rpc_url) —
-    never a blind Ethereum-mainnet fallback. It is None when no chain has been
-    configured, in which case host tools infer the chain per call / from a
-    recorded fork context / chain registry and report ``chain_not_inferred`` when
-    nothing resolves. The dispatch-side host-tool chain resolver consults this as
-    its weakest (run-default) precedence step.
-    """
-    return _ALCHEMY_RUNTIME.get("primary_network") or None
-
-
-def _alchemy_settings() -> tuple:
-    """Return ``(api_key | None, default_network | None)``. Authoritative source
-    is the runtime set by the CLI; never reads config on the hot path.
-
-    ``default_network`` is the run-level default chain (or None) — it is no longer
-    a blind ``eth-mainnet`` fallback, so a tool with no inferred chain reports
-    ``chain_not_inferred`` rather than silently querying Ethereum mainnet."""
-    key = _ALCHEMY_RUNTIME.get("api_key") or None
-    network = _ALCHEMY_RUNTIME.get("primary_network") or None
-    return key, network
+def _alchemy_settings() -> str | None:
+    """Return the runtime Alchemy API key without reading local config."""
+    return _ALCHEMY_RUNTIME.get("api_key") or None
 
 
 async def _alchemy_fork_context_network(container) -> str | None:
@@ -204,20 +171,15 @@ async def _alchemy_fork_context_network(container) -> str | None:
     return None
 
 
-async def _alchemy_default_network(container) -> str | None:
+async def _alchemy_context_network(container) -> str | None:
     """The chain to use when a tool call omits `network`, or None.
 
-    Resolves the agent's most recent recorded fork-context chain, else the
-    run-level default network. Returns None when neither is known — it never
-    falls back to Ethereum mainnet, so callers that require a chain report
-    ``chain_not_inferred`` instead of silently querying mainnet. (In the normal
-    dispatch path the chain is already resolved and injected before the tool
-    runs; this remains the in-tool safety net for any other call site.)"""
-    fork_context_network = await _alchemy_fork_context_network(container)
-    if fork_context_network:
-        return fork_context_network
-    _, network = _alchemy_settings()
-    return network
+    Resolves the agent's most recent recorded fork-context chain. It never falls
+    back to a run-level or Ethereum-mainnet default. In the normal dispatch path
+    the chain is already resolved and injected before the tool runs; this remains
+    the in-tool safety net for direct call sites.
+    """
+    return await _alchemy_fork_context_network(container)
 
 
 def _redact_alchemy(value, api_key):
@@ -298,16 +260,15 @@ async def _alchemy_rpc(method, params, *, network=None, cu_method=None, containe
 
     The target chain is the agent-supplied `network` (Alchemy subdomain, chain
     name, or chain id); when omitted it resolves the chain recorded in the latest
-    record_fork_context, then the run default. If no chain can be inferred it
-    returns ``chain_not_inferred`` rather than silently querying Ethereum
-    mainnet."""
-    key, default_network = _alchemy_settings()
+    record_fork_context. If no chain can be inferred it returns
+    ``chain_not_inferred`` rather than silently querying Ethereum mainnet."""
+    key = _alchemy_settings()
     billing_method = cu_method or method
     if not key:
-        return {"network": network or default_network, "method": method, "ok": False,
+        return {"network": network, "method": method, "ok": False,
                 "error": "alchemy_not_configured", "message": "No Alchemy API key configured."}
     if network is None or str(network).strip() == "":
-        net = await _alchemy_default_network(container) if container is not None else default_network
+        net = await _alchemy_context_network(container) if container is not None else None
         if not net:
             return {"network": None, "method": method, "ok": False,
                     "error": "chain_not_inferred", "message": _CHAIN_NOT_INFERRED_MESSAGE}
@@ -355,7 +316,7 @@ async def _alchemy_rpc(method, params, *, network=None, cu_method=None, containe
 
 async def _alchemy_prices_call(payload, *, endpoint="tokens/by-address", cu_method="prices_by_address") -> dict:
     """Call the Alchemy Prices REST API (different host, bare key)."""
-    key, _ = _alchemy_settings()
+    key = _alchemy_settings()
     base = {"network": "prices", "method": cu_method}
     if not key:
         return {**base, "ok": False, "error": "alchemy_not_configured",
@@ -388,7 +349,7 @@ async def _alchemy_prices_call(payload, *, endpoint="tokens/by-address", cu_meth
 async def _write_alchemy_artifact(container, slug, payload) -> str:
     """Persist a redacted probe payload under the campaign probes dir, return
     its path (a valid /workspace/campaign/ evidence path)."""
-    key, _ = _alchemy_settings()
+    key = _alchemy_settings()
     redacted = _redact_alchemy(payload, key)
     content = json.dumps(redacted, indent=2, sort_keys=True, default=str)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -875,7 +836,7 @@ async def _alchemy_get_token_prices(container, args) -> str:
                 f"unrecognized network '{raw_network}'; use an Alchemy subdomain, chain name, or chain id"
             ))
     else:
-        net = await _alchemy_default_network(container)
+        net = await _alchemy_context_network(container)
     entries = []
     tokens_arg = args.get("tokens")
     addresses_arg = args.get("addresses")
@@ -1479,7 +1440,7 @@ def _observed_tx_unavailable(tool, address, target_selector, net, call, action_s
 
 
 async def _write_observed_tx_artifact(container, otx_id, payload) -> str:
-    key, _ = _alchemy_settings()
+    key = _alchemy_settings()
     content = json.dumps(_redact_alchemy(payload, key), indent=2, sort_keys=True, default=str)
     path = f"{_OBSERVED_TX_DIR}/{otx_id}.json"
     await container.write_file(path, content + "\n")
@@ -1544,7 +1505,7 @@ async def _alchemy_observed_tx_miner(container, args) -> str:
         # this tool runs; here (no key, or a direct call) net may be None, and the
         # downstream _alchemy_rpc reports alchemy_not_configured (key checked
         # first) or chain_not_inferred, surfaced via _observed_tx_unavailable.
-        net = await _alchemy_default_network(container)
+        net = await _alchemy_context_network(container)
 
     blockers: list = []
     enrichment_degraded = False
@@ -1648,7 +1609,7 @@ async def _alchemy_observed_tx_miner(container, args) -> str:
     }
     if action_space:
         digest["action_space"] = action_space
-    key, _ = _alchemy_settings()
+    key = _alchemy_settings()
     return json.dumps(_redact_alchemy(digest, key), indent=2, sort_keys=True, default=str)
 
 
@@ -1730,9 +1691,9 @@ async def _etherscan_request(action, extra_params, *, network=None, chain_id=Non
     never raises; never leaks the key.
 
     The chain id is taken from the explicit ``chain_id``/``network`` args, else
-    the latest record_fork_context chain, then the run default. It never defaults
-    to chain id 1: when no chain can be inferred it returns ``chain_not_inferred``
-    rather than silently querying Ethereum mainnet."""
+    the latest record_fork_context chain. It never defaults to chain id 1: when
+    no chain can be inferred it returns ``chain_not_inferred`` rather than
+    silently querying Ethereum mainnet."""
     key = _etherscan_api_key()
     if not key:
         return {"ok": False, "error": "etherscan_not_configured",
@@ -1746,7 +1707,7 @@ async def _etherscan_request(action, extra_params, *, network=None, chain_id=Non
         chain_id = resolved_chain_id
     else:
         default_subdomain = (
-            await _alchemy_default_network(container) if container is not None else None
+            await _alchemy_context_network(container) if container is not None else None
         )
         chain_id = resolve_chain_id(default_subdomain) if default_subdomain else None
         if chain_id is None:

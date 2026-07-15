@@ -485,7 +485,7 @@ At run completion, `_save_campaign_artifacts` copies:
 
 The normal output directory also includes `report.md` and `findings.json`.
 `findings.json` records run metadata, structured RPC provenance under `rpc`
-(`provider` alchemy/explicit/none, target `network`/`chain_id`, `source`,
+(`provider` alchemy/explicit/none, endpoint `network`/`chain_id`, `source`,
 `override`, `assumed_default_mainnet`, plus a legacy redacted `rpc_url` prefix
 kept for compatibility), saved artifact counts, submitted findings, and final
 readiness status when the controller does not permit a clean stop.
@@ -564,7 +564,7 @@ The implementation currently supports:
   `compose_sequence_experiment`. This grounds setup/calldata/fork state in real
   usage so experiments avoid calldata/setup false negatives. The chain is
   selected per call or inferred at dispatch (fork context, chain-registry
-  binding, latest `record_fork_context`, then run default; `chain_not_inferred`
+  binding, then latest `record_fork_context`; `chain_not_inferred`
   when none), the key is host-resolved and redacted, and successful calls write
   the full result under `/workspace/campaign/observed-txs/` (`otx-NNN`) when
   `record_result=true` (the default), while returning a compact digest. It
@@ -572,15 +572,13 @@ The implementation currently supports:
   the key/chain) or `partial` (no matching txs, or enrichment unavailable) and is
   corroboration/context only — a runnable forge PoC stays required for findings.
 - Chain/deployment inference and a single shared tool-side RPC resolver. The
-  agent starts with no chain bound (no manual `--chain` for normal use):
-  no-chain startup is the normal path, and source-only analysis proceeds until
-  recon fixes a chain. `--chain`/`--chain-id` and config
-  `default_chain`/`default_network`/`default_chain_id` are optional hints — not
-  requirements and not single-chain constraints (a multi-chain scope overrides
-  them per target, branch, or fork context). `ETH_RPC_URL` is an advanced
-  explicit override and the env var injected into generated fork tests (see the
-  fork-injection item below), never normal setup; host-side tools never silently
-  fall back to mainnet.
+  agent starts with no chain bound: no-chain startup is the normal path, and
+  source-only analysis proceeds until recon fixes one or more chains. There is no
+  run-level target-chain setting; the agent binds each target, branch, and fork
+  context from discovered evidence. `ETH_RPC_URL` is an advanced explicit
+  endpoint override and the env var injected into generated fork tests (see the
+  fork-injection item below), never normal setup or a substitute for per-target
+  chain discovery; host-side tools never silently fall back to mainnet.
   `inspect_scope` infers a chain/deployment registry from deployment files,
   Foundry `broadcast/<chainid>/` and Hardhat `deployments/<network>/` layouts,
   and block-explorer links, persisting it as a campaign artifact (above).
@@ -592,9 +590,8 @@ The implementation currently supports:
   (`_resolve_tool_rpc_endpoint`) derives an endpoint for a tool call in
   precedence order: explicit `rpc_url`; `network`/`chain_id` args; an explicit
   fork context; an unambiguous registry binding for the target; the latest
-  recorded fork context; the run-level default
-  (`REENTBOT_DEFAULT_NETWORK`/`REENTBOT_DEFAULT_CHAIN_ID` or config); the
-  resolved chain via Alchemy/per-chain config; then a demoted, chain-agnostic
+  recorded fork context; the resolved chain via Alchemy/per-chain config; then a
+  demoted, chain-agnostic
   `ETH_RPC_URL`; and nothing unless mainnet is explicitly allowed. A target the
   registry maps to several chains is never resolved arbitrarily — it returns
   `provider="none"`; `_resolve_tool_rpc_endpoints_for_chains` resolves one
