@@ -1,14 +1,17 @@
 import asyncio
 import json
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+from reentbotpro.llm import DEFAULT_MODEL
 from reentbotpro.agent import (
     DEFAULT_CONTEXT_WINDOW,
     DEFAULT_TOOLSETS,
     _ATTACK_SEARCH_ALWAYS_ALLOWED_TOOLS,
     _CAMPAIGN_SUMMARY_COUNTERS,
     _CAMPAIGN_TOOL_TRACKING,
+    _FINAL_READINESS_NUDGE,
+    _MIN_AUDIT_TURNS,
     _TOOLS_TOKEN_OVERHEAD,
     _age_tool_outputs,
     _activate_requested_toolsets,
@@ -20,7 +23,9 @@ from reentbotpro.agent import (
     _execute_tool_calls,
     _is_context_window_error,
     _report_visible_tools,
+    _record_final_readiness,
     _run_command_is_diagnostic,
+    _run_experiment_targets_local_workspace,
     _strip_old_reasoning,
     _stream_turn,
     _stream_turn_with_recovery,
@@ -33,6 +38,7 @@ from reentbotpro.agent import (
     _update_explored,
     _visible_tools,
     calculate_max_context,
+    chat_loop,
     get_model_max_output_tokens,
     run_audit,
     run_report,
@@ -99,7 +105,7 @@ class FakeContainer:
 
 
 class StreamTurnTests(unittest.TestCase):
-    def test_agent_default_context_window_matches_default_model(self):
+    def test_legacy_default_context_window_remains_stable(self):
         self.assertEqual(DEFAULT_CONTEXT_WINDOW, 272_000)
 
     def test_default_output_limit_is_audit_reserve(self):
@@ -112,7 +118,7 @@ class StreamTurnTests(unittest.TestCase):
 
         asyncio.run(_stream_turn(
             client,
-            "gpt-5.4",
+            DEFAULT_MODEL,
             [{"role": "user", "content": "inspect"}],
             display=object(),
         ))
@@ -129,7 +135,7 @@ class StreamTurnTests(unittest.TestCase):
 
         asyncio.run(_stream_turn(
             client,
-            "gpt-5.4",
+            DEFAULT_MODEL,
             [{"role": "user", "content": "inspect"}],
             display=object(),
         ))
@@ -137,9 +143,15 @@ class StreamTurnTests(unittest.TestCase):
         names = {tool["function"]["name"] for tool in client.kwargs["tools"]}
         self.assertIn("inspect_scope", names)
         self.assertIn("request_toolset", names)
-        self.assertIn("plan_attack_campaign", names)
-        self.assertIn("review_campaign_progress", names)
         self.assertIn("attack_search", names)
+        self.assertIn("build_campaign_brief", names)
+        self.assertTrue({
+            "create_experiment",
+            "plan_attack_campaign",
+            "prepare_fork_exploit_workbench",
+            "review_attack_surface_coverage",
+            "review_campaign_progress",
+        }.isdisjoint(names))
         self.assertNotIn("compose_sequence_experiment", names)
         self.assertNotIn("submit_finding", names)
 
@@ -153,7 +165,7 @@ class StreamTurnTests(unittest.TestCase):
 
         asyncio.run(_stream_turn(
             client,
-            "gpt-5.4",
+            DEFAULT_MODEL,
             [{"role": "user", "content": "inspect"}],
             display=object(),
             tools=[],
@@ -172,7 +184,7 @@ class StreamTurnTests(unittest.TestCase):
 
         asyncio.run(_stream_turn(
             client,
-            "gpt-5.4",
+            DEFAULT_MODEL,
             [{"role": "user", "content": "inspect"}],
             display=object(),
             tools=tools,
@@ -227,7 +239,7 @@ class StreamTurnTests(unittest.TestCase):
         ):
             report = asyncio.run(run_report(
                 client=object(),
-                model="gpt-5.4",
+                model=DEFAULT_MODEL,
                 messages=messages,
                 container=container,
                 display=FakeDisplay(),
@@ -258,10 +270,63 @@ class StreamTurnTests(unittest.TestCase):
         self.assertIn('"validated": true', report_prompt)
         self.assertNotIn("Here are all submitted findings for reference", report_prompt)
 
+    def test_run_report_fallback_uses_only_report_phase_output(self):
+        container = FakeContainer()
+        audit_chunk = "AUDIT_REASONING_SHOULD_NOT_BE_A_REPORT " * 30
+        report_chunk = "# Report\n\nValidated submitted findings only. " * 20
+        messages = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "assistant", "content": audit_chunk},
+        ]
+
+        async def fake_stream_turn_with_recovery(
+            client,
+            model,
+            turn_messages,
+            display,
+            **kwargs,
+        ):
+            return (
+                {"role": "assistant", "content": report_chunk},
+                0,
+                0,
+                "stop",
+                turn_messages,
+            )
+
+        with patch(
+            "reentbotpro.agent._stream_turn_with_recovery",
+            side_effect=fake_stream_turn_with_recovery,
+        ):
+            report = asyncio.run(run_report(
+                client=object(),
+                model=DEFAULT_MODEL,
+                messages=messages,
+                container=container,
+                display=FakeDisplay(),
+                findings=[],
+                max_time_seconds=5,
+            ))
+
+        self.assertEqual(report, report_chunk)
+        self.assertNotIn("AUDIT_REASONING_SHOULD_NOT_BE_A_REPORT", report)
+
     def test_stop_readiness_blocks_high_signal_active_branch(self):
         container = FakeContainer()
         container.files["/workspace/campaign/attack-search/current.json"] = """
 {
+  "summary": {
+    "active": 1,
+    "actionable": 1,
+    "parked": 0,
+    "campaign_ready": false
+  },
+  "next_action": {
+    "branch_id": "br-001",
+    "status": "needs_evidence",
+    "tool": "summarize_trace",
+    "must_follow": true
+  },
   "branches": [{
     "id": "br-001",
     "title": "Live vault withdrawal branch",
@@ -279,33 +344,99 @@ class StreamTurnTests(unittest.TestCase):
         self.assertFalse(readiness["ready"])
         self.assertEqual(
             readiness["blockers"][0]["kind"],
-            "active_attack_search_branch",
+            "attack_search_not_ready",
         )
+        self.assertEqual(readiness["blockers"][0]["actionable"], 1)
 
-    def test_stop_readiness_allows_generic_refresh_branch(self):
+    def test_stop_readiness_accepts_branchless_campaign_ready_state(self):
         container = FakeContainer()
         container.files["/workspace/campaign/attack-search/current.json"] = """
 {
-  "branches": [{
-    "id": "br-001",
-    "title": "Refresh campaign plan",
-    "status": "needs_hypothesis",
-    "source": "needs_plan",
-    "priority": "medium",
-    "priority_score": 1,
-    "next_tool": "plan_attack_campaign"
-  }]
+  "summary": {
+    "active": 0,
+    "actionable": 0,
+    "parked": 0,
+    "campaign_ready": true
+  },
+  "next_action": {
+    "branch_id": null,
+    "status": "campaign_ready",
+    "tool": null,
+    "must_follow": false
+  },
+  "branches": []
 }
 """
 
         readiness = asyncio.run(_campaign_stop_readiness(container))
 
         self.assertTrue(readiness["ready"])
+        self.assertEqual(readiness["blockers"], [])
+        self.assertEqual(readiness["checked"], {"attack_search": True})
 
-    def test_stop_readiness_allows_low_signal_coverage_cleanup(self):
+    def test_stop_readiness_requires_attack_search_state(self):
+        readiness = asyncio.run(_campaign_stop_readiness(FakeContainer()))
+
+        self.assertFalse(readiness["ready"])
+        self.assertEqual(readiness["checked"], {"attack_search": False})
+        self.assertEqual(
+            readiness["blockers"][0]["kind"],
+            "missing_attack_search_state",
+        )
+
+    def test_campaign_ready_next_action_does_not_guard_unrelated_tool(self):
         container = FakeContainer()
         container.files["/workspace/campaign/attack-search/current.json"] = """
 {
+  "next_action": {
+    "branch_id": null,
+    "status": "campaign_ready",
+    "tool": "map_protocol_graph",
+    "expected_tools": ["map_protocol_graph"],
+    "must_follow": false
+  },
+  "branches": []
+}
+"""
+        tool_calls = [{
+            "id": "call_1",
+            "function": {
+                "name": "write_file",
+                "arguments": "{\"path\":\"/workspace/notes.txt\",\"content\":\"done\"}",
+            },
+        }]
+
+        with patch(
+            "reentbotpro.agent.execute_tool",
+            new=AsyncMock(return_value="ran write_file"),
+        ) as mocked:
+            results = asyncio.run(_execute_tool_calls(
+                tool_calls,
+                container,
+                [],
+                FakeDisplay(),
+            ))
+
+        mocked.assert_awaited_once()
+        self.assertEqual(results[0]["content"], "ran write_file")
+        self.assertNotIn("attack_search_next_action_required", results[0]["content"])
+
+    def test_stop_readiness_blocks_nonparked_next_action_regardless_of_score(self):
+        container = FakeContainer()
+        container.files["/workspace/campaign/attack-search/current.json"] = """
+{
+  "summary": {
+    "active": 1,
+    "actionable": 1,
+    "parked": 0,
+    "campaign_ready": false
+  },
+  "next_action": {
+    "branch_id": "br-001",
+    "status": "needs_context",
+    "tool": "source_slice",
+    "must_follow": true
+  },
   "branches": [{
     "id": "br-001",
     "title": "Source-review coverage gap: MockSpell::cast",
@@ -328,16 +459,32 @@ class StreamTurnTests(unittest.TestCase):
 
         readiness = asyncio.run(_campaign_stop_readiness(container))
 
-        self.assertTrue(readiness["ready"])
+        self.assertFalse(readiness["ready"])
+        self.assertEqual(
+            readiness["blockers"][0]["kind"],
+            "attack_search_not_ready",
+        )
 
-    def test_stop_readiness_blocks_high_signal_coverage_gap(self):
+    def test_stop_readiness_accepts_campaign_ready_with_parked_branches(self):
         container = FakeContainer()
         container.files["/workspace/campaign/attack-search/current.json"] = """
 {
+  "summary": {
+    "active": 0,
+    "actionable": 0,
+    "parked": 1,
+    "campaign_ready": true
+  },
+  "next_action": {
+    "branch_id": null,
+    "status": "campaign_ready",
+    "tool": null,
+    "must_follow": false
+  },
   "branches": [{
     "id": "br-001",
     "title": "Source-review coverage gap: Vault::withdraw",
-    "status": "needs_context",
+    "status": "parked_needs_live_context",
     "source": "coverage_high_attention_gap",
     "priority": "high",
     "priority_score": 22,
@@ -356,10 +503,239 @@ class StreamTurnTests(unittest.TestCase):
 
         readiness = asyncio.run(_campaign_stop_readiness(container))
 
+        self.assertTrue(readiness["ready"])
+        self.assertEqual(readiness["blockers"], [])
+
+    def test_stop_readiness_consumes_controller_summary_without_status_duplication(self):
+        container = FakeContainer()
+        container.files["/workspace/campaign/attack-search/current.json"] = """
+{
+  "summary": {
+    "active": 1,
+    "actionable": 0,
+    "parked": 1,
+    "campaign_ready": true
+  },
+  "next_action": {
+    "branch_id": null,
+    "status": "campaign_ready",
+    "tool": null,
+    "must_follow": false
+  },
+  "branches": [{
+    "id": "br-future",
+    "status": "parked_by_future_controller_policy"
+  }]
+}
+"""
+
+        readiness = asyncio.run(_campaign_stop_readiness(container))
+
+        self.assertTrue(readiness["ready"])
+        self.assertEqual(readiness["blockers"], [])
+
+    def test_stop_readiness_fails_closed_without_controller_summary(self):
+        container = FakeContainer()
+        container.files["/workspace/campaign/attack-search/current.json"] = """
+{
+  "next_action": {
+    "branch_id": null,
+    "status": "campaign_ready",
+    "tool": null,
+    "must_follow": false
+  },
+  "branches": []
+}
+"""
+
+        readiness = asyncio.run(_campaign_stop_readiness(container))
+
         self.assertFalse(readiness["ready"])
         self.assertEqual(
             readiness["blockers"][0]["kind"],
-            "active_attack_search_branch",
+            "attack_search_not_ready",
+        )
+
+    def test_record_final_readiness_runs_fresh_sync_before_reading_state(self):
+        container = FakeContainer()
+        ready_state = {
+            "summary": {
+                "active": 0,
+                "actionable": 0,
+                "parked": 0,
+                "campaign_ready": True,
+            },
+            "next_action": {
+                "branch_id": None,
+                "status": "campaign_ready",
+                "tool": None,
+                "must_follow": False,
+            },
+            "branches": [],
+        }
+
+        async def sync_controller(name, arguments, target, findings):
+            self.assertEqual(name, "attack_search")
+            self.assertEqual(
+                arguments,
+                {"action": "sync", "record_result": False},
+            )
+            self.assertIs(target, container)
+            self.assertEqual(findings, [])
+            target.files["/workspace/campaign/attack-search/current.json"] = (
+                json.dumps(ready_state)
+            )
+            return json.dumps({
+                "summary": ready_state["summary"],
+                "next_action": ready_state["next_action"],
+            })
+
+        explored = {}
+        with patch(
+            "reentbotpro.agent.execute_tool",
+            new=AsyncMock(side_effect=sync_controller),
+        ) as mocked:
+            readiness = asyncio.run(_record_final_readiness(
+                container,
+                explored,
+                reason="wrap_up_requested",
+            ))
+
+        mocked.assert_awaited_once()
+        self.assertTrue(readiness["ready"])
+        self.assertEqual(
+            readiness["sync"],
+            {"action": "sync", "attempted": True, "succeeded": True},
+        )
+        self.assertEqual(explored["attack_search_runs"], 1)
+        self.assertNotIn("audit_status", explored)
+
+    def test_record_final_readiness_rejects_stale_ready_state_when_sync_fails(self):
+        container = FakeContainer()
+        container.files["/workspace/campaign/attack-search/current.json"] = json.dumps({
+            "summary": {"actionable": 0, "campaign_ready": True},
+            "next_action": {
+                "branch_id": None,
+                "status": "campaign_ready",
+                "must_follow": False,
+            },
+            "branches": [],
+        })
+        explored = {}
+
+        with patch(
+            "reentbotpro.agent.execute_tool",
+            new=AsyncMock(return_value="Error: controller sync unavailable"),
+        ) as mocked:
+            readiness = asyncio.run(_record_final_readiness(
+                container,
+                explored,
+                reason="wrap_up_requested",
+            ))
+
+        mocked.assert_awaited_once()
+        self.assertFalse(readiness["ready"])
+        self.assertEqual(
+            readiness["blockers"][0]["kind"],
+            "final_attack_search_sync_failed",
+        )
+        self.assertFalse(readiness["sync"]["succeeded"])
+        self.assertEqual(
+            explored["audit_status"],
+            "incomplete_no_validated_findings",
+        )
+        self.assertEqual(explored["audit_status_reason"], "wrap_up_requested")
+
+    def test_wall_clock_wrap_up_performs_fresh_final_sync(self):
+        container = FakeContainer()
+        ready_state = {
+            "summary": {"actionable": 0, "campaign_ready": True},
+            "next_action": {
+                "branch_id": None,
+                "status": "campaign_ready",
+                "tool": None,
+                "must_follow": False,
+            },
+            "branches": [],
+        }
+
+        async def finish_turn(*_args, **_kwargs):
+            return (
+                {"role": "assistant", "content": "Wrapped up."},
+                0,
+                0,
+                "stop",
+                [],
+            )
+
+        async def sync_controller(_name, arguments, target, _findings):
+            self.assertEqual(arguments["action"], "sync")
+            target.files["/workspace/campaign/attack-search/current.json"] = (
+                json.dumps(ready_state)
+            )
+            return json.dumps({
+                "summary": ready_state["summary"],
+                "next_action": ready_state["next_action"],
+            })
+
+        with (
+            patch(
+                "reentbotpro.agent._stream_turn_with_recovery",
+                side_effect=finish_turn,
+            ),
+            patch(
+                "reentbotpro.agent.execute_tool",
+                new=AsyncMock(side_effect=sync_controller),
+            ) as synced,
+        ):
+            _findings, _messages, explored = asyncio.run(run_audit(
+                client=object(),
+                model=DEFAULT_MODEL,
+                system_prompt="system",
+                container=container,
+                display=FakeDisplay(),
+                max_time_seconds=0,
+            ))
+
+        synced.assert_awaited_once()
+        self.assertTrue(explored["final_readiness"]["ready"])
+        self.assertTrue(explored["final_readiness"]["sync"]["succeeded"])
+        self.assertEqual(explored["attack_search_syncs"], 1)
+
+    def test_stop_readiness_rejects_inconsistent_ready_state(self):
+        container = FakeContainer()
+        container.files["/workspace/campaign/attack-search/current.json"] = """
+{
+  "summary": {
+    "active": 1,
+    "actionable": 1,
+    "parked": 0,
+    "campaign_ready": true
+  },
+  "next_action": {
+    "branch_id": null,
+    "status": "campaign_ready",
+    "tool": null,
+    "must_follow": false
+  },
+  "branches": [{
+    "id": "br-001",
+    "title": "Unreviewed objective evidence",
+    "status": "needs_evidence",
+    "source": "result_without_objective",
+    "priority": "high",
+    "priority_score": 28,
+    "next_tool": "summarize_trace"
+  }]
+}
+"""
+
+        readiness = asyncio.run(_campaign_stop_readiness(container))
+
+        self.assertFalse(readiness["ready"])
+        self.assertEqual(
+            readiness["blockers"][0]["kind"],
+            "attack_search_not_ready",
         )
 
     def test_execute_tool_calls_blocks_tool_that_violates_attack_search_next_action(self):
@@ -684,6 +1060,27 @@ class StreamTurnTests(unittest.TestCase):
         self.assertNotIn("attack_search_next_action_required", results[0]["content"])
         self.assertEqual(results[0]["content"], "ran run_experiment")
 
+    def test_run_experiment_with_local_working_dir_is_always_allowed(self):
+        container = FakeContainer()
+        container.files["/workspace/campaign/attack-search/current.json"] = (
+            self._next_action_search_json(tool="write_file")
+        )
+        tool_calls = [{
+            "id": "call_1",
+            "function": {
+                "name": "run_experiment",
+                "arguments": json.dumps({
+                    "command": "FOUNDRY_PROFILE=generated forge test -vvv",
+                    "working_dir": "/workspace/experiments/exp-001-callback/",
+                }),
+            },
+        }]
+
+        mocked, results = self._run_one_tool(tool_calls, container)
+
+        self.assertTrue(mocked.called)
+        self.assertNotIn("attack_search_next_action_required", results[0]["content"])
+
     def test_repair_experiment_is_always_allowed_against_unrelated_next_action(self):
         # repair_experiment only ever edits the agent's own /workspace/experiments/
         # workspace, so -- like run_experiment against the local workspace -- the
@@ -707,8 +1104,8 @@ class StreamTurnTests(unittest.TestCase):
         self.assertNotIn("attack_search_next_action_required", results[0]["content"])
         self.assertEqual(results[0]["content"], "ran repair_experiment")
 
-    def test_run_experiment_with_workspace_path_anywhere_in_command_is_allowed(self):
-        # The path may appear in the middle of the command (e.g. as --root arg)
+    def test_run_experiment_with_workspace_root_argument_is_allowed(self):
+        # A parsed --root target is an explicit local-workspace binding.
         container = FakeContainer()
         container.files["/workspace/campaign/attack-search/current.json"] = (
             self._next_action_search_json(tool="write_file")
@@ -727,6 +1124,35 @@ class StreamTurnTests(unittest.TestCase):
         mocked, _results = self._run_one_tool(tool_calls, container)
 
         self.assertTrue(mocked.called)
+
+    def test_run_experiment_workspace_substring_does_not_bypass_guard(self):
+        container = FakeContainer()
+        container.files["/workspace/campaign/attack-search/current.json"] = (
+            self._next_action_search_json(tool="write_file")
+        )
+        tool_calls = [{
+            "id": "call_1",
+            "function": {
+                "name": "run_experiment",
+                "arguments": json.dumps({
+                    "command": (
+                        "echo /workspace/experiments/exp-001-callback "
+                        "&& rm -rf /audit"
+                    ),
+                }),
+            },
+        }]
+
+        with patch("reentbotpro.agent.execute_tool", new=AsyncMock()) as mocked:
+            results = asyncio.run(_execute_tool_calls(
+                tool_calls,
+                container,
+                [],
+                FakeDisplay(),
+            ))
+
+        self.assertFalse(mocked.called)
+        self.assertIn("attack_search_next_action_required", results[0]["content"])
 
     def test_run_experiment_with_non_workspace_command_still_respects_guard(self):
         # Generic run_experiment usage (e.g. cast call against mainnet) should
@@ -848,7 +1274,7 @@ class StreamTurnTests(unittest.TestCase):
 
         asyncio.run(_stream_turn(
             client,
-            "gpt-5.4",
+            DEFAULT_MODEL,
             [{"role": "user", "content": "inspect"}],
             display=object(),
             max_output_tokens=999_999,
@@ -866,7 +1292,7 @@ class StreamTurnTests(unittest.TestCase):
 
         asyncio.run(_stream_turn(
             client,
-            "gpt-5.4",
+            DEFAULT_MODEL,
             [{"role": "user", "content": "inspect"}],
             display=object(),
             max_output_tokens=None,
@@ -874,7 +1300,7 @@ class StreamTurnTests(unittest.TestCase):
 
         self.assertEqual(
             client.kwargs["max_output_tokens"],
-            get_model_max_output_tokens("gpt-5.4"),
+            get_model_max_output_tokens(DEFAULT_MODEL),
         )
 
     # ── Diagnostic run_command permissiveness ──────────────────────────
@@ -919,6 +1345,39 @@ class StreamTurnTests(unittest.TestCase):
 
         self.assertFalse(mocked.called)
         self.assertIn("attack_search_next_action_required", results[0]["content"])
+
+    def test_diagnostic_run_command_cannot_overwrite_protected_campaign_artifacts(self):
+        container = FakeContainer()
+        container.files["/workspace/campaign/attack-search/current.json"] = (
+            self._next_action_search_json(tool="compose_sequence_experiment")
+        )
+        commands = (
+            "forge build > /workspace/campaign/attack-search/current.json",
+            "slither . --json /workspace/campaign/state.json",
+            "slither . --json /workspace/campaign/results/res-001.log",
+            "forge build > /output/report.md",
+            "forge build --use /audit/bin/evil-solc",
+        )
+
+        for index, command in enumerate(commands, start=1):
+            tool_calls = [{
+                "id": f"call_{index}",
+                "function": {
+                    "name": "run_command",
+                    "arguments": json.dumps({"command": command}),
+                },
+            }]
+            with self.subTest(command=command):
+                with patch("reentbotpro.agent.execute_tool", new=AsyncMock()) as mocked:
+                    results = asyncio.run(_execute_tool_calls(
+                        tool_calls, container, [], FakeDisplay(),
+                    ))
+
+                self.assertFalse(mocked.called)
+                self.assertIn(
+                    "attack_search_next_action_required",
+                    results[0]["content"],
+                )
 
     def test_structured_expected_tools_overrides_text_scan(self):
         # next_action carries an explicit expected_tools list; the guard honors
@@ -1088,15 +1547,37 @@ class AgentStateTests(unittest.TestCase):
             _build_explored_summary(explored),
         )
 
+    def test_retired_workflow_tools_are_absent_from_agent_tracking(self):
+        retired_tools = {
+            "create_experiment",
+            "plan_attack_campaign",
+            "prepare_fork_exploit_workbench",
+            "review_attack_surface_coverage",
+            "review_campaign_progress",
+        }
+
+        self.assertTrue(retired_tools.isdisjoint(_CAMPAIGN_TOOL_TRACKING))
+        self.assertTrue(retired_tools.isdisjoint(_ATTACK_SEARCH_ALWAYS_ALLOWED_TOOLS))
+        self.assertTrue(retired_tools.isdisjoint(TOOL_BY_NAME))
+        self.assertTrue(retired_tools.isdisjoint(tool_names_for_toolsets({"all"})))
+        summary_counters = {name for name, _label in _CAMPAIGN_SUMMARY_COUNTERS}
+        self.assertTrue({
+            "campaign_plans",
+            "coverage_reviews",
+            "experiments_created",
+            "progress_reviews",
+        }.isdisjoint(summary_counters))
+
     @staticmethod
-    def _run_attack_search(next_action, *, with_results=True):
+    def _run_attack_search(next_action, *, with_results=True, explored=None):
         """Run _update_explored for one attack_search call and return explored.
 
         The controller's result payload (with ``next_action``) drives
         demand-driven toolset activation, so the default passes a result message;
         ``with_results=False`` exercises the legacy (no-result) signature.
         """
-        explored = {"files_read": set(), "tools_run": set()}
+        if explored is None:
+            explored = {"files_read": set(), "tools_run": set()}
         tool_calls = [{
             "id": "call_1",
             "function": {"name": "attack_search", "arguments": '{"action":"sync"}'},
@@ -1122,6 +1603,7 @@ class AgentStateTests(unittest.TestCase):
         })
 
         self.assertEqual(explored["attack_search_runs"], 1)
+        self.assertEqual(explored["attack_search_syncs"], 1)
         self.assertIn("map", explored["active_toolsets"])
         self.assertNotIn("experiment", explored["active_toolsets"])
         self.assertNotIn("evidence", explored["active_toolsets"])
@@ -1207,13 +1689,16 @@ class AgentStateTests(unittest.TestCase):
         names = {tool["function"]["name"] for tool in _visible_tools(explored)}
         self.assertIn("review_finding_evidence", names)
 
-    def test_attack_search_complete_next_action_activates_nothing(self):
-        # A completed search must not unlock any specialized toolset.
+    def test_attack_search_campaign_ready_next_action_activates_nothing(self):
+        # A branchless ready campaign must not unlock any specialized toolset.
         explored = self._run_attack_search({
             "branch_id": None,
-            "status": "complete",
-            "tool": "attack_search",
-            "required_toolsets": [],
+            "status": "campaign_ready",
+            "tool": None,
+            "required_toolsets": ["map"],
+            "expected_tools": ["map_protocol_graph"],
+            "campaign_ready": True,
+            "must_follow": False,
         })
 
         self.assertEqual(
@@ -1228,10 +1713,34 @@ class AgentStateTests(unittest.TestCase):
         explored = self._run_attack_search(None, with_results=False)
 
         self.assertEqual(explored["attack_search_runs"], 1)
+        self.assertEqual(explored["attack_search_syncs"], 1)
         self.assertEqual(
             {ts for ts in explored.get("active_toolsets", set()) if ts != "core"},
             set(),
         )
+
+    def test_attack_search_status_does_not_satisfy_final_sync_counter(self):
+        explored = {"files_read": set(), "tools_run": set()}
+        _update_explored(
+            [{
+                "id": "call_status",
+                "function": {
+                    "name": "attack_search",
+                    "arguments": '{"action":"status"}',
+                },
+            }],
+            explored,
+            [{
+                "role": "tool",
+                "tool_call_id": "call_status",
+                "content": json.dumps({
+                    "next_action": {"status": "campaign_ready"},
+                }),
+            }],
+        )
+
+        self.assertEqual(explored["attack_search_runs"], 1)
+        self.assertEqual(explored.get("attack_search_syncs", 0), 0)
 
     def test_attack_search_single_tool_next_action_is_smaller_than_full_surface(self):
         # The whole point: a single-tool next_action exposes fewer tools than the
@@ -1258,10 +1767,9 @@ class AgentStateTests(unittest.TestCase):
         self.assertEqual(visible, set(tool_names_for_toolsets(explored["active_toolsets"])))
 
     def test_attack_search_activation_preserves_prior_requested_toolsets(self):
-        # Demand-driven activation accumulates (unions), it never replaces: a
-        # later attack_search that needs `map` must not wipe a toolset the agent
-        # explicitly requested earlier, or request_toolset would stop being a
-        # durable escape hatch.
+        # A later attack_search that needs `map` must not wipe a toolset the
+        # agent explicitly requested earlier; request_toolset is the durable
+        # escape hatch while controller visibility is replaceable.
         explored = {"files_read": set(), "tools_run": set()}
         _activate_requested_toolsets(
             [{"function": {"name": "request_toolset",
@@ -1289,6 +1797,69 @@ class AgentStateTests(unittest.TestCase):
         self.assertIn("map", explored["active_toolsets"])
         self.assertIn("evidence", explored["active_toolsets"])  # not clobbered
         self.assertNotIn("experiment", explored["active_toolsets"])
+
+    def test_attack_search_replaces_prior_controller_toolset(self):
+        explored = {"files_read": set(), "tools_run": set()}
+        self._run_attack_search(
+            {
+                "branch_id": "br-map",
+                "status": "needs_mapping",
+                "tool": "build_attack_graph",
+                "required_toolsets": ["map"],
+            },
+            explored=explored,
+        )
+        self.assertEqual(explored["controller_toolsets"], {"map"})
+
+        self._run_attack_search(
+            {
+                "branch_id": "br-run",
+                "status": "needs_run",
+                "tool": "compose_sequence_experiment",
+                "required_toolsets": ["experiment"],
+            },
+            explored=explored,
+        )
+
+        self.assertEqual(explored["controller_toolsets"], {"experiment"})
+        self.assertEqual(explored["requested_toolsets"], set())
+        self.assertEqual(
+            {name for name in explored["active_toolsets"] if name != "core"},
+            {"experiment"},
+        )
+
+    def test_campaign_ready_clears_controller_but_keeps_requested_toolset(self):
+        explored = {"files_read": set(), "tools_run": set()}
+        _activate_requested_toolsets(
+            [{"function": {"name": "request_toolset",
+                            "arguments": '{"toolset":"evidence"}'}}],
+            explored,
+        )
+        self._run_attack_search(
+            {
+                "branch_id": "br-map",
+                "status": "needs_mapping",
+                "tool": "build_attack_graph",
+                "required_toolsets": ["map"],
+            },
+            explored=explored,
+        )
+        self._run_attack_search(
+            {
+                "branch_id": None,
+                "status": "campaign_ready",
+                "campaign_ready": True,
+                "must_follow": False,
+            },
+            explored=explored,
+        )
+
+        self.assertEqual(explored["controller_toolsets"], set())
+        self.assertEqual(explored["requested_toolsets"], {"evidence"})
+        self.assertEqual(
+            {name for name in explored["active_toolsets"] if name != "core"},
+            {"evidence"},
+        )
 
     def test_toolsets_from_next_action_core_only_declaration_activates_nothing(self):
         # An all-core declaration is authoritative and resolves to no specialized
@@ -1620,7 +2191,7 @@ class AgentStateTests(unittest.TestCase):
         response, _, _, _, recovered_messages = asyncio.run(
             _stream_turn_with_recovery(
                 client,
-                "gpt-5.4",
+                DEFAULT_MODEL,
                 messages,
                 display,
                 findings=[],
@@ -1697,15 +2268,6 @@ class DisplaySummaryTests(unittest.TestCase):
             ),
             "as-001 (auto profiles, max 25)",
         )
-        self.assertEqual(
-            _tool_summary(
-                "prepare_fork_exploit_workbench",
-                {"candidate_id": "cand-001"},
-            ),
-            "cand-001",
-        )
-
-
 class AlchemyToolRegistrationTests(unittest.TestCase):
     def test_all_alchemy_tools_have_schemas(self):
         for name in _ALCHEMY_INVESTIGATION_TOOLS:
@@ -2146,6 +2708,8 @@ class SemanticToolSummaryTests(unittest.TestCase):
                 "tool": "run_experiment",
                 "source": "attack_graph",
                 "dossier_path": "/workspace/campaign/branch-dossiers/branch-003.json",
+                "campaign_ready": False,
+                "must_follow": True,
                 "required_args": {"compose_sequence_experiment": {"x": 1}},
                 "instructions": "y" * 2000,
             },
@@ -2158,7 +2722,14 @@ class SemanticToolSummaryTests(unittest.TestCase):
                     "instructions": "z" * 2000,
                 },
             ],
-            "summary": {"branches": 4, "active": 3, "terminal": 1},
+            "summary": {
+                "branches": 4,
+                "active": 3,
+                "actionable": 3,
+                "parked": 0,
+                "terminal": 1,
+                "campaign_ready": False,
+            },
         })
 
         summary = _summarize_tool_result("attack_search", content)
@@ -2166,6 +2737,10 @@ class SemanticToolSummaryTests(unittest.TestCase):
         self.assertIn('"branch_id": "branch-003"', summary)
         self.assertIn('"status": "needs_run"', summary)
         self.assertIn('"tool": "run_experiment"', summary)
+        self.assertIn('"campaign_ready": false', summary)
+        self.assertIn('"must_follow": true', summary)
+        self.assertIn('"actionable": 3', summary)
+        self.assertIn('"parked": 0', summary)
         # The dossier path is the one-read recovery handle and must survive.
         self.assertIn("/workspace/campaign/branch-dossiers/branch-003.json", summary)
         self.assertIn("required_args_keys", summary)
@@ -2174,6 +2749,36 @@ class SemanticToolSummaryTests(unittest.TestCase):
         self.assertNotIn("y" * 200, summary)
         self.assertNotIn("z" * 200, summary)
         self.assertLess(len(summary), len(content))
+
+    def test_attack_search_preserves_branchless_campaign_ready_state(self):
+        content = json.dumps({
+            "search_id": "search-002",
+            "action": "sync",
+            "next_action": {
+                "branch_id": None,
+                "status": "campaign_ready",
+                "tool": None,
+                "campaign_ready": True,
+                "must_follow": False,
+            },
+            "active_branches": [],
+            "summary": {
+                "branches": 2,
+                "active": 0,
+                "actionable": 0,
+                "parked": 2,
+                "terminal": 0,
+                "campaign_ready": True,
+            },
+        })
+
+        summary = _summarize_tool_result("attack_search", content)
+
+        self.assertIn('"status": "campaign_ready"', summary)
+        self.assertIn('"campaign_ready": true', summary)
+        self.assertIn('"must_follow": false', summary)
+        self.assertIn('"actionable": 0', summary)
+        self.assertIn('"parked": 2', summary)
 
     def test_observed_tx_miner_summary_preserves_hashes_and_arg_shapes(self):
         content = json.dumps({
@@ -2348,8 +2953,9 @@ class TruncationNoteBranchTests(unittest.TestCase):
             "/workspace/campaign/branch-dossiers/branch-003.json", note
         )
 
-    def test_update_explored_ignores_branchless_attack_search_result(self):
-        # A completed search (no next branch) must not clobber a prior branch.
+    def test_update_explored_clears_stale_branch_when_campaign_is_ready(self):
+        # A fresh branchless readiness result must not leave a stale dossier
+        # locator in truncation/recovery state.
         explored = {
             "files_read": set(),
             "tools_run": set(),
@@ -2363,13 +2969,18 @@ class TruncationNoteBranchTests(unittest.TestCase):
             "tool_call_id": "call_1",
             "content": json.dumps({
                 "search_id": "search-001",
-                "next_action": {"branch_id": None, "status": "complete"},
+                "next_action": {
+                    "branch_id": None,
+                    "status": "campaign_ready",
+                    "campaign_ready": True,
+                    "must_follow": False,
+                },
             }),
         }]
 
         _update_explored(tool_calls, explored, results)
 
-        self.assertEqual(explored["attack_branch"]["branch_id"], "branch-003")
+        self.assertNotIn("attack_branch", explored)
 
 
 class DiagnoseBuildAgentTests(unittest.TestCase):
@@ -2406,6 +3017,153 @@ class DiagnoseBuildAgentTests(unittest.TestCase):
 
 
 class ControllerPermissivenessHelperTests(unittest.TestCase):
+    def test_local_experiment_target_accepts_only_explicit_normalized_bindings(self):
+        allowed = (
+            {
+                "command": "forge test -vvv",
+                "working_dir": "/workspace/experiments/exp-001/",
+            },
+            {
+                "command": "forge test -vvv",
+                "working_dir": (
+                    "/workspace/experiments/exp-old/../exp-normalized"
+                ),
+            },
+            {
+                "command": (
+                    "FOUNDRY_PROFILE=ci forge test --root "
+                    "/workspace/experiments/exp-001 -vvv"
+                ),
+            },
+            {
+                "command": (
+                    "forge build --root=/workspace/experiments/exp-001"
+                ),
+            },
+            {
+                "command": (
+                    "forge test --out "
+                    "/workspace/experiments/exp-001/out"
+                ),
+                "working_dir": "/workspace/experiments/exp-001",
+            },
+            {
+                "command": (
+                    "forge coverage --report lcov --report-file "
+                    "/workspace/campaign/static-analysis/exp-001.lcov"
+                ),
+                "working_dir": "/workspace/experiments/exp-001",
+            },
+            {
+                "command": (
+                    "forge test --debug --dump "
+                    "/workspace/experiments/exp-001/debug.json"
+                ),
+                "working_dir": "/workspace/experiments/exp-001",
+            },
+            {
+                "command": (
+                    "cd /workspace/experiments/exp-001 && "
+                    "FOUNDRY_PROFILE=ci forge test -vvv"
+                ),
+            },
+        )
+        for arguments in allowed:
+            self.assertTrue(
+                _run_experiment_targets_local_workspace(arguments),
+                f"expected local experiment binding: {arguments!r}",
+            )
+
+    def test_local_experiment_target_rejects_mentions_traversal_and_chains(self):
+        blocked = (
+            {"command": "echo /workspace/experiments/exp-001"},
+            {"command": "forge test # --root /workspace/experiments/exp-001"},
+            {
+                "command": (
+                    "forge test --match-path "
+                    "/workspace/experiments/exp-001/test/PoC.t.sol"
+                ),
+            },
+            {
+                "command": "forge test",
+                "working_dir": "/workspace/experiments",
+            },
+            {
+                "command": "forge test",
+                "working_dir": "/workspace/experiments-evil/exp-001",
+            },
+            {
+                "command": "forge test",
+                "working_dir": "/workspace/experiments/../../audit",
+            },
+            {
+                "command": (
+                    "forge test --root /workspace/experiments/exp-001 "
+                    "&& rm -rf /audit"
+                ),
+            },
+            {
+                "command": (
+                    "cd /workspace/experiments/exp-001 && forge test "
+                    "&& rm -rf /audit"
+                ),
+            },
+            {
+                "command": "rm -rf /audit",
+                "working_dir": "/workspace/experiments/exp-001",
+            },
+            {
+                "command": (
+                    "forge test --root /workspace/experiments/exp-001 "
+                    "--root /audit"
+                ),
+            },
+            {
+                "command": "FOUNDRY_OUT=/audit/src forge test",
+                "working_dir": "/workspace/experiments/exp-001",
+            },
+            {
+                "command": "PATH=/tmp forge test",
+                "working_dir": "/workspace/experiments/exp-001",
+            },
+            {
+                "command": "forge test --out /audit/src",
+                "working_dir": "/workspace/experiments/exp-001",
+            },
+            {
+                "command": "forge test --cache-path ../../audit/src",
+                "working_dir": "/workspace/experiments/exp-001",
+            },
+            {
+                "command": "forge test --config-path /audit/foundry.toml",
+                "working_dir": "/workspace/experiments/exp-001",
+            },
+            {
+                "command": "forge test --ffi",
+                "working_dir": "/workspace/experiments/exp-001",
+            },
+            {
+                "command": (
+                    "forge coverage --report lcov --report-file "
+                    "/audit/overwrite.sol"
+                ),
+                "working_dir": "/workspace/experiments/exp-001",
+            },
+            {
+                "command": "forge test --debug --dump /audit/debug.json",
+                "working_dir": "/workspace/experiments/exp-001",
+            },
+            {
+                "command": "forge test --use /audit/bin/evil-solc",
+                "working_dir": "/workspace/experiments/exp-001",
+            },
+        )
+        for arguments in blocked:
+            self.assertFalse(
+                _run_experiment_targets_local_workspace(arguments),
+                f"expected guarded experiment command: {arguments!r}",
+            )
+
     def test_run_command_diagnostic_allowed_examples(self):
         for command in (
             "forge build",
@@ -2415,9 +3173,20 @@ class ControllerPermissivenessHelperTests(unittest.TestCase):
             "forge inspect Vault storageLayout",
             "forge test --list",
             "forge test --list --match-contract Vault",
+            (
+                "forge build --out "
+                "/workspace/campaign/build-diagnostics/scratch/forge-out"
+            ),
+            (
+                "forge build -o/workspace/campaign/build-diagnostics/"
+                "scratch/forge-out-short"
+            ),
             "slither .",
             "slither src --exclude naming-convention",
-            "slither . > /workspace/campaign/slither.txt",
+            "slither . > /workspace/campaign/static-analysis/slither.txt",
+            "slither . --json /workspace/campaign/static-analysis/slither.json",
+            "forge build > /output/diagnostics/forge-build.log",
+            "slither . --sarif=-",
         ):
             self.assertTrue(
                 _run_command_is_diagnostic({"command": command}),
@@ -2433,9 +3202,35 @@ class ControllerPermissivenessHelperTests(unittest.TestCase):
             "cast send 0xabc 'foo()'",
             "forge build && rm -rf /audit",
             "forge build; echo done",
+            "forge build # diagnostic-looking shell comment",
             "forge build | tee out.txt",
             "echo $(whoami)",
+            "FOUNDRY_OUT=/audit/src forge build",
+            "PATH=/tmp forge build",
+            "forge build --out /audit/src",
+            "forge build -o/audit/src",
+            "forge build --cache-path ../../audit/src",
+            "forge build --contracts /audit/src",
+            "forge config --config-path /audit/foundry.toml",
+            "forge build --broadcast /audit/broadcast",
+            "forge build --ffi",
+            "forge build --use /audit/bin/evil-solc",
+            "forge build --config-path /workspace/experiments/unsafe.toml",
+            "forge build > /workspace/campaign/attack-search/current.json",
+            "slither . --json /workspace/campaign/state.json",
+            "slither . --json /workspace/campaign/results/res-001.log",
+            "forge build > /output/report.md",
             "slither . > /audit/out.txt",
+            "slither . --json /audit/slither.json",
+            "slither . --sarif=/audit/slither.sarif",
+            "slither . --compile-custom-build 'touch /audit/owned'",
+            "slither . --compile-custom 'touch /audit/owned'",
+            "slither . --generate-patches",
+            "slither . --triage-mode",
+            "slither . --solc /tmp/evil-solc",
+            "slither . --config-file /workspace/experiments/unsafe.json",
+            "slither . --etherscan-apikey super-secret",
+            "slither . --foundry-out=/audit/out",
             "rm -rf /audit",
         ):
             self.assertFalse(
@@ -2605,6 +3400,67 @@ class TurnHistoryBudgetTests(unittest.TestCase):
             )
 
 
+class ChatHistoryBudgetTests(unittest.TestCase):
+    def _capture_chat_budget(self, *, max_context, user_cap):
+        captured: dict[str, object] = {}
+        explored = {
+            "files_read": set(),
+            "tools_run": set(),
+            "active_toolsets": {"core"},
+        }
+
+        async def fake_stream(client, model, messages, display, **kwargs):
+            captured["max_context"] = kwargs["max_context"]
+            captured["tools"] = kwargs["tools"]
+            return (
+                {"role": "assistant", "content": "done"},
+                0,
+                0,
+                "stop",
+                messages,
+            )
+
+        with (
+            patch("builtins.input", side_effect=["summarize", "exit"]),
+            patch(
+                "reentbotpro.agent._stream_turn_with_recovery",
+                side_effect=fake_stream,
+            ),
+        ):
+            asyncio.run(chat_loop(
+                client=object(),
+                model=DEFAULT_MODEL,
+                messages=[{"role": "system", "content": "system"}],
+                container=FakeContainer(),
+                display=MagicMock(),
+                findings=[],
+                explored=explored,
+                max_time_seconds=5,
+                max_context=max_context,
+                context_window=DEFAULT_CONTEXT_WINDOW,
+                max_context_is_user_cap=user_cap,
+            ))
+        return captured
+
+    def test_chat_reserves_model_max_output_and_visible_schemas(self):
+        audit_budget = calculate_max_context(DEFAULT_CONTEXT_WINDOW)
+        captured = self._capture_chat_budget(
+            max_context=audit_budget,
+            user_cap=False,
+        )
+        expected = calculate_max_context(
+            DEFAULT_CONTEXT_WINDOW,
+            output_reserve=get_model_max_output_tokens(DEFAULT_MODEL),
+            tools=captured["tools"],
+        )
+        self.assertEqual(captured["max_context"], expected)
+        self.assertLess(captured["max_context"], audit_budget)
+
+    def test_chat_preserves_explicit_user_context_cap(self):
+        captured = self._capture_chat_budget(max_context=40_000, user_cap=True)
+        self.assertLessEqual(captured["max_context"], 40_000)
+
+
 class RunAuditBudgetTests(unittest.TestCase):
     """run_audit threads the visible-tool budget into each turn's truncation."""
 
@@ -2623,7 +3479,7 @@ class RunAuditBudgetTests(unittest.TestCase):
         ):
             asyncio.run(run_audit(
                 client=object(),
-                model="gpt-5.4",
+                model=DEFAULT_MODEL,
                 system_prompt="system",
                 container=FakeContainer(),
                 display=FakeDisplay(),
@@ -2691,6 +3547,9 @@ class EarlyStopNudgeTests(unittest.TestCase):
     controller — while still refusing to let the agent stop after shallow,
     no-tool analysis."""
 
+    def test_minimum_audit_turn_floor_remains_ten_thousand(self):
+        self.assertEqual(_MIN_AUDIT_TURNS, 10000)
+
     def _capture_early_stop_nudge(self) -> str:
         captured: dict[str, object] = {}
         calls = {"n": 0}
@@ -2717,7 +3576,7 @@ class EarlyStopNudgeTests(unittest.TestCase):
         ):
             asyncio.run(run_audit(
                 client=object(),
-                model="gpt-5.4",
+                model=DEFAULT_MODEL,
                 system_prompt="system",
                 container=FakeContainer(),
                 display=FakeDisplay(),
@@ -2743,6 +3602,21 @@ class EarlyStopNudgeTests(unittest.TestCase):
             nudge.index("manual dependency repair"),
             "diagnose_build should be recommended before manual dependency repair",
         )
+
+    def test_prelimit_voluntary_stop_is_rejected(self):
+        nudge = self._capture_early_stop_nudge()
+        self.assertIn("do not stop", nudge)
+        self.assertGreater(_MIN_AUDIT_TURNS, 1)
+
+    def test_final_readiness_nudge_uses_authoritative_controller_rule(self):
+        self.assertIn(
+            "Any nonterminal, nonparked branch",
+            _FINAL_READINESS_NUDGE,
+        )
+        self.assertIn("parked integrity limit", _FINAL_READINESS_NUDGE)
+        self.assertIn("branchless campaign_ready", _FINAL_READINESS_NUDGE)
+        self.assertIn("regardless of its score", _FINAL_READINESS_NUDGE)
+        self.assertNotIn("high/critical", _FINAL_READINESS_NUDGE)
 
     def test_nudge_routes_generated_experiment_failures_to_repair_experiment(self):
         nudge = self._capture_early_stop_nudge()

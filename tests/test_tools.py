@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import unittest
@@ -7,13 +8,20 @@ from reentbotpro.tools import (
     _CAMPAIGN_ID_PREFIXES,
     _CAMPAIGN_STATE_PATH,
     _ast_source_unit_to_parsed_file,
+    _load_ast_sources,
     _collect_line_hints,
+    _coverage_action_referenced,
     _coverage_attention,
+    _coverage_normalize_text,
+    _coverage_record_index,
+    _coverage_references_for_action,
     _line_starts,
     _structural_action_affordances,
     _attack_search,
     _attack_search_branch_dossier,
     _attack_graph_candidate_score,
+    _attack_graph_nodes_edges_from_exposures,
+    _attack_candidate_fork_context,
     _reachability_high_trust,
     _authority_probe_command,
     _build_campaign_brief,
@@ -23,16 +31,18 @@ from reentbotpro.tools import (
     _complete_sequence_experiment,
     _compose_invariant_harness,
     _compose_sequence_experiment,
-    _create_experiment,
     _diagnose_build,
+    _derive_attack_surface_gaps,
     _infer_build_system,
     _load_campaign_state,
     _normalize_force_route_kinds,
     _normalize_force_callback_kinds,
     _objective_clearly_non_economic,
     _objective_evaluation_alt_path_active,
+    _validate_objective_evaluation,
     _parse_forge_test_summary,
     _parse_parameters,
+    _parse_action_space_file,
     _ast_parameters,
     _action_grammar_quality,
     _action_uses_attacker_contract,
@@ -65,24 +75,22 @@ from reentbotpro.tools import (
     _source_only_allows_critical,
     _build_attack_graph,
     _inventory_live_targets,
+    _live_inventory_entries_by_address,
     _inspect_scope,
     _map_action_space,
     _map_live_reachability,
     _map_protocol_graph,
+    _match_protocol_graph_context,
     _mutate_hypothesis,
-    _plan_add_branch,
-    _plan_attack_campaign,
-    _plan_branch_from_action_gap,
-    _plan_branch_from_protocol_hotspot,
     _fork_workbench_adapter,
     _generic_state_transition_workbench_adapter,
     _infer_fork_workbench_mechanism,
-    _prepare_fork_exploit_workbench,
+    _progress_hypotheses_without_experiments,
+    _progress_evidence_paths,
+    _progress_unrun_experiments,
     _read_campaign,
     _record_fork_context,
     _repair_experiment,
-    _review_attack_surface_coverage,
-    _review_campaign_progress,
     _review_finding_evidence,
     _review_report_quality,
     _request_toolset,
@@ -118,8 +126,6 @@ from reentbotpro.tools import (
     _chain_hints_from_text,
     _collect_chain_hints,
     _command_needs_rpc,
-    _experiment_readme,
-    _foundry_template_contract,
     _latest_chain_registry,
     _network_env_token,
     _next_chain_registry_id,
@@ -166,6 +172,35 @@ class FakeContainer:
         return self.exec_result
 
 
+async def _record_test_experiment(
+    container: FakeContainer,
+    *,
+    title: str,
+    hypothesis_id: str | None = None,
+) -> None:
+    """Record state-only experiment lineage for tests not exercising scaffolds."""
+    await _update_campaign(container, {
+        "section": "experiment",
+        "title": title,
+        "content": "Concrete test fixture recorded without a generated scaffold.",
+        "related_ids": [hypothesis_id] if hypothesis_id else [],
+    })
+
+
+async def _record_test_foundation(container: FakeContainer) -> None:
+    """Record the minimum foundation needed for controller-derived work."""
+    for section, title in (
+        ("protocol_model", "Protocol model"),
+        ("value_flow", "Value flow"),
+        ("invariant", "Invariant"),
+    ):
+        await _update_campaign(container, {
+            "section": section,
+            "title": title,
+            "content": f"{title} with concrete source references.",
+        })
+
+
 def _exploitability_fields(**overrides):
     fields = {
         "preconditions": [
@@ -208,6 +243,221 @@ class CampaignIdTests(unittest.TestCase):
         self.assertEqual(len(prefixes), len(set(prefixes)))
         self.assertEqual(_CAMPAIGN_ID_PREFIXES["invariant"], "inv")
         self.assertEqual(_CAMPAIGN_ID_PREFIXES["live_inventory"], "linv")
+
+
+class ProgressEvidencePathTests(unittest.TestCase):
+    def test_paths_are_deduplicated_in_first_seen_order(self):
+        prefix = "/workspace/campaign/evaluations/"
+        first = prefix + "eval-002.json"
+        second = prefix + "eval-001.json"
+        state = {
+            "sections": {
+                "result": [
+                    {"evidence": [first, "/audit/unrelated.sol", first]},
+                    {"evidence": [second, first]},
+                ]
+            }
+        }
+
+        self.assertEqual(
+            _progress_evidence_paths(state, prefix),
+            [first, second],
+        )
+
+
+class CoverageRecordIndexTests(unittest.TestCase):
+    @staticmethod
+    def _record(
+        identifier,
+        text,
+        *,
+        section="hypothesis",
+        action_keys=None,
+        coverage_keys=None,
+        normalized=None,
+    ):
+        return {
+            "section": section,
+            "id": identifier,
+            "title": identifier,
+            "status": "open",
+            "priority": "high",
+            "action_keys": action_keys or [],
+            "coverage_keys": coverage_keys or [],
+            "text": text,
+            "normalized": (
+                _coverage_normalize_text(text)
+                if normalized is None
+                else normalized
+            ),
+        }
+
+    def test_indexed_references_are_equivalent_to_linear_matching(self):
+        records = [
+            self._record(
+                "coverage-exact",
+                "structured definition lineage",
+                coverage_keys=[
+                    "Vault::withdraw(uint256)@/audit/src/Vault.sol"
+                ],
+            ),
+            self._record(
+                "coverage-mismatch",
+                "forge test for Vault::withdraw(uint256)",
+                coverage_keys=[
+                    "Vault::withdraw(uint256)@/audit/vendor/Vault.sol"
+                ],
+            ),
+            self._record(
+                "action-exact",
+                "structured signature lineage",
+                action_keys=["Vault::withdraw(uint256)"],
+            ),
+            self._record(
+                "action-legacy",
+                "structured legacy lineage",
+                action_keys=["Vault::withdraw"],
+            ),
+            self._record(
+                "action-text-fallback",
+                "Vault::withdraw remains relevant",
+                action_keys=["Other::call"],
+            ),
+            self._record(
+                "result-fuzzy-disabled",
+                "Analysis of Vault rights around withdraw behavior",
+                section="result",
+            ),
+            self._record(
+                "hypothesis-fuzzy",
+                "Analysis of Vault rights around withdraw behavior",
+            ),
+            self._record(
+                "raw-prefix",
+                "Legacy prose named Vault::withdrawVariant",
+                normalized="",
+            ),
+            self._record(
+                "overload-legacy-only",
+                "structured legacy lineage",
+                action_keys=["Vault::withdraw"],
+            ),
+            self._record(
+                "overload-signature-text",
+                "forge test for Vault::withdraw(uint256)",
+                section="result",
+            ),
+            self._record(
+                "underscore-text",
+                "Rewards::claim_rewards was exercised",
+                normalized="",
+            ),
+            self._record(
+                "unbound-text",
+                "sweep() was exercised",
+                normalized="",
+            ),
+        ]
+        actions = [
+            {
+                "contract": "Vault",
+                "function": "withdraw",
+                "signature": "withdraw(uint256)",
+                "file": "/audit/src/Vault.sol",
+            },
+            {
+                "contract": "Vault",
+                "function": "withdraw",
+                "signature": "withdraw(uint256)",
+                "overload_count": 2,
+                "file": "/audit/src/Vault.sol",
+            },
+            {
+                "contract": "Rewards",
+                "function": "claim_rewards",
+                "file": "/audit/src/Rewards.sol",
+            },
+            {
+                "function": "sweep",
+                "file": "/audit/src/Library.sol",
+            },
+        ]
+        expected_ids = [
+            [
+                "coverage-exact",
+                "action-exact",
+                "action-legacy",
+                "action-text-fallback",
+                "hypothesis-fuzzy",
+                "raw-prefix",
+                "overload-legacy-only",
+                "overload-signature-text",
+            ],
+            [
+                "coverage-exact",
+                "action-exact",
+                "overload-signature-text",
+            ],
+            ["underscore-text"],
+            ["unbound-text"],
+        ]
+        record_index = _coverage_record_index(records)
+
+        for action, expected in zip(actions, expected_ids, strict=True):
+            for ambiguous in (False, True):
+                with self.subTest(action=action, ambiguous=ambiguous):
+                    linear = _coverage_references_for_action(
+                        action,
+                        records,
+                        text_identity_is_ambiguous=ambiguous,
+                    )
+                    indexed = _coverage_references_for_action(
+                        action,
+                        records,
+                        text_identity_is_ambiguous=ambiguous,
+                        record_index=record_index,
+                    )
+                    self.assertEqual(indexed, linear)
+                    self.assertEqual(
+                        [reference["id"] for reference in indexed],
+                        expected,
+                    )
+
+    def test_index_prunes_unrelated_text_scans(self):
+        records = [
+            self._record(
+                f"unrelated-{index}",
+                f"Unrelated campaign note number {index}",
+            )
+            for index in range(250)
+        ]
+        records.append(self._record("matching", "Test Vault::withdraw now"))
+        action = {
+            "contract": "Vault",
+            "function": "withdraw",
+            "file": "/audit/src/Vault.sol",
+        }
+        record_index = _coverage_record_index(records)
+
+        with mock.patch(
+            "reentbotpro.tools._coverage_action_referenced",
+            wraps=_coverage_action_referenced,
+        ) as matcher:
+            indexed = _coverage_references_for_action(
+                action,
+                records,
+                record_index=record_index,
+            )
+        self.assertEqual([item["id"] for item in indexed], ["matching"])
+        self.assertEqual(matcher.call_count, 1)
+
+        with mock.patch(
+            "reentbotpro.tools._coverage_action_referenced",
+            wraps=_coverage_action_referenced,
+        ) as matcher:
+            linear = _coverage_references_for_action(action, records)
+        self.assertEqual(linear, indexed)
+        self.assertEqual(matcher.call_count, len(records))
 
 
 class WriteFileToolTests(unittest.IsolatedAsyncioTestCase):
@@ -254,8 +504,11 @@ class ToolsetRequestTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["requested_toolset"], "experiment")
         self.assertEqual(result["activated_toolsets"], ["experiment"])
-        self.assertIn("prepare_fork_exploit_workbench", result["available_tools"])
+        self.assertNotIn("prepare_fork_exploit_workbench", result["available_tools"])
+        self.assertNotIn("create_experiment", result["available_tools"])
         self.assertIn("compose_sequence_experiment", result["available_tools"])
+        self.assertIn("complete_sequence_experiment", result["available_tools"])
+        self.assertIn("compose_invariant_harness", result["available_tools"])
         self.assertIn("run_experiment", result["available_tools"])
         self.assertIn("request_toolset", result["available_tools"])
         self.assertIn("available on the next turn", result["message"])
@@ -338,6 +591,84 @@ solc = "0.8.20"
             "FOUNDRY_PROFILE=contract_Vault_abcd forge build src/Vault_abcd",
         )
         self.assertIn("/workspace/campaign/scope-manifest.json", container.files)
+        profiles_by_contract = {
+            profile["contract"]: profile
+            for profile in result["ranked_profiles"]
+        }
+        self.assertEqual(
+            set(profiles_by_contract),
+            {"TransparentUpgradeableProxy", "Vault"},
+        )
+        proxy = profiles_by_contract["TransparentUpgradeableProxy"]
+        self.assertGreaterEqual(proxy["priority_score"], 0)
+        self.assertIn("proxy/infrastructure", proxy["tags"])
+
+        manifest = json.loads(
+            container.files["/workspace/campaign/scope-manifest.json"]
+        )
+        self.assertEqual(len(manifest["ranked_profiles"]), 2)
+        self.assertEqual(manifest["scope_policy"]["profiles_retained"], 2)
+        self.assertEqual(
+            manifest["scope_policy"]["profiles_excluded_by_priority"],
+            0,
+        )
+
+    async def test_inspect_scope_response_limit_never_trims_persisted_scope(self):
+        container = FakeContainer()
+        container.files["/audit/foundry.toml"] = """
+[profile.contract_Vault_abcd]
+src = "src/Vault_abcd"
+
+[profile.contract_AccountingEngine_beef]
+src = "src/AccountingEngine_beef"
+
+[profile.contract_TransparentUpgradeableProxy_dead]
+src = "src/TransparentUpgradeableProxy_dead"
+"""
+        container.exec_results = [
+            (0, ""),  # /audit/src exists for _default_source_scan_roots
+            (
+                0,
+                "/audit/src/Vault_abcd/Vault.sol\n"
+                "/audit/src/AccountingEngine_beef/AccountingEngine.sol\n"
+                "/audit/src/TransparentUpgradeableProxy_dead/Proxy.sol\n",
+            ),
+            (0, ""),
+        ]
+
+        result = json.loads(await _inspect_scope(container, {"max_profiles": 1}))
+
+        self.assertEqual(len(result["ranked_profiles"]), 1)
+        self.assertEqual(result["omitted_from_response"]["ranked_profiles"], 2)
+        self.assertIn(
+            "Response-only compaction",
+            result["omitted_from_response"]["note"],
+        )
+
+        manifest = json.loads(
+            container.files["/workspace/campaign/scope-manifest.json"]
+        )
+        profiles_by_contract = {
+            profile["contract"]: profile
+            for profile in manifest["ranked_profiles"]
+        }
+        self.assertEqual(
+            set(profiles_by_contract),
+            {"AccountingEngine", "TransparentUpgradeableProxy", "Vault"},
+        )
+        self.assertEqual(
+            profiles_by_contract["AccountingEngine"]["priority_score"],
+            0,
+        )
+        self.assertIn(
+            "proxy/infrastructure",
+            profiles_by_contract["TransparentUpgradeableProxy"]["tags"],
+        )
+        self.assertEqual(manifest["scope_policy"]["profiles_retained"], 3)
+        self.assertEqual(
+            manifest["scope_policy"]["profiles_excluded_by_priority"],
+            0,
+        )
 
     async def test_search_code_defaults_to_source_root_and_excludes_artifacts(self):
         container = FakeContainer()
@@ -358,6 +689,365 @@ solc = "0.8.20"
         self.assertIn("/audit/src", command)
         self.assertIn("--exclude-dir=findings", command)
         self.assertIn("--exclude-dir='*_poc'", command)
+
+
+class ScopeBatchingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hard_item_cap_stays_explicitly_parked_not_covered(self):
+        container = FakeContainer()
+        await _record_test_foundation(container)
+        path = "/workspace/campaign/action-spaces/as-001.json"
+        container.files[path] = json.dumps({
+            "id": "as-001",
+            "status": "observed",
+            "scope_batch": {
+                "kind": "source_roots",
+                "series_id": "as-001",
+                "has_more": False,
+                "continuation_args": {
+                    "path": "/audit",
+                    "include_tests": False,
+                    "max_files": 160,
+                    "max_roots": 12,
+                    "max_items": 10_000,
+                },
+            },
+            "source": {
+                "path": "/audit",
+                "files_requested": 1,
+                "files_scanned": 1,
+                "max_items": 10_000,
+            },
+            "section_retention": {
+                "actions": {
+                    "cumulative_total": 10_001,
+                    "retained": 10_000,
+                    "omitted_by_item_limit": 1,
+                },
+            },
+            "cumulative_totals": {"actions": 10_001},
+            "actions": [],
+            "observations": [],
+        })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Hard-capped action scope",
+            "content": "Full-scope action map reached its retention bound.",
+            "evidence": [path],
+        })
+
+        search = json.loads(await _attack_search(container, {"action": "sync"}))
+
+        self.assertEqual(
+            search["next_action"]["source"],
+            "action_space_retention_limit",
+        )
+        self.assertEqual(
+            search["next_action"]["status"],
+            "parked_harness_limit",
+        )
+        self.assertFalse(search["campaign_ready"])
+        self.assertIn("focused source subset", search["next_action"]["tool"])
+
+    async def test_controller_remaps_when_default_item_retention_omits_surface(self):
+        container = FakeContainer()
+        await _record_test_foundation(container)
+        root = "/audit/src/Large_1111"
+        path = f"{root}/Large.sol"
+        container.files["/workspace/campaign/scope-manifest.json"] = json.dumps({
+            "ranked_profiles": [{
+                "contract": "Large",
+                "src": root,
+            }],
+        })
+        declarations = "\n".join(
+            f"uint256 public v{index};" for index in range(2001)
+        )
+        container.files[path] = (
+            "pragma solidity ^0.8.20; contract Large {\n"
+            + declarations
+            + "\n}"
+        )
+
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            container.exec_results = [(0, path + "\n")]
+            mapped = json.loads(await _map_action_space(container, {
+                "max_roots": 1,
+            }))
+
+        self.assertFalse(mapped["scope_batch"]["has_more"])
+        self.assertEqual(
+            mapped["section_retention"]["observations"]["cumulative_total"],
+            2001,
+        )
+        self.assertEqual(
+            mapped["section_retention"]["observations"]["omitted_by_item_limit"],
+            1,
+        )
+        search = json.loads(await _attack_search(container, {"action": "sync"}))
+        self.assertEqual(search["next_action"]["tool"], "map_action_space")
+        self.assertEqual(
+            search["next_action"]["source"],
+            "action_space_retention_limit",
+        )
+        remap = search["next_action"]["required_args"]["map_action_space"]
+        self.assertEqual(remap["max_items"], 4000)
+        self.assertNotIn("previous_action_space", remap)
+
+    async def test_downstream_maps_consume_completed_cumulative_action_scope(self):
+        container = FakeContainer()
+        container.files["/workspace/campaign/scope-manifest.json"] = json.dumps({
+            "ranked_profiles": [
+                {"contract": "A", "src": "/audit/src/A_1111"},
+                {"contract": "B", "src": "/audit/src/B_2222"},
+            ],
+        })
+        path_a = "/audit/src/A_1111/A.sol"
+        path_b = "/audit/src/B_2222/B.sol"
+        container.files[path_a] = (
+            "pragma solidity ^0.8.20; contract A { "
+            "uint256 x; function a() external { x += 1; } }"
+        )
+        container.files[path_b] = (
+            "pragma solidity ^0.8.20; contract B { "
+            "uint256 y; function b() external { y += 1; } }"
+        )
+
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            container.exec_results = [(0, path_a + "\n")]
+            first = json.loads(await _map_action_space(container, {
+                "max_roots": 1,
+                "record_result": False,
+            }))
+            container.exec_results = [(0, path_b + "\n")]
+            final = json.loads(await _map_action_space(container, {
+                **first["scope_batch"]["continuation_args"],
+                "profile_cursor": first["scope_batch"]["next_cursor"],
+                "source_file_cursor": first["scope_batch"]["next_file_cursor"],
+                "previous_action_space": first["path"],
+                "record_result": False,
+            }))
+
+            graph_result = json.loads(await _map_protocol_graph(container, {
+                "action_space": final["path"],
+                "max_files": 1,
+                "record_result": False,
+            }))
+            model_result = json.loads(await _extract_state_transition_model(
+                container,
+                {
+                    "files": [path_a],
+                    "action_space": final["path"],
+                    "record_result": False,
+                },
+            ))
+
+        graph = json.loads(container.files[graph_result["path"]])
+        self.assertEqual(graph["source"]["action_space"], final["path"])
+        self.assertEqual(graph["source"]["files_scanned"], 1)
+        self.assertEqual(
+            graph["source"]["action_space_projection"]["definition_nodes_added"],
+            1,
+        )
+        projected = [
+            node for node in graph["nodes"]
+            if node.get("contract") == "B" and node.get("function") == "b"
+        ]
+        self.assertEqual(len(projected), 1)
+        self.assertEqual(projected[0]["projection"], "action_space_definition")
+
+        model = json.loads(container.files[model_result["path"]])
+        self.assertEqual(model["scope"]["source_units"], 1)
+        self.assertEqual(model["scope"]["action_space_units_merged"], 1)
+        self.assertEqual(
+            {entry["contract"] for entry in model["entrypoints"]},
+            {"A", "B"},
+        )
+
+    async def test_action_scope_pages_large_root_without_skipping_files(self):
+        container = FakeContainer()
+        await _record_test_foundation(container)
+        root = "/audit/src/Large_1111"
+        paths = [f"{root}/C{index}.sol" for index in range(3)]
+        container.files["/workspace/campaign/scope-manifest.json"] = json.dumps({
+            "ranked_profiles": [{
+                "profile": "contract_Large_1111",
+                "contract": "Large",
+                "src": root,
+            }],
+        })
+        for index, path in enumerate(paths):
+            container.files[path] = (
+                "pragma solidity ^0.8.20; "
+                f"contract C{index} {{ function f{index}() external {{}} }}"
+            )
+
+        listing = "\n".join(paths) + "\n"
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            container.exec_results = [(0, listing)]
+            first = json.loads(await _map_action_space(container, {
+                "max_files": 2,
+                "max_roots": 1,
+            }))
+
+            self.assertTrue(first["scope_batch"]["has_more"])
+            self.assertFalse(first["scope_batch"]["selected_roots_complete"])
+            self.assertEqual(first["scope_batch"]["next_cursor"], 0)
+            self.assertEqual(first["scope_batch"]["next_file_cursor"], 2)
+            self.assertEqual(first["scope_batch"]["processed_roots"], [])
+
+            search = json.loads(await _attack_search(container, {"action": "sync"}))
+            continuation = search["next_action"]["required_args"][
+                "map_action_space"
+            ]
+            self.assertEqual(continuation["profile_cursor"], 0)
+            self.assertEqual(continuation["source_file_cursor"], 2)
+            self.assertEqual(continuation["previous_action_space"], first["path"])
+
+            container.exec_results = [(0, listing)]
+            final = json.loads(await _map_action_space(container, continuation))
+
+        self.assertFalse(final["scope_batch"]["has_more"])
+        self.assertTrue(final["scope_batch"]["selected_roots_complete"])
+        self.assertEqual(final["scope_batch"]["processed_roots"], [root])
+        self.assertEqual(final["source"]["files_scanned"], 3)
+        self.assertEqual(final["source"]["files_truncated_by_limit"], 0)
+        artifact = json.loads(container.files[final["path"]])
+        self.assertEqual(
+            {entry["contract"] for entry in artifact["actions"]},
+            {"C0", "C1", "C2"},
+        )
+
+    async def test_controller_continues_cumulative_source_and_live_batches(self):
+        container = FakeContainer()
+        await _record_test_foundation(container)
+        container.files["/workspace/campaign/scope-manifest.json"] = json.dumps({
+            "ranked_profiles": [
+                {
+                    "profile": "contract_A_1111",
+                    "contract": "A",
+                    "src": "/audit/src/A_1111",
+                    "address": "0x1111111111111111111111111111111111111111",
+                },
+                {
+                    "profile": "contract_B_2222",
+                    "contract": "B",
+                    "src": "/audit/src/B_2222",
+                    "address": "0x2222222222222222222222222222222222222222",
+                },
+            ],
+        })
+        container.files["/audit/src/A_1111/A.sol"] = (
+            "pragma solidity ^0.8.20; "
+            "contract A { function a() external {} }"
+        )
+        container.files["/audit/src/B_2222/B.sol"] = (
+            "pragma solidity ^0.8.20; "
+            "contract B { function b() external {} }"
+        )
+
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            container.exec_results = [(0, "/audit/src/A_1111/A.sol\n")]
+            first_action = json.loads(await _map_action_space(container, {
+                "max_roots": 1,
+            }))
+
+            first_search = json.loads(await _attack_search(container, {
+                "action": "sync",
+            }))
+            self.assertEqual(first_search["next_action"]["tool"], "map_action_space")
+            action_args = first_search["next_action"]["required_args"][
+                "map_action_space"
+            ]
+            self.assertEqual(
+                action_args["profile_cursor"],
+                first_action["scope_batch"]["next_cursor"],
+            )
+            self.assertEqual(action_args["previous_action_space"], first_action["path"])
+
+            container.exec_results = [(0, "/audit/src/B_2222/B.sol\n")]
+            final_action = json.loads(await _map_action_space(container, action_args))
+
+        self.assertFalse(final_action["scope_batch"]["has_more"])
+        action_artifact = json.loads(container.files[final_action["path"]])
+        self.assertEqual(
+            {item["contract"] for item in action_artifact["actions"]},
+            {"A", "B"},
+        )
+
+        first_live = json.loads(await _map_live_reachability(container, {
+            "action_space": final_action["path"],
+            "max_profiles": 1,
+            "execute_probes": False,
+        }))
+        first_live_artifact = json.loads(container.files[first_live["path"]])
+        self.assertNotIn(
+            "processed_profiles",
+            first_live_artifact["scope_batch"],
+        )
+        self.assertEqual(
+            first_live_artifact["scope_batch"]["processed_profile_count"],
+            1,
+        )
+        self.assertTrue(all(
+            "causal_facts" not in exposure
+            for profile in first_live_artifact["profiles"]
+            for exposure in profile.get("action_exposures") or []
+        ))
+        live_search = json.loads(await _attack_search(container, {
+            "action": "sync",
+        }))
+        self.assertEqual(
+            live_search["next_action"]["tool"],
+            "map_live_reachability",
+        )
+        live_args = live_search["next_action"]["required_args"][
+            "map_live_reachability"
+        ]
+        self.assertEqual(
+            live_args["profile_cursor"],
+            first_live["scope_batch"]["next_cursor"],
+        )
+        self.assertEqual(
+            live_args["previous_live_reachability"],
+            first_live["path"],
+        )
+
+        final_live = json.loads(await _map_live_reachability(container, live_args))
+
+        self.assertFalse(final_live["scope_batch"]["has_more"])
+        self.assertEqual(final_live["summary"]["profiles"], 2)
+        final_search = json.loads(await _attack_search(container, {"action": "sync"}))
+        self.assertNotEqual(
+            final_search["next_action"]["source"],
+            "incomplete_scope_batch",
+        )
+
+    async def test_no_manifest_broad_action_map_satisfies_controller_scope(self):
+        container = FakeContainer()
+        await _record_test_foundation(container)
+        container.files["/audit/src/A.sol"] = (
+            "pragma solidity ^0.8.20; "
+            "contract A { function run() external {} }"
+        )
+        container.exec_results = [
+            (0, ""),  # /audit/src exists
+            (0, "/audit/src/A.sol\n"),
+        ]
+
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            action_space = json.loads(await _map_action_space(container, {}))
+
+        self.assertIsNone(action_space["scope_batch"])
+        search = json.loads(await _attack_search(container, {"action": "sync"}))
+        current = json.loads(
+            container.files["/workspace/campaign/attack-search/current.json"]
+        )
+        self.assertFalse(any(
+            branch.get("key") == "map:action_space"
+            and branch.get("status") != "superseded"
+            for branch in current["branches"]
+        ))
+        self.assertNotEqual(search["next_action"]["tool"], "map_action_space")
 
 
 class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
@@ -771,6 +1461,7 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_run_experiment_marks_forge_noop_as_blocked_not_objective(self):
         container = FakeContainer()
+        await _record_test_foundation(container)
         await _compose_sequence_experiment(container, {
             "title": "Vault replay",
             "objective": "Replay a value-moving vault sequence.",
@@ -809,14 +1500,16 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "did not execute any tests",
             result["run_classification"]["reason"],
         )
-        progress = json.loads(await _review_campaign_progress(container, {
-            "record_result": False,
-        }))
-        self.assertEqual(progress["summary"]["blocked_results_without_decisions"], 1)
         attack = json.loads(await _attack_search(container, {
             "action": "sync",
             "record_result": False,
         }))
+        blocked = [
+            branch for branch in attack["active_branches"]
+            if branch["source"] == "blocked_result"
+        ]
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["status"], "needs_poc_repair")
         self.assertFalse([
             branch for branch in attack["active_branches"]
             if branch["source"] == "result_without_objective"
@@ -1013,20 +1706,20 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("rejected", parked["summary"]["by_status"])
         # No decision artifact was created by parking.
         self.assertIsNone(parked.get("decision_id"))
-        # Parking metadata is recorded and surfaced on the branch and next_action.
+        # Parking metadata stays on the preserved branch. With no other
+        # actionable work, the controller reports campaign_ready instead of
+        # forcing the parked branch back into the queue.
         self.assertEqual(branch["parking_reason"], "no fork context for the router yet")
         self.assertEqual(branch["recommended_budget"], "revisit after fork context")
         self.assertIn("scheduling_score", branch)
-        self.assertIn("scheduling_score", parked["next_action"])
-        self.assertEqual(
-            parked["next_action"]["parking_reason"],
-            "no fork context for the router yet",
-        )
+        self.assertTrue(parked["campaign_ready"])
+        self.assertEqual(parked["next_action"]["status"], "campaign_ready")
+        self.assertFalse(parked["next_action"]["must_follow"])
         # No decision section was written to campaign state.
         state = json.loads(container.files[_CAMPAIGN_STATE_PATH])
         self.assertEqual(state["sections"].get("decision", []), [])
 
-    async def test_attack_search_decision_dedupes_coverage_by_action_key(self):
+    async def test_attack_search_decision_dedupes_exact_coverage_definition(self):
         container = FakeContainer()
         for section, title in (
             ("protocol_model", "Protocol model"),
@@ -1060,12 +1753,6 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "content": "as-001",
             "evidence": ["/workspace/campaign/action-spaces/as-001.json"],
         })
-        await _review_attack_surface_coverage(container, {
-            "action_space": "as-001",
-            "title": "Coverage review",
-            "record_result": True,
-        })
-
         result = json.loads(await _attack_search(container, {
             "action": "sync",
             "record_result": False,
@@ -1084,13 +1771,6 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "failed_assumption": "Withdraw was untested.",
             "record_result": False,
         })
-        stale_progress = json.loads(await _review_campaign_progress(container, {
-            "record_result": False,
-        }))
-        self.assertEqual(
-            stale_progress["summary"]["coverage_high_attention_gaps"],
-            0,
-        )
         stale_sync = json.loads(await _attack_search(container, {
             "action": "sync",
             "record_result": False,
@@ -1099,17 +1779,23 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             branch for branch in stale_sync["active_branches"]
             if branch["source"] == "coverage_high_attention_gap"
         ])
-        review = json.loads(await _review_attack_surface_coverage(container, {
-            "action_space": "as-001",
-            "title": "Coverage review after decision",
-            "record_result": False,
-        }))
-
-        self.assertEqual(review["summary"]["high_attention_gaps"], 0)
-        review_artifact = json.loads(container.files[review["path"]])
-        self.assertEqual(review_artifact["covered_actions"][0]["coverage"], "decided")
-        state = json.loads(container.files[_CAMPAIGN_STATE_PATH])
-        self.assertIn("Vault::withdraw", state["attack_search"]["decided_action_keys"])
+        state = await _load_campaign_state(container)
+        gaps = await _derive_attack_surface_gaps(
+            container,
+            state,
+            json.loads(container.files[
+                "/workspace/campaign/action-spaces/as-001.json"
+            ]),
+        )
+        self.assertEqual(gaps, [])
+        self.assertIn(
+            "Vault::withdraw@/audit/src/Vault.sol",
+            state["attack_search"]["decided_coverage_keys"],
+        )
+        self.assertFalse(any(
+            path.startswith("/workspace/campaign/coverage-reviews/")
+            for path in container.files
+        ))
 
     async def test_attack_search_source_reviews_coverage_gap_after_empty_live_map(self):
         container = FakeContainer()
@@ -1155,12 +1841,6 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
                 "/workspace/campaign/live-reachability/lr-001.json",
             ],
         })
-        await _review_attack_surface_coverage(container, {
-            "action_space": "as-001",
-            "title": "Coverage review",
-            "record_result": True,
-        })
-
         result = json.loads(await _attack_search(container, {
             "action": "sync",
             "record_result": False,
@@ -1292,6 +1972,28 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             ),
             "priority": "high",
             "evidence": ["/audit/src/Vault.sol:42"],
+            "hypothesis_card": {
+                "attacker_control": (
+                    "An unprivileged depositor controls the public withdraw call."
+                ),
+                "state_path": [
+                    "deposit credits shares",
+                    "withdraw converts shares to assets",
+                ],
+                "invariant_at_risk": (
+                    "A user cannot withdraw more assets than their share entitlement."
+                ),
+                "impact_sink": "Vault assets leave through Vault::withdraw.",
+                "material_preconditions": [
+                    "The deployed vault accepts an unprivileged deposit and withdrawal."
+                ],
+                "falsifier": (
+                    "The before/after balance delta never exceeds deposited assets."
+                ),
+                "objective": (
+                    "Measure attacker profit and vault loss after deposit then withdraw."
+                ),
+            },
         })
 
         result = json.loads(await _attack_search(container, {
@@ -1307,6 +2009,124 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("compose_sequence_experiment", branch["next_tool"])
         self.assertEqual(branch["required_toolsets"], ["experiment"])
         self.assertTrue(branch["readiness"]["ready"])
+
+    async def test_update_campaign_rejects_nonstring_hypothesis_paths(self):
+        container = FakeContainer()
+        result = await _update_campaign(container, {
+            "section": "hypothesis",
+            "title": "Malformed structured hypothesis",
+            "content": "A model supplied an object where a state-path fact belongs.",
+            "hypothesis_card": {
+                "attacker_control": "An unprivileged caller controls the action.",
+                "state_path": [{}],
+                "invariant_at_risk": "Assets must remain solvent.",
+                "impact_sink": "Assets leave the vault.",
+                "material_preconditions": ["A deployed vault exists."],
+                "falsifier": "No asset delta is observed.",
+                "objective": "Measure the asset delta.",
+            },
+        })
+
+        self.assertIn(
+            "hypothesis_card.state_path items must be nonempty strings",
+            result,
+        )
+        state = await _load_campaign_state(container)
+        self.assertEqual(state["sections"]["hypothesis"], [])
+
+    async def test_update_campaign_rejects_nonstring_hypothesis_scalars(self):
+        base_card = {
+            "attacker_control": "An unprivileged caller controls the action.",
+            "state_path": ["The action changes recorded credit."],
+            "invariant_at_risk": "Recorded credit must remain solvent.",
+            "impact_sink": "Assets leave the vault.",
+            "material_preconditions": ["A deployed vault exists."],
+            "falsifier": "No unauthorized asset delta is observed.",
+            "objective": "Measure the unauthorized asset delta.",
+        }
+        for malformed in (7, False, {}, []):
+            with self.subTest(malformed=malformed):
+                container = FakeContainer()
+                card = {**base_card, "objective": malformed}
+
+                result = await _update_campaign(container, {
+                    "section": "hypothesis",
+                    "title": "Malformed structured hypothesis",
+                    "content": "The scalar objective has the wrong JSON type.",
+                    "hypothesis_card": card,
+                })
+
+                self.assertIn(
+                    "hypothesis_card.objective must be a string",
+                    result,
+                )
+                state = await _load_campaign_state(container)
+                self.assertEqual(state["sections"]["hypothesis"], [])
+
+    def test_hypothesis_readiness_is_safe_for_malformed_durable_cards(self):
+        state = {
+            "sections": {
+                "hypothesis": [{
+                    "id": "hyp-001",
+                    "title": "Hand-edited malformed card",
+                    "content": "Durable state contains an invalid scalar type.",
+                    "status": "open",
+                    "evidence": ["/audit/src/Vault.sol:42"],
+                    "hypothesis_card": {
+                        "attacker_control": "The caller controls withdraw.",
+                        "state_path": ["withdraw debits credit then sends assets"],
+                        "invariant_at_risk": "Withdrawals cannot exceed credit.",
+                        "impact_sink": "Assets leave through withdraw.",
+                        "material_preconditions": ["The vault is deployed."],
+                        "falsifier": "No excess asset delta is observed.",
+                        "objective": {"unexpected": "object"},
+                    },
+                }],
+                "experiment": [],
+                "result": [],
+            },
+        }
+
+        [candidate] = _progress_hypotheses_without_experiments(state)
+
+        self.assertFalse(candidate["readiness"]["ready"])
+        self.assertIn(
+            "hypothesis_card.objective must be a string",
+            candidate["readiness"]["missing"],
+        )
+        self.assertEqual(candidate["readiness"]["hypothesis_card"], {})
+
+    def test_hypothesis_readiness_ignores_whitespace_only_evidence(self):
+        state = {
+            "sections": {
+                "hypothesis": [{
+                    "id": "hyp-001",
+                    "title": "Complete card without concrete evidence",
+                    "content": "Whitespace is not a source or probe reference.",
+                    "status": "open",
+                    "evidence": ["  \t  "],
+                    "hypothesis_card": {
+                        "attacker_control": "The caller controls withdraw.",
+                        "state_path": ["withdraw debits credit then sends assets"],
+                        "invariant_at_risk": "Withdrawals cannot exceed credit.",
+                        "impact_sink": "Assets leave through withdraw.",
+                        "material_preconditions": ["The vault is deployed."],
+                        "falsifier": "No excess asset delta is observed.",
+                        "objective": "Measure any excess asset delta.",
+                    },
+                }],
+                "experiment": [],
+                "result": [],
+            },
+        }
+
+        [candidate] = _progress_hypotheses_without_experiments(state)
+
+        self.assertFalse(candidate["readiness"]["ready"])
+        self.assertIn(
+            "source, deployment, or probe evidence",
+            candidate["readiness"]["missing"],
+        )
 
     async def test_attack_search_routes_context_missing_sequence_away_from_completion(self):
         container = FakeContainer()
@@ -1379,6 +2199,11 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
         })
         container.files["/workspace/campaign/protocol-graphs/pg-001.json"] = json.dumps({
             "id": "pg-001",
+            "source": {
+                "action_space": (
+                    "/workspace/campaign/action-spaces/as-001.json"
+                ),
+            },
             "nodes": [],
             "edges": [],
         })
@@ -1394,6 +2219,8 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
                 "contract": "Vault",
                 "function": "withdraw",
                 "target_address": "0x1111111111111111111111111111111111111111",
+                "network": "mainnet",
+                "chain_id": 1,
                 "exposure": "exposed",
                 "objective": "Vault::withdraw must not release unauthorized value.",
                 "actions": [{
@@ -1521,141 +2348,108 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             {"experiment": "exp-001", "log_path": log_path},
         )
 
-    async def test_progress_coverage_gaps_compacts_duplicate_high_attention_items(self):
+    async def test_internal_coverage_ignores_meta_artifacts_as_execution_evidence(self):
         container = FakeContainer()
+        await self._record_foundation(container)
+        action_space_path = "/workspace/campaign/action-spaces/as-001.json"
+        container.files[action_space_path] = json.dumps({
+            "id": "as-001",
+            "actions": [{
+                "contract": "Vault",
+                "function": "withdraw",
+                "signature": "withdraw(uint256)",
+                "file": "/audit/src/Vault.sol",
+                "line": 20,
+                "affordances": ["value_out_or_burn"],
+                "parameters": [{"name": "amount", "raw": "uint256 amount"}],
+            }],
+            "observations": [],
+        })
         container.files["/workspace/campaign/coverage-reviews/cov-001.json"] = json.dumps({
             "id": "cov-001",
-            "title": "Coverage review",
-            "action_space": "/workspace/campaign/action-spaces/as-001.json",
-            "summary": {
-                "high_attention_gaps": 3,
-                "hypothesized_not_experimented": 0,
-            },
-            "high_attention_gaps": [
-                {
-                    "key": "Vault::withdraw",
-                    "contract": "Vault",
-                    "function": "withdraw",
-                    "file": "/audit/src/Vault.sol",
-                    "line": 20,
-                    "attention_score": 5,
-                    "affordances": ["value_out_or_burn"],
-                    "parameters": [{"name": "amount", "raw": "uint256 amount"}],
-                },
-                {
-                    "key": "Vault::withdraw",
-                    "contract": "Vault",
-                    "function": "withdraw",
-                    "file": "/audit/profiles/Vault.sol",
-                    "line": 42,
-                    "attention_score": 4,
-                    "affordances": ["value_out_or_burn"],
-                    "parameters": [{"name": "amount", "raw": "uint256 amount"}],
-                },
-                {
-                    "key": "Oracle::updatePrice",
-                    "contract": "Oracle",
-                    "function": "updatePrice",
-                    "file": "/audit/src/Oracle.sol",
-                    "line": 55,
-                    "attention_score": 4,
-                    "affordances": ["valuation_dependency", "market_or_router"],
-                    "parameters": [{"name": "price", "raw": "uint256 price"}],
-                },
-            ],
+            "title": "Legacy review naming Vault::withdraw",
+            "action_space": action_space_path,
+            "summary": {"high_attention_gaps": 0},
+            "covered_actions": [{"key": "Vault::withdraw", "coverage": "result_observed"}],
         })
         await _update_campaign(container, {
             "section": "result",
-            "title": "Coverage review result",
-            "content": "Coverage review cov-001.",
-            "evidence": ["/workspace/campaign/coverage-reviews/cov-001.json"],
+            "title": "Legacy coverage review result for Vault::withdraw",
+            "content": "Coverage bookkeeping only; no experiment was executed.",
+            "evidence": [
+                action_space_path,
+                "/workspace/campaign/coverage-reviews/cov-001.json",
+            ],
         })
 
-        progress = json.loads(await _review_campaign_progress(container, {
+        state = await _load_campaign_state(container)
+        gaps = await _derive_attack_surface_gaps(
+            container,
+            state,
+            json.loads(container.files[action_space_path]),
+        )
+        self.assertEqual([gap["key"] for gap in gaps], ["Vault::withdraw(uint256)"])
+
+        attack = json.loads(await _attack_search(container, {
+            "action": "sync",
             "record_result": False,
         }))
-
-        coverage = progress["coverage_high_attention_gaps"][0]
-        self.assertEqual(coverage["summary"]["raw_high_attention_gaps"], 3)
-        self.assertEqual(coverage["summary"]["high_attention_gaps"], 2)
-        self.assertEqual(coverage["summary"]["duplicate_high_attention_gaps"], 1)
         self.assertEqual(
-            [item["key"] for item in coverage["top_high_attention_gaps"]],
-            ["Vault::withdraw", "Oracle::updatePrice"],
+            [
+                branch["action_keys"]
+                for branch in attack["active_branches"]
+                if branch["source"] == "coverage_high_attention_gap"
+            ],
+            [["Vault::withdraw(uint256)"]],
         )
 
-    async def test_coarse_coverage_branch_does_not_resurface_after_rejection(self):
-        # Regression: a rejected coarse coverage branch must not reappear when
-        # the agent re-runs review_attack_surface_coverage on the same action
-        # space. The branch is keyed by the stable action-space id, so a fresh
-        # review artifact (new id) merges onto the existing terminal branch
-        # instead of spawning a new active twin.
+    async def test_internal_coverage_branch_does_not_resurface_after_rejection(self):
         container = FakeContainer()
-        for section, title in (
-            ("protocol_model", "Protocol model"),
-            ("value_flow", "Value flow"),
-            ("invariant", "Invariant"),
-            ("hypothesis", "Hypothesis"),
-        ):
-            await _update_campaign(container, {
-                "section": section,
-                "title": title,
-                "content": f"{title} with concrete source references.",
-            })
-
-        def _write_review(review_id):
-            container.files[
-                f"/workspace/campaign/coverage-reviews/{review_id}.json"
-            ] = json.dumps({
-                "id": review_id,
-                "title": f"Coverage review {review_id}",
-                "action_space": "as-001",
-                "summary": {
-                    "high_attention_gaps": 0,
-                    "hypothesized_not_experimented": 1,
-                },
-                "high_attention_gaps": [],
-            })
-
-        async def _record_review_result(review_id):
-            await _update_campaign(container, {
-                "section": "result",
-                "title": f"Coverage review {review_id} result",
-                "content": f"Recorded {review_id}.",
-                "evidence": [
-                    f"/workspace/campaign/coverage-reviews/{review_id}.json"
-                ],
-            })
-
-        _write_review("cov-001")
-        await _record_review_result("cov-001")
+        await self._record_foundation(container)
+        action_space_path = "/workspace/campaign/action-spaces/as-001.json"
+        container.files[action_space_path] = json.dumps({
+            "id": "as-001",
+            "actions": [{
+                "contract": "Vault",
+                "function": "withdraw",
+                "file": "/audit/src/Vault.sol",
+                "line": 20,
+                "affordances": ["value_out_or_burn"],
+            }],
+            "observations": [],
+        })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Action-space map",
+            "content": "Mapped callable surface.",
+            "evidence": [action_space_path],
+        })
 
         first_sync = json.loads(await _attack_search(container, {
             "action": "sync",
             "max_branches": 40,
             "record_result": False,
         }))
-        coarse_branches = [
+        coverage_branches = [
             branch for branch in first_sync["active_branches"]
             if branch["source"] == "coverage_high_attention_gap"
         ]
-        self.assertEqual(len(coarse_branches), 1)
-        coarse_branch = coarse_branches[0]
-        self.assertEqual(coarse_branch["status"], "needs_context")
-        self.assertEqual(coarse_branch["required_toolsets"], ["core"])
+        self.assertEqual(len(coverage_branches), 1)
+        coverage_branch = coverage_branches[0]
 
         decision = json.loads(await _attack_search(container, {
             "action": "decision",
-            "branch_id": coarse_branch["id"],
+            "branch_id": coverage_branch["id"],
             "decision_status": "rejected",
-            "decision": "Leftover coverage gaps are expected behavior.",
+            "decision": "The mapped withdrawal is correctly account-bound.",
             "record_result": False,
         }))
         self.assertEqual(decision["action"], "decision")
 
-        # A second review of the same action space mints a new artifact id.
-        _write_review("cov-002")
-        await _record_review_result("cov-002")
+        # Legacy bookkeeping cannot recreate a freshly decided controller gap.
+        container.files["/workspace/campaign/coverage-reviews/cov-999.json"] = (
+            '{"id":"cov-999","high_attention_gaps":[{"key":"Vault::withdraw"}]}'
+        )
 
         second_sync = json.loads(await _attack_search(container, {
             "action": "sync",
@@ -1670,47 +2464,39 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
         terminal_ids = {
             branch["id"] for branch in second_sync["terminal_branches"]
         }
-        self.assertIn(coarse_branch["id"], terminal_ids)
+        self.assertIn(coverage_branch["id"], terminal_ids)
 
-    async def test_coverage_family_decision_supersedes_helper_siblings(self):
+    async def test_coverage_family_decision_keeps_unrelated_helper_action(self):
         container = FakeContainer()
         await self._record_foundation(container)
-        container.files["/workspace/campaign/coverage-reviews/cov-001.json"] = json.dumps({
-            "id": "cov-001",
-            "title": "Coverage review",
-            "action_space": "as-001",
-            "summary": {
-                "high_attention_gaps": 2,
-                "hypothesized_not_experimented": 0,
-            },
-            "high_attention_gaps": [
+        action_space_path = "/workspace/campaign/action-spaces/as-001.json"
+        container.files[action_space_path] = json.dumps({
+            "id": "as-001",
+            "actions": [
                 {
-                    "key": "MockSpell::schedule",
                     "contract": "MockSpell",
                     "function": "schedule",
                     "file": "/audit/test/MockSpell.sol",
                     "line": 20,
-                    "attention_score": 4,
-                    "affordances": ["state_mutating_entrypoint"],
+                    "affordances": ["mapping_state_write", "state_mutating_entrypoint"],
                     "parameters": [],
                 },
                 {
-                    "key": "MockSpell::cast",
                     "contract": "MockSpell",
                     "function": "cast",
                     "file": "/audit/test/MockSpell.sol",
                     "line": 35,
-                    "attention_score": 4,
-                    "affordances": ["state_mutating_entrypoint"],
+                    "affordances": ["mapping_state_write", "state_mutating_entrypoint"],
                     "parameters": [],
                 },
             ],
+            "observations": [],
         })
         await _update_campaign(container, {
             "section": "result",
-            "title": "Coverage review",
-            "content": "Coverage review cov-001.",
-            "evidence": ["/workspace/campaign/coverage-reviews/cov-001.json"],
+            "title": "Action-space map",
+            "content": "Mapped helper actions without executing them.",
+            "evidence": [action_space_path],
         })
 
         first_sync = json.loads(await _attack_search(container, {
@@ -1723,11 +2509,17 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             if branch["source"] == "coverage_high_attention_gap"
         ]
         self.assertEqual(len(coverage), 2)
+        remaining_action_key = next(
+            branch["action_keys"][0]
+            for branch in coverage
+            if branch["id"] != coverage[0]["id"]
+        )
 
         await _attack_search(container, {
             "action": "decision",
             "branch_id": coverage[0]["id"],
             "decision_status": "rejected",
+            "decision_scope": "action_family",
             "decision": (
                 "Same helper mock family: test-only wrapper, not a production "
                 "value flow."
@@ -1746,11 +2538,308 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(
             {branch["status"] for branch in terminal_coverage},
-            {"rejected", "superseded"},
+            {"rejected"},
+        )
+        self.assertTrue(any(
+            branch.get("source") == "coverage_high_attention_gap"
+            and branch.get("action_keys") == [remaining_action_key]
+            for branch in decided["active_branches"]
+        ))
+
+    async def test_coverage_family_decision_supersedes_only_semantic_variants(self):
+        container = FakeContainer()
+        await self._record_foundation(container)
+        action_space_path = "/workspace/campaign/action-spaces/as-001.json"
+        container.files[action_space_path] = json.dumps({
+            "id": "as-001",
+            "actions": [
+                {
+                    "contract": "RewardsController",
+                    "function": "claimRewards",
+                    "file": "/audit/src/RewardsController.sol",
+                    "line": 20,
+                    "affordances": ["value_out_or_burn"],
+                },
+                {
+                    "contract": "RewardsController",
+                    "function": "claimAllRewardsToSelf",
+                    "file": "/audit/src/RewardsController.sol",
+                    "line": 40,
+                    "affordances": ["value_out_or_burn"],
+                },
+                {
+                    "contract": "RewardsController",
+                    "function": "setClaimer",
+                    "file": "/audit/src/RewardsController.sol",
+                    "line": 60,
+                    "affordances": ["mapping_state_write"],
+                },
+            ],
+            "observations": [],
+        })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Action-space map",
+            "content": "Mapped reward actions.",
+            "evidence": [action_space_path],
+        })
+
+        initial = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
+            "record_result": False,
+        }))
+        coverage = {
+            branch["action_keys"][0]: branch
+            for branch in initial["active_branches"]
+            if branch.get("source") == "coverage_high_attention_gap"
+        }
+        decided = json.loads(await _attack_search(container, {
+            "action": "decision",
+            "branch_id": coverage["RewardsController::claimRewards"]["id"],
+            "decision_status": "rejected",
+            "decision_scope": "action_family",
+            "decision": "The self-claim variants share the same proven sender binding.",
+            "include_terminal": True,
+            "record_result": False,
+        }))
+
+        terminal_keys = {
+            key
+            for branch in decided["terminal_branches"]
+            if branch.get("source") == "coverage_high_attention_gap"
+            for key in branch.get("action_keys") or []
+        }
+        self.assertLessEqual(
+            {
+                "RewardsController::claimRewards",
+                "RewardsController::claimAllRewardsToSelf",
+            },
+            terminal_keys,
+        )
+        self.assertTrue(any(
+            branch.get("action_keys") == ["RewardsController::setClaimer"]
+            for branch in decided["active_branches"]
+        ))
+
+    async def test_decision_prose_does_not_expand_default_branch_scope(self):
+        container = FakeContainer()
+        await self._record_foundation(container)
+        action_space_path = "/workspace/campaign/action-spaces/as-001.json"
+        container.files[action_space_path] = json.dumps({
+            "id": "as-001",
+            "actions": [
+                {
+                    "contract": "RewardsController",
+                    "function": function,
+                    "file": "/audit/src/RewardsController.sol",
+                    "line": line,
+                    "affordances": ["value_out_or_burn"],
+                }
+                for function, line in (
+                    ("claimRewards", 20),
+                    ("claimAllRewardsToSelf", 40),
+                )
+            ],
+            "observations": [],
+        })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Reward action map",
+            "content": "Mapped two related claim variants.",
+            "evidence": [action_space_path],
+        })
+        initial = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
+            "record_result": False,
+        }))
+        branches = [
+            branch
+            for branch in initial["active_branches"]
+            if branch.get("source") == "coverage_high_attention_gap"
+        ]
+        self.assertEqual(len(branches), 2)
+
+        decided = json.loads(await _attack_search(container, {
+            "action": "decision",
+            "branch_id": branches[0]["id"],
+            "decision_status": "rejected",
+            "decision": (
+                "There is no profit; this is the same family and the target is "
+                "not live."
+            ),
+            "include_terminal": True,
+            "record_result": False,
+        }))
+
+        self.assertEqual(
+            sum(
+                branch.get("source") == "coverage_high_attention_gap"
+                for branch in decided["active_branches"]
+            ),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                branch.get("source") == "coverage_high_attention_gap"
+                for branch in decided["terminal_branches"]
+            ),
+            1,
         )
 
-    async def test_mutate_hypothesis_creates_linked_next_steps(self):
+    async def test_coverage_identity_keeps_same_named_definitions_separate(self):
         container = FakeContainer()
+        await self._record_foundation(container)
+        action_space_path = "/workspace/campaign/action-spaces/as-001.json"
+        container.files[action_space_path] = json.dumps({
+            "id": "as-001",
+            "actions": [
+                {
+                    "contract": "Vault",
+                    "function": "withdraw",
+                    "signature": "withdraw(uint256)",
+                    "file": "/audit/src/Vault.sol",
+                    "line": 20,
+                    "affordances": ["value_out_or_burn"],
+                },
+                {
+                    "contract": "Vault",
+                    "function": "withdraw",
+                    "signature": "withdraw(uint256)",
+                    "file": "/audit/vendor/Vault.sol",
+                    "line": 20,
+                    "affordances": ["value_out_or_burn"],
+                },
+            ],
+            "observations": [],
+        })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Two Vault definitions",
+            "content": "Both definitions are in the mapped surface.",
+            "evidence": [action_space_path],
+        })
+
+        initial = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
+            "record_result": False,
+        }))
+        branches = [
+            branch
+            for branch in initial["active_branches"]
+            if branch.get("source") == "coverage_high_attention_gap"
+        ]
+        self.assertEqual(len(branches), 2)
+        self.assertEqual(
+            {tuple(branch["coverage_keys"]) for branch in branches},
+            {
+                ("Vault::withdraw(uint256)@/audit/src/Vault.sol",),
+                ("Vault::withdraw(uint256)@/audit/vendor/Vault.sol",),
+            },
+        )
+
+        decided_key = branches[0]["coverage_keys"][0]
+        await _attack_search(container, {
+            "action": "decision",
+            "branch_id": branches[0]["id"],
+            "decision_status": "rejected",
+            "decision": "This exact source definition is gated.",
+            "record_result": False,
+        })
+        after = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
+            "record_result": False,
+        }))
+        remaining = [
+            branch
+            for branch in after["active_branches"]
+            if branch.get("source") == "coverage_high_attention_gap"
+        ]
+        self.assertEqual(len(remaining), 1)
+        self.assertNotEqual(remaining[0]["coverage_keys"], [decided_key])
+
+    async def test_parked_coverage_batch_advances_and_remains_durable(self):
+        container = FakeContainer()
+        await self._record_foundation(container)
+        action_space_path = "/workspace/campaign/action-spaces/as-001.json"
+        actions = [
+            {
+                "contract": "Surface",
+                "function": f"mutate{index:02d}",
+                "file": "/audit/src/Surface.sol",
+                "line": index + 1,
+                "affordances": ["mapping_state_write"],
+            }
+            for index in range(27)
+        ]
+        container.files[action_space_path] = json.dumps({
+            "id": "as-001",
+            "actions": actions,
+            "observations": [],
+        })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Large action-space map",
+            "content": "Mapped 27 high-attention definitions.",
+            "evidence": [action_space_path],
+        })
+
+        initial = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
+            "record_result": False,
+        }))
+        first_batch = [
+            branch
+            for branch in initial["active_branches"]
+            if branch.get("source") == "coverage_high_attention_gap"
+        ]
+        self.assertEqual(len(first_batch), 25)
+        for branch in first_batch:
+            result = await _attack_search(container, {
+                "action": "advance",
+                "branch_id": branch["id"],
+                "status": "parked_low_roi",
+                "notes": "Defer until the higher-value branches are exhausted.",
+                "record_result": False,
+            })
+            self.assertNotIn("Error:", result)
+
+        next_batch = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
+            "record_result": False,
+        }))
+        coverage = [
+            branch
+            for branch in next_batch["active_branches"]
+            if branch.get("source") == "coverage_high_attention_gap"
+        ]
+        self.assertEqual(
+            sum(branch["status"] == "parked_low_roi" for branch in coverage),
+            25,
+        )
+        self.assertEqual(
+            sum(branch["status"] == "needs_context" for branch in coverage),
+            2,
+        )
+        self.assertFalse(next_batch["campaign_ready"])
+
+    async def test_mutate_hypothesis_records_lineage_without_placeholder_experiment(self):
+        container = FakeContainer()
+        for section, title in (
+            ("protocol_model", "Protocol model"),
+            ("value_flow", "Value flow"),
+            ("invariant", "Collateralization invariant"),
+        ):
+            await _update_campaign(container, {
+                "section": section,
+                "title": title,
+                "content": f"{title} with concrete source references.",
+            })
         await _update_campaign(container, {
             "section": "hypothesis",
             "title": "Spot price manipulation overvalues collateral",
@@ -1778,7 +2867,31 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
                     "Fork before oracle update, manipulate the pool, advance "
                     "time to the update boundary, then borrow."
                 ),
-                "expected_observation": "Borrow limit increases without durable collateral.",
+                "hypothesis_card": {
+                    "attacker_control": (
+                        "An unprivileged trader controls the pool swap and "
+                        "timing of the public oracle update."
+                    ),
+                    "state_path": [
+                        "swap changes the cumulative pool observation",
+                        "oracle update stores the manipulated TWAP",
+                        "borrow reads the stored TWAP for collateral value",
+                    ],
+                    "invariant_at_risk": (
+                        "Borrowed assets must remain bounded by durable collateral."
+                    ),
+                    "impact_sink": "The borrow action releases protocol assets.",
+                    "material_preconditions": [
+                        "The deployed oracle update is public at the fork block."
+                    ],
+                    "falsifier": (
+                        "Borrow headroom remains unchanged after the timed update."
+                    ),
+                    "objective": (
+                        "Measure attacker borrow headroom before and after the "
+                        "swap-update-borrow sequence."
+                    ),
+                },
                 "priority": "high",
             }],
             "open_questions": [{
@@ -1790,20 +2903,72 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn('"mutation_id": "mut-001"', result)
         self.assertIn('"hypothesis_id": "hyp-002"', result)
-        self.assertIn('"experiment_id": "exp-001"', result)
+        self.assertNotIn("experiment_id", result)
         self.assertIn('"decision_id": "dec-001"', result)
         self.assertIn("/workspace/campaign/mutations/mut-001.json", container.files)
-        mutation = container.files["/workspace/campaign/mutations/mut-001.json"]
-        self.assertIn('"source_found": true', mutation)
-        self.assertIn("TWAP update cadence", mutation)
-        state = container.files[_CAMPAIGN_STATE_PATH]
-        self.assertIn('"mutation": 1', state)
-        self.assertIn('"status": "rejected"', state)
-        self.assertIn('"id": "hyp-002"', state)
-        self.assertIn('"id": "exp-001"', state)
-        self.assertIn('"id": "dec-001"', state)
-        self.assertIn('"id": "oq-001"', state)
-        self.assertIn("Mutation mut-001", state)
+        mutation = json.loads(
+            container.files["/workspace/campaign/mutations/mut-001.json"]
+        )
+        self.assertTrue(mutation["source_found"])
+        self.assertEqual(
+            mutation["mutations"][0]["hypothesis_card"]["impact_sink"],
+            "The borrow action releases protocol assets.",
+        )
+
+        state = json.loads(container.files[_CAMPAIGN_STATE_PATH])
+        self.assertEqual(state["counters"]["mutation"], 1)
+        self.assertEqual(state["sections"]["experiment"], [])
+        source, child = state["sections"]["hypothesis"]
+        self.assertEqual(source["status"], "rejected")
+        self.assertEqual(source["mutation_children"], ["hyp-002"])
+        self.assertEqual(source["mutation_ids"], ["mut-001"])
+        self.assertEqual(child["mutated_from"], "hyp-001")
+        self.assertEqual(child["mutation_id"], "mut-001")
+        self.assertEqual(
+            child["hypothesis_card"],
+            mutation["mutations"][0]["hypothesis_card"],
+        )
+        self.assertEqual(state["sections"]["decision"][0]["id"], "dec-001")
+        self.assertEqual(state["sections"]["open_question"][0]["id"], "oq-001")
+
+        ready_hypotheses = _progress_hypotheses_without_experiments(state)
+        self.assertEqual([item["id"] for item in ready_hypotheses], ["hyp-002"])
+        self.assertTrue(ready_hypotheses[0]["readiness"]["ready"])
+        self.assertEqual(ready_hypotheses[0]["readiness"]["missing"], [])
+        self.assertIn(
+            "compose a sequence experiment",
+            ready_hypotheses[0]["suggested_action"],
+        )
+
+    async def test_mutate_hypothesis_rejects_retired_experiment_creation_flag(self):
+        container = FakeContainer()
+        await _update_campaign(container, {
+            "section": "hypothesis",
+            "title": "Original branch",
+            "content": "A concrete branch awaiting a disciplined mutation.",
+        })
+        state_before = container.files[_CAMPAIGN_STATE_PATH]
+
+        result = await _mutate_hypothesis(container, {
+            "source_hypothesis_id": "hyp-001",
+            "failed_assumption": "The assumed state dependency is absent.",
+            "interpretation": "Test the adjacent accounting dependency.",
+            "create_experiments": True,
+            "mutations": [{
+                "title": "Adjacent accounting dependency",
+                "hypothesis": "A different state field feeds the value release.",
+                "rationale": "The original field was not read by the sink.",
+                "experiment": "Compose a concrete read/write/release sequence.",
+            }],
+        })
+
+        self.assertIn("create_experiments was removed", result)
+        self.assertIn("compose_sequence_experiment", result)
+        self.assertEqual(container.files[_CAMPAIGN_STATE_PATH], state_before)
+        self.assertFalse(any(
+            path.startswith("/workspace/campaign/mutations/")
+            for path in container.files
+        ))
 
     async def test_mutate_hypothesis_rejects_empty_mutations(self):
         container = FakeContainer()
@@ -1818,18 +2983,20 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("requires at least one mutation", result)
         self.assertEqual(container.files, {})
 
-    async def test_review_campaign_progress_flags_process_gaps(self):
+    async def test_attack_search_derives_process_gaps_without_progress_artifact(self):
         container = FakeContainer()
+        await _record_test_foundation(container)
         await _update_campaign(container, {
             "section": "hypothesis",
             "title": "Donation sequence can profit",
             "content": "Needs an experiment and objective evaluation.",
             "priority": "high",
         })
-        await _create_experiment(container, {
-            "title": "Donation sequence proof",
-            "hypothesis_id": "hyp-001",
-        })
+        await _record_test_experiment(
+            container,
+            title="Donation sequence proof",
+            hypothesis_id="hyp-001",
+        )
         await _update_campaign(container, {
             "section": "hypothesis",
             "title": "Unexplored oracle cadence branch",
@@ -1842,10 +3009,11 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "content": "Experiment exists but has no result yet.",
             "priority": "medium",
         })
-        await _create_experiment(container, {
-            "title": "Unrun accounting probe",
-            "hypothesis_id": "hyp-003",
-        })
+        await _record_test_experiment(
+            container,
+            title="Unrun accounting probe",
+            hypothesis_id="hyp-003",
+        )
         await _update_campaign(container, {
             "section": "result",
             "title": "Oracle cadence run blocked",
@@ -1887,27 +3055,83 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "related_ids": ["fr-001", "rr-001"],
         })
 
-        result = await _review_campaign_progress(container, {
-            "title": "Mid-campaign review",
+        result = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
+            "record_result": False,
+        }))
+
+        sources = {branch["source"] for branch in result["active_branches"]}
+        self.assertIn("experiment_without_result", sources)
+        self.assertIn("blocked_result", sources)
+        self.assertIn("failed_objective", sources)
+        self.assertIn("ready_finding_review", sources)
+        self.assertIn("ready_report_review", sources)
+        self.assertEqual(result["next_action"]["status"], "ready_to_submit")
+        self.assertFalse(any(
+            path.startswith("/workspace/campaign/progress-reviews/")
+            for path in container.files
+        ))
+
+    async def test_attack_search_consumes_only_explicit_finding_review_link(self):
+        container = FakeContainer()
+        await self._record_foundation(container)
+        finding_one = "/workspace/campaign/finding-reviews/fr-001.json"
+        finding_two = "/workspace/campaign/finding-reviews/fr-002.json"
+        report = "/workspace/campaign/report-reviews/rr-001.json"
+        container.files[finding_one] = json.dumps({
+            "id": "fr-001",
+            "title": "First ready evidence review",
+            "severity": "high",
+            "ready": True,
+        })
+        container.files[finding_two] = json.dumps({
+            "id": "fr-002",
+            "title": "Second ready evidence review",
+            "severity": "high",
+            "ready": True,
+        })
+        container.files[report] = json.dumps({
+            "id": "rr-001",
+            "title": "Report for the second review",
+            "severity": "high",
+            "ready": True,
+            "candidate": {
+                "evidence_review": finding_two,
+                # Generic lineage may mention another review, but it is not
+                # the report review's consumed evidence identity.
+                "campaign_ids": ["fr-001", "fr-002"],
+            },
+        })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Ready review artifacts",
+            "content": "Two evidence reviews and one linked report review are ready.",
+            "status": "observed",
+            "evidence": [finding_one, finding_two, report],
         })
 
-        self.assertIn('"review_id": "prg-001"', result)
-        # Advisory tool: it surfaces gaps but defers scheduling to the controller.
-        self.assertIn("attack_search is authoritative", result)
-        self.assertIn('"missing_foundation": 3', result)
-        self.assertIn('"experiments_without_results": 1', result)
-        self.assertIn('"failed_evaluations": 1', result)
-        self.assertIn('"ready_finding_reviews": 1', result)
-        self.assertIn('"ready_report_reviews": 1', result)
-        self.assertIn("Unrun accounting probe", result)
-        self.assertIn("Profit objective", result)
-        self.assertIn("Ready report", result)
-        self.assertIn("/workspace/campaign/progress-reviews/prg-001.json", container.files)
-        review = container.files["/workspace/campaign/progress-reviews/prg-001.json"]
-        self.assertIn("Submit ready report-reviewed findings", review)
-        state = container.files[_CAMPAIGN_STATE_PATH]
-        self.assertIn('"progress_review": 1', state)
-        self.assertIn("Campaign progress review", state)
+        result = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
+            "record_result": False,
+        }))
+
+        finding_branches = [
+            branch
+            for branch in result["active_branches"]
+            if branch["source"] == "ready_finding_review"
+        ]
+        self.assertEqual(
+            [branch["source_ids"] for branch in finding_branches],
+            [["fr-001"]],
+            result,
+        )
+        self.assertTrue(any(
+            branch["source"] == "ready_report_review"
+            and branch["source_ids"] == ["rr-001"]
+            for branch in result["active_branches"]
+        ))
 
     async def test_build_campaign_brief_persists_resume_artifacts(self):
         container = FakeContainer()
@@ -1932,44 +3156,56 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "content": "Attacker donates assets, deposits, then redeems.",
             "priority": "high",
         })
-        await _create_experiment(container, {
-            "title": "Donation sequence proof",
-            "hypothesis_id": "hyp-001",
-        })
-        await _plan_attack_campaign(container, {
-            "title": "Resume plan",
+        await _record_test_experiment(
+            container,
+            title="Donation sequence proof",
+            hypothesis_id="hyp-001",
+        )
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
             "focus": "redeem",
-        })
-
+            "record_result": False,
+        }))
         result = await _build_campaign_brief(container, {
             "title": "Resume after context compaction",
-            "focus": "redeem path",
+            "focus": "redeem",
             "max_items": 3,
         })
 
         self.assertIn('"brief_id": "brief-001"', result)
-        self.assertIn('"tool": "run_experiment"', result)
+        self.assertIn('"tool": "map_action_space"', result)
         # Advisory tool: the resume brief defers scheduling to the controller.
         self.assertIn("attack_search is authoritative", result)
         self.assertIn("/workspace/campaign/brief.json", container.files)
         self.assertIn("/workspace/campaign/brief.md", container.files)
         brief = json.loads(container.files["/workspace/campaign/brief.json"])
         self.assertEqual(brief["id"], "brief-001")
-        self.assertEqual(brief["suggested_next"]["tool"], "run_experiment")
-        self.assertEqual(brief["latest_artifacts"]["plans"][0]["id"], "plan-001")
         self.assertEqual(
-            brief["active_work"]["experiments_without_results"][0]["id"],
-            "exp-001",
+            brief["suggested_next"],
+            search["next_action"],
         )
+        self.assertEqual(
+            brief["suggested_next"],
+            brief["attack_search"]["next_action"],
+        )
+        experiment_branch = next(
+            branch
+            for branch in brief["active_work"]["attack_search_branches"]
+            if branch["source"] == "experiment_without_result"
+        )
+        self.assertEqual(experiment_branch["source_ids"], ["exp-001"])
         markdown = container.files["/workspace/campaign/brief.md"]
         self.assertIn("# Resume after context compaction", markdown)
-        self.assertIn("## Latest Plan", markdown)
+        self.assertIn("## Controller Next Action", markdown)
         self.assertIn("Donation sequence proof", markdown)
         # The resume doc tells the agent the controller, not the brief, schedules.
         self.assertIn("attack_search is authoritative", markdown)
         state = container.files[_CAMPAIGN_STATE_PATH]
         self.assertIn('"campaign_brief": 1', state)
-        self.assertIn("Campaign resume brief", state)
+        self.assertFalse(any(
+            path.startswith("/workspace/campaign/plans/")
+            for path in container.files
+        ))
 
     async def test_build_campaign_brief_suggests_explicit_actions_for_coverage_gaps(self):
         container = FakeContainer()
@@ -2012,10 +3248,10 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "evidence": ["/workspace/campaign/action-spaces/as-001.json"],
             "related_ids": ["as-001"],
         })
-        await _review_attack_surface_coverage(container, {
-            "action_space": "as-001",
-            "title": "Coverage review",
-        })
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
 
         result = await _build_campaign_brief(container, {
             "record_result": False,
@@ -2030,9 +3266,128 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             brief["suggested_next"]["tool"],
             "source_slice then update_campaign or attack_search decision",
         )
+        self.assertEqual(brief["suggested_next"], search["next_action"])
+        self.assertFalse(any(
+            path.startswith("/workspace/campaign/coverage-reviews/")
+            for path in container.files
+        ))
 
-    async def test_review_attack_surface_coverage_flags_untested_levers(self):
+    async def test_text_only_result_does_not_close_duplicate_source_definitions(self):
         container = FakeContainer()
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Legacy withdraw run",
+            "content": "forge test completed for Vault::withdraw",
+            "status": "observed",
+        })
+        actions = [
+            {
+                "contract": "Vault",
+                "function": "withdraw",
+                "file": "/audit/src/PrimaryVault.sol",
+                "line": 20,
+                "affordances": ["value_out_or_burn"],
+            },
+            {
+                "contract": "Vault",
+                "function": "withdraw",
+                "file": "/audit/vendor/LegacyVault.sol",
+                "line": 35,
+                "affordances": ["value_out_or_burn"],
+            },
+        ]
+        state = await _load_campaign_state(container)
+
+        duplicate_gaps = await _derive_attack_surface_gaps(
+            container,
+            state,
+            {"actions": actions, "observations": []},
+        )
+
+        self.assertEqual(
+            {gap["coverage_key"] for gap in duplicate_gaps},
+            {
+                "Vault::withdraw@/audit/src/PrimaryVault.sol",
+                "Vault::withdraw@/audit/vendor/LegacyVault.sol",
+            },
+        )
+        self.assertTrue(all(gap["coverage"] == "unexplored" for gap in duplicate_gaps))
+        self.assertTrue(all(
+            gap["references"][0]["match_kind"] == "text_context"
+            for gap in duplicate_gaps
+        ))
+
+        # Preserve compatibility for a legacy campaign where the prose can
+        # identify exactly one definition in the current action space.
+        unique_gaps = await _derive_attack_surface_gaps(
+            container,
+            state,
+            {"actions": actions[:1], "observations": []},
+        )
+        self.assertEqual(unique_gaps, [])
+
+    async def test_attack_search_detects_text_ambiguity_across_action_spaces(self):
+        container = FakeContainer()
+        await self._record_foundation(container)
+        action_space_paths = [
+            "/workspace/campaign/action-spaces/as-001.json",
+            "/workspace/campaign/action-spaces/as-002.json",
+        ]
+        for index, (path, source_file) in enumerate(zip(
+            action_space_paths,
+            ("/audit/src/Primary.sol", "/audit/vendor/Legacy.sol"),
+            strict=True,
+        ), start=1):
+            container.files[path] = json.dumps({
+                "id": f"as-{index:03d}",
+                "actions": [{
+                    "contract": "Vault",
+                    "function": "withdraw",
+                    "file": source_file,
+                    "line": 20,
+                    "affordances": ["value_out_or_burn"],
+                }],
+                "observations": [],
+            })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Independent action-space maps",
+            "content": "Both source roots were mapped.",
+            "evidence": action_space_paths,
+            "related_ids": ["as-001", "as-002"],
+        })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Legacy withdraw run",
+            "content": "forge test completed for Vault::withdraw",
+            "status": "observed",
+        })
+
+        with mock.patch(
+            "reentbotpro.tools._coverage_record_index",
+            wraps=_coverage_record_index,
+        ) as indexer:
+            result = json.loads(await _attack_search(container, {
+                "action": "sync",
+                "max_branches": 40,
+                "record_result": False,
+            }))
+
+        coverage_keys = {
+            key
+            for branch in result["active_branches"]
+            if branch.get("source") == "coverage_high_attention_gap"
+            for key in branch.get("coverage_keys") or []
+        }
+        self.assertEqual(coverage_keys, {
+            "Vault::withdraw@/audit/src/Primary.sol",
+            "Vault::withdraw@/audit/vendor/Legacy.sol",
+        })
+        self.assertEqual(indexer.call_count, 1)
+
+    async def test_internal_coverage_flags_only_unexperimented_levers(self):
+        container = FakeContainer()
+        await _record_test_foundation(container)
         container.files["/workspace/campaign/action-spaces/as-001.json"] = """
 {
   "id": "as-001",
@@ -2108,58 +3463,42 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "related_ids": ["exp-001"],
         })
 
-        result = await _review_attack_surface_coverage(container, {
-            "action_space": "as-001",
-            "title": "Core surface review",
-        })
-
-        self.assertIn('"coverage_review_id": "cov-001"', result)
-        self.assertIn('"high_attention_gaps": 1', result)
-        self.assertIn('"hypothesized_not_experimented": 1', result)
-        self.assertIn('"key": "Oracle::updatePrice"', result)
-        self.assertIn('"key": "Vault::withdraw"', result)
-        self.assertNotIn('"key": "Router::execute",\n      "contract"', result)
-        self.assertIn("/workspace/campaign/coverage-reviews/cov-001.json", container.files)
-        review = container.files["/workspace/campaign/coverage-reviews/cov-001.json"]
-        self.assertIn('"coverage": "result_observed"', review)
-        self.assertIn('"contract": "Router"', review)
-        self.assertIn("Pick one high-attention uncovered lever", review)
-        progress = await _review_campaign_progress(container, {
-            "record_result": False,
-        })
-        self.assertIn('"coverage_high_attention_gaps": 1', progress)
-        self.assertIn("Oracle::updatePrice", progress)
-        plan = await _plan_attack_campaign(container, {
-            "title": "Next core branch",
-            "focus": "oracle",
-        })
-        self.assertIn('"plan_id": "plan-001"', plan)
-        self.assertIn('"key": "Oracle::updatePrice"', plan)
-        self.assertIn(
-            '"recommended_next_tool": "compose_sequence_experiment with explicit actions or compose_invariant_harness with handler actions"',
-            plan,
+        state = await _load_campaign_state(container)
+        action_space = json.loads(
+            container.files["/workspace/campaign/action-spaces/as-001.json"]
         )
-        self.assertIn('"oracle_window_checks"', plan)
-        self.assertIn("updatedAt/timestamp", plan)
-        self.assertIn("missing fork context", plan)
-        self.assertIn("/workspace/campaign/plans/plan-001.json", container.files)
-        plan_artifact = container.files["/workspace/campaign/plans/plan-001.json"]
-        self.assertIn("stop_or_mutate_condition", plan_artifact)
-        progress_after_plan = await _review_campaign_progress(container, {
-            "record_result": False,
-        })
-        self.assertIn('"latest_campaign_plans": 1', progress_after_plan)
-        state = container.files[_CAMPAIGN_STATE_PATH]
-        self.assertIn('"coverage_review": 1', state)
-        self.assertIn('"campaign_plan": 1', state)
-        self.assertIn("Attack-surface coverage review", state)
-        self.assertIn("Attack campaign plan", state)
+        gaps = await _derive_attack_surface_gaps(container, state, action_space)
+        gap_keys = {gap["key"] for gap in gaps}
+        # A hypothesis is not execution coverage. Deposit is covered by the
+        # experiment, while a sequence scaffold alone is planning metadata and
+        # must not make Router::execute look executed.
+        self.assertEqual(
+            gap_keys,
+            {"Oracle::updatePrice", "Router::execute", "Vault::withdraw"},
+        )
 
-    async def test_plan_attack_campaign_is_advisory_not_a_scheduler(self):
-        # The planner is advisory: it defers scheduling authority to
-        # attack_search via controller_note, exposes its suggestions under an
-        # explicitly advisory key (candidate_next_steps), and never emits a
-        # competing required/next-action order.
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
+            "record_result": False,
+        }))
+        controller_keys = {
+            action_key
+            for branch in search["active_branches"]
+            if branch.get("source") == "coverage_high_attention_gap"
+            for action_key in branch.get("action_keys") or []
+        }
+        self.assertEqual(controller_keys, gap_keys)
+        self.assertFalse(any(
+            path.startswith((
+                "/workspace/campaign/coverage-reviews/",
+                "/workspace/campaign/progress-reviews/",
+                "/workspace/campaign/plans/",
+            ))
+            for path in container.files
+        ))
+
+    async def test_attack_search_is_only_scheduler_and_brief_mirrors_it(self):
         container = FakeContainer()
         for section, title in [
             ("protocol_model", "Vault model"),
@@ -2178,31 +3517,25 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "priority": "high",
         })
 
-        result = await _plan_attack_campaign(container, {"title": "Advisory plan"})
-        plan = json.loads(result)
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
+        await _build_campaign_brief(container, {"record_result": False})
+        brief = json.loads(container.files["/workspace/campaign/brief.json"])
 
+        self.assertTrue(search["next_action"]["must_follow"])
+        self.assertEqual(brief["suggested_next"], search["next_action"])
         self.assertEqual(
-            plan["controller_note"],
-            "Use attack_search for authoritative next_action and branch transitions.",
+            brief["attack_search"]["next_action"],
+            search["next_action"],
         )
-        self.assertIn("candidate_next_steps", plan)
-        self.assertTrue(plan["candidate_next_steps"])
-        # No competing scheduler fields: the planner never issues a next_action.
-        self.assertNotIn("next_actions", plan)
-        self.assertNotIn("next_action", plan)
-        self.assertNotIn("required_next_action", plan)
-        self.assertNotIn("must_follow_next_action", plan)
+        self.assertFalse(any(
+            path.startswith("/workspace/campaign/plans/")
+            for path in container.files
+        ))
 
-        artifact = json.loads(
-            container.files["/workspace/campaign/plans/plan-001.json"]
-        )
-        self.assertEqual(artifact["controller_note"], plan["controller_note"])
-        self.assertIn("candidate_next_steps", artifact)
-        self.assertNotIn("next_actions", artifact)
-        self.assertNotIn("required_next_action", artifact)
-        self.assertNotIn("must_follow_next_action", artifact)
-
-    async def test_plan_attack_campaign_uses_amm_context_for_valuation_branch(self):
+    async def test_sequence_route_uses_amm_context_for_valuation_branch(self):
         container = FakeContainer()
         await _update_campaign(container, {
             "section": "value_flow",
@@ -2251,20 +3584,26 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "evidence": ["/workspace/campaign/action-spaces/as-001.json"],
             "related_ids": ["as-001"],
         })
-        await _review_attack_surface_coverage(container, {
-            "action_space": "as-001",
-            "title": "Oracle coverage",
-        })
-
-        missing_plan = json.loads(await _plan_attack_campaign(container, {
+        missing_plan = json.loads(await _compose_sequence_experiment(container, {
             "title": "Oracle branch before economics",
-            "record_result": False,
+            "objective": "Move market price and extract profitable value.",
+            "action_space": "as-001",
+            "fork_context": "fc-001",
+            "actions": [{
+                "actor": "attacker",
+                "contract": "OracleAdapter",
+                "function": "updatePrice",
+            }],
         }))
-        missing_branch = missing_plan["branches"][0]
-        self.assertIn(
-            "missing AMM/economics estimate for price-moving branch",
-            missing_branch["blockers"],
+        missing_branch = next(
+            route for route in missing_plan["route_composition"]["routes"]
+            if route["kind"] == "amm_or_valuation_route"
         )
+        self.assertEqual(
+            missing_branch["missing_context"],
+            ["linked AMM economics estimate"],
+        )
+        self.assertEqual(missing_branch["suggested_tools"], ["estimate_amm_economics"])
 
         await _estimate_amm_economics(container, {
             "title": "WETH/USDC manipulation route",
@@ -2283,15 +3622,22 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             }],
             "related_ids": ["as-001"],
         })
-        ready_plan = json.loads(await _plan_attack_campaign(container, {
+        ready_plan = json.loads(await _compose_sequence_experiment(container, {
             "title": "Oracle branch after economics",
-            "record_result": False,
+            "objective": "Move market price and extract profitable value.",
+            "action_space": "as-001",
+            "fork_context": "fc-001",
+            "actions": [{
+                "actor": "attacker",
+                "contract": "OracleAdapter",
+                "function": "updatePrice",
+            }],
         }))
-        ready_branch = ready_plan["branches"][0]
-        self.assertNotIn(
-            "missing AMM/economics estimate",
-            " ".join(ready_branch["blockers"]),
+        ready_branch = next(
+            route for route in ready_plan["route_composition"]["routes"]
+            if route["kind"] == "amm_or_valuation_route"
         )
+        self.assertEqual(ready_branch["missing_context"], [])
         self.assertIn(
             "/workspace/campaign/economics/econ-001.json",
             ready_branch["source_artifacts"],
@@ -2306,7 +3652,7 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "0",
         )
 
-    async def test_plan_attack_campaign_uses_lending_health_context_for_credit_branch(self):
+    async def test_sequence_route_uses_lending_health_context_for_credit_branch(self):
         container = FakeContainer()
         await _update_campaign(container, {
             "section": "value_flow",
@@ -2359,32 +3705,32 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "evidence": ["/workspace/campaign/action-spaces/as-001.json"],
             "related_ids": ["as-001"],
         })
-        await _review_attack_surface_coverage(container, {
-            "action_space": "as-001",
-            "title": "Lending coverage",
-        })
-
-        missing_plan = json.loads(await _plan_attack_campaign(container, {
+        missing_plan = json.loads(await _compose_sequence_experiment(container, {
             "title": "Lending branch before economics",
-            "record_result": False,
+            "objective": "Liquidate an unhealthy borrower for net profit.",
+            "action_space": "as-001",
+            "fork_context": "fc-001",
+            "actions": [{
+                "actor": "attacker",
+                "contract": "LendingPool",
+                "function": "liquidate",
+            }],
         }))
-        missing_branch = missing_plan["branches"][0]
+        missing_branch = next(
+            route for route in missing_plan["route_composition"]["routes"]
+            if route["kind"] == "liquidation_credit_route"
+        )
         self.assertEqual(
-            missing_branch["target_actions"][0]["key"],
-            "LendingPool::liquidate",
+            missing_branch["missing_context"],
+            ["linked lending health estimate"],
         )
-        self.assertIn(
-            "missing lending health estimate for credit/liquidation branch",
-            missing_branch["blockers"],
+        self.assertEqual(
+            missing_branch["suggested_tools"],
+            ["estimate_lending_health"],
         )
-        self.assertIn(
-            "run estimate_lending_health",
-            " ".join(missing_branch["required_setup"]),
-        )
-        self.assertIn("liquidation_route_checks", missing_branch)
         self.assertIn(
             "close factor",
-            " ".join(missing_branch["liquidation_route_checks"]),
+            " ".join(missing_branch["setup_prompts"]),
         )
 
         await _estimate_lending_health(container, {
@@ -2403,19 +3749,22 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             }],
             "related_ids": ["as-001"],
         })
-        ready_plan = json.loads(await _plan_attack_campaign(container, {
+        ready_plan = json.loads(await _compose_sequence_experiment(container, {
             "title": "Lending branch after economics",
-            "record_result": False,
+            "objective": "Liquidate an unhealthy borrower for net profit.",
+            "action_space": "as-001",
+            "fork_context": "fc-001",
+            "actions": [{
+                "actor": "attacker",
+                "contract": "LendingPool",
+                "function": "liquidate",
+            }],
         }))
-        ready_branch = ready_plan["branches"][0]
-        self.assertGreater(
-            ready_branch["priority_score"],
-            missing_branch["priority_score"],
+        ready_branch = next(
+            route for route in ready_plan["route_composition"]["routes"]
+            if route["kind"] == "liquidation_credit_route"
         )
-        self.assertNotIn(
-            "missing lending health estimate",
-            " ".join(ready_branch["blockers"]),
-        )
+        self.assertEqual(ready_branch["missing_context"], [])
         self.assertIn(
             "/workspace/campaign/economics/econ-001.json",
             ready_branch["source_artifacts"],
@@ -2429,11 +3778,11 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
         self.assertEqual(
-            ready_plan["branches"][0]["economics_context"]["total_shortfall_usd"],
+            ready_branch["economics_context"]["total_shortfall_usd"],
             "260",
         )
 
-    async def test_plan_attack_campaign_uses_flash_loan_context_for_callback_branch(self):
+    async def test_sequence_route_uses_flash_loan_context_for_callback_branch(self):
         container = FakeContainer()
         await _update_campaign(container, {
             "section": "value_flow",
@@ -2468,25 +3817,25 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "evidence": ["/workspace/campaign/action-spaces/as-001.json"],
             "related_ids": ["as-001"],
         })
-        await _review_attack_surface_coverage(container, {
-            "action_space": "as-001",
-            "title": "Flash callback coverage",
-        })
-
-        missing_plan = json.loads(await _plan_attack_campaign(container, {
+        missing_plan = json.loads(await _compose_sequence_experiment(container, {
             "title": "Flash branch before economics",
-            "record_result": False,
+            "objective": "Use a flash loan callback to extract net value.",
+            "action_space": "as-001",
+            "actions": [{
+                "actor": "callbackAttacker",
+                "contract": "FlashProvider",
+                "function": "flashLoan",
+            }],
         }))
-        missing_branch = missing_plan["branches"][0]
+        missing_branch = next(
+            route for route in missing_plan["route_composition"]["routes"]
+            if route["kind"] == "flash_loan_route"
+        )
         self.assertEqual(
-            missing_branch["target_actions"][0]["key"],
-            "FlashProvider::flashLoan",
+            missing_branch["missing_context"],
+            ["linked flash-loan estimate"],
         )
-        self.assertIn("flash_loan_checks", missing_branch)
-        self.assertIn(
-            "run estimate_flash_loan",
-            " ".join(missing_branch["required_setup"]),
-        )
+        self.assertEqual(missing_branch["suggested_tools"], ["estimate_flash_loan"])
 
         await _estimate_flash_loan(container, {
             "title": "USDC callback liquidity",
@@ -2502,35 +3851,38 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             }],
             "related_ids": ["as-001"],
         })
-        ready_plan = json.loads(await _plan_attack_campaign(container, {
+        ready_plan = json.loads(await _compose_sequence_experiment(container, {
             "title": "Flash branch after economics",
-            "record_result": False,
+            "objective": "Use a flash loan callback to extract net value.",
+            "action_space": "as-001",
+            "actions": [{
+                "actor": "callbackAttacker",
+                "contract": "FlashProvider",
+                "function": "flashLoan",
+            }],
         }))
-        ready_branch = ready_plan["branches"][0]
-        self.assertGreater(
-            ready_branch["priority_score"],
-            missing_branch["priority_score"],
+        ready_branch = next(
+            route for route in ready_plan["route_composition"]["routes"]
+            if route["kind"] == "flash_loan_route"
         )
+        self.assertEqual(ready_branch["missing_context"], [])
         self.assertIn(
             "/workspace/campaign/economics/flash-001.json",
             ready_branch["source_artifacts"],
         )
         self.assertEqual(
-            ready_branch["flash_loan_context"]["kind"],
+            ready_branch["economics_context"]["kind"],
             "flash_loan",
         )
         self.assertEqual(
-            ready_branch["flash_loan_context"]["insufficient_liquidity"],
+            ready_branch["economics_context"]["insufficient_liquidity"],
             0,
         )
         self.assertEqual(
-            ready_branch["flash_loan_context"]["total_fee_usd"],
+            ready_branch["economics_context"]["total_fee_usd"],
             "0.09",
         )
-        self.assertIn(
-            "review linked flash-loan estimate",
-            " ".join(ready_branch["required_setup"]),
-        )
+        self.assertEqual(ready_branch["suggested_tools"], [])
 
     async def test_review_finding_evidence_records_ready_review(self):
         container = FakeContainer()
@@ -2539,10 +3891,11 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "title": "Share inflation can drain vault",
             "content": "Donation before first deposit can skew share price.",
         })
-        await _create_experiment(container, {
-            "title": "Donation then redeem",
-            "hypothesis_id": "hyp-001",
-        })
+        await _record_test_experiment(
+            container,
+            title="Donation then redeem",
+            hypothesis_id="hyp-001",
+        )
         container.exec_result = (0, "Suite result: ok. 1 passed; 0 failed")
         await _run_experiment(container, {
             "command": "forge test --match-test testDonationRedeem -vvv",
@@ -2925,6 +4278,7 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
                 "min_delta": "1",
                 "unit": "USDC",
             }],
+            "related_ids": ["exp-001", "res-001", "cmp-001"],
             "record_result": False,
         })
 
@@ -2939,9 +4293,10 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
                 "Compare attacker balances before and after.",
                 "Confirm eval-001 records positive attacker profit.",
             ],
-            "campaign_ids": ["exp-001", "res-001", "eval-001"],
+            "campaign_ids": ["exp-001", "res-001", "cmp-001", "eval-001"],
             "evidence": [
                 "/workspace/campaign/results/res-001.log",
+                "/workspace/campaign/comparisons/cmp-001.json",
                 "/workspace/campaign/evaluations/eval-001.json",
             ],
             "objective_evaluation": "eval-001",
@@ -3081,6 +4436,7 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_review_finding_evidence_warns_unresolved_route_composition(self):
         container = FakeContainer()
+        await _record_test_foundation(container)
         sequence_path = "/workspace/experiments/exp-001-route/sequence.json"
         container.files[sequence_path] = json.dumps({
             "id": "exp-001",
@@ -3149,14 +4505,17 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "route composition amm_or_valuation_route from exp-001 missing context",
             " ".join(parsed["warnings"]),
         )
-        plan = json.loads(await _plan_attack_campaign(container, {
-            "title": "Review caveated route finding",
-            "max_branches": 1,
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
             "record_result": False,
         }))
-        branch = plan["branches"][0]
+        branch = next(
+            item for item in search["active_branches"]
+            if item["source"] == "ready_finding_review"
+        )
         self.assertEqual(branch["source"], "ready_finding_review")
-        self.assertEqual(branch["recommended_next_tool"], "review_report_quality")
+        self.assertEqual(branch["next_tool"], "review_report_quality")
 
     async def test_review_finding_evidence_accepts_resolved_route_composition(self):
         container = FakeContainer()
@@ -3384,10 +4743,11 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "title": "Donation sequence inflates redemption",
             "content": "Donate, deposit, and redeem can increase attacker balance.",
         })
-        await _create_experiment(container, {
-            "title": "Donation redeem proof",
-            "hypothesis_id": "hyp-001",
-        })
+        await _record_test_experiment(
+            container,
+            title="Donation redeem proof",
+            hypothesis_id="hyp-001",
+        )
         container.files["/workspace/campaign/results/res-001.log"] = (
             "Suite result: ok. 1 passed; 0 failed\n"
         )
@@ -3481,10 +4841,11 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "title": "Donation sequence inflates redemption",
             "content": "Donate, deposit, and redeem can increase attacker balance.",
         })
-        await _create_experiment(container, {
-            "title": "Donation redeem proof",
-            "hypothesis_id": "hyp-001",
-        })
+        await _record_test_experiment(
+            container,
+            title="Donation redeem proof",
+            hypothesis_id="hyp-001",
+        )
         container.files["/workspace/campaign/results/res-001.log"] = (
             "Suite result: ok. 1 passed; 0 failed\n"
         )
@@ -3754,6 +5115,7 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_review_report_quality_warns_missing_route_composition_evidence(self):
         container = FakeContainer()
+        await _record_test_foundation(container)
         container.files["/workspace/campaign/results/res-001.log"] = (
             "Suite result: ok. 1 passed; 0 failed\n"
         )
@@ -3835,14 +5197,17 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             "report does not describe route evidence for flash_loan_route",
             " ".join(parsed["warnings"]),
         )
-        plan = json.loads(await _plan_attack_campaign(container, {
-            "title": "Review caveated report route review",
-            "max_branches": 1,
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
             "record_result": False,
         }))
-        branch = plan["branches"][0]
+        branch = next(
+            item for item in search["active_branches"]
+            if item["source"] == "ready_report_review"
+        )
         self.assertEqual(branch["source"], "ready_report_review")
-        self.assertEqual(branch["recommended_next_tool"], "submit_finding")
+        self.assertEqual(branch["next_tool"], "submit_finding")
 
     async def test_review_report_quality_warns_missing_minimized_variant_reference(self):
         container = FakeContainer()
@@ -4082,77 +5447,6 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("reports failing tests", joined)
         self.assertIn("/workspace/campaign/report-reviews/rr-001.json", container.files)
 
-    async def test_create_experiment_writes_scaffold_and_campaign_entry(self):
-        container = FakeContainer()
-
-        result = await _create_experiment(container, {
-            "title": "Manipulate spot price before borrow",
-            "template": "fork_test",
-            "hypothesis_id": "hyp-001",
-            "notes": "Use a fork and assert bad debt or attacker PnL.",
-        })
-
-        self.assertIn("Created experiment exp-001", result)
-        self.assertIn("/workspace/experiments/exp-001-manipulate-spot-price-before-borrow/README.md", container.files)
-        self.assertIn("/workspace/experiments/exp-001-manipulate-spot-price-before-borrow/ReentbotProExperiment.t.sol", container.files)
-        self.assertIn("vm.createFork", container.files[
-            "/workspace/experiments/exp-001-manipulate-spot-price-before-borrow/ReentbotProExperiment.t.sol"
-        ])
-        self.assertIn("pragma solidity >=0.8.0 <0.9.0;", container.files[
-            "/workspace/experiments/exp-001-manipulate-spot-price-before-borrow/ReentbotProExperiment.t.sol"
-        ])
-        state = container.files[_CAMPAIGN_STATE_PATH]
-        self.assertIn('"id": "exp-001"', state)
-        self.assertIn('"hyp-001"', state)
-
-    async def test_create_experiment_can_skip_placeholder_scaffold(self):
-        container = FakeContainer()
-
-        result = await _create_experiment(container, {
-            "title": "Custom manager accounting probe",
-            "template": "accounting_probe",
-            "write_scaffold_contract": False,
-            "hypothesis_id": "hyp-001",
-        })
-
-        self.assertIn("Created experiment exp-001", result)
-        self.assertIn(
-            "/workspace/experiments/exp-001-custom-manager-accounting-probe/README.md",
-            container.files,
-        )
-        self.assertNotIn(
-            "/workspace/experiments/exp-001-custom-manager-accounting-probe/ReentbotProExperiment.t.sol",
-            container.files,
-        )
-        self.assertIn(
-            "No starter Solidity scaffold was written",
-            container.files[
-                "/workspace/experiments/exp-001-custom-manager-accounting-probe/README.md"
-            ],
-        )
-
-    async def test_create_experiment_rejects_unapproved_target_dir(self):
-        container = FakeContainer()
-
-        result = await _create_experiment(container, {
-            "title": "Bad target",
-            "target_dir": "/tmp/reentbot",
-        })
-
-        self.assertIn("target_dir must be under", result)
-        self.assertEqual(container.files, {})
-
-    async def test_create_experiment_rejects_unknown_priority(self):
-        container = FakeContainer()
-
-        result = await _create_experiment(container, {
-            "title": "Bad priority",
-            "priority": "urgent",
-        })
-
-        self.assertIn("unknown campaign priority", result)
-        self.assertEqual(container.files, {})
-
     async def test_run_experiment_records_result_and_full_log(self):
         container = FakeContainer()
         container.exec_result = (0, "PASS test_experiment")
@@ -4325,8 +5619,9 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
         state = container.files[_CAMPAIGN_STATE_PATH]
         self.assertIn("/workspace/campaign/results/res-001.followup.json", state)
 
-    async def test_run_experiment_diagnoses_blocked_run_for_planner_repair(self):
+    async def test_run_experiment_diagnoses_blocked_run_for_controller_repair(self):
         container = FakeContainer()
+        await _record_test_foundation(container)
         container.exec_result = (
             1,
             "\n".join([
@@ -4367,28 +5662,24 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             " ".join(followup["failure_diagnosis"]["compile_repair_hints"]),
         )
 
-        progress = json.loads(await _review_campaign_progress(container, {
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
             "record_result": False,
         }))
-        self.assertEqual(
-            progress["summary"]["blocked_results_without_decisions"],
-            1,
+        branch = next(
+            item for item in search["active_branches"]
+            if item["source"] == "blocked_result"
         )
-        self.assertEqual(
-            progress["blocked_results_without_decisions"][0]["failure_diagnosis"]["kind"],
-            "compile_error",
-        )
-
-        plan = json.loads(await _plan_attack_campaign(container, {
-            "record_result": False,
-        }))
-        branch = plan["branches"][0]
         self.assertEqual(branch["source"], "blocked_result")
         self.assertEqual(branch["failure_diagnosis"]["kind"], "compile_error")
-        self.assertEqual(branch["recommended_next_tool"], "run_experiment")
+        self.assertEqual(
+            branch["next_tool"],
+            "diagnose_build then repair_experiment or run_experiment",
+        )
         self.assertIn(
-            "fix imports",
-            " ".join(branch["required_setup"]),
+            "helper imports",
+            " ".join(branch["failure_diagnosis"]["compile_repair_hints"]),
         )
 
     async def test_run_experiment_repairs_foundry_checksum_address_once(self):
@@ -4476,6 +5767,7 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_run_sequence_minimization_records_preserved_variant(self):
         container = FakeContainer()
+        await _record_test_foundation(container)
         await _compose_sequence_experiment(container, {
             "title": "Minimize vault replay",
             "objective": "Find the shortest sequence that preserves profit.",
@@ -4576,35 +5868,18 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"sequence_minimization": 1', state)
         self.assertIn('"id": "res-001"', state)
         self.assertIn("/workspace/campaign/minimizations/min-001.json", state)
-        progress = json.loads(await _review_campaign_progress(container, {
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
             "record_result": False,
         }))
-        self.assertEqual(
-            progress["summary"]["sequence_minimizations_without_review"],
-            1,
+        branch = next(
+            item for item in search["active_branches"]
+            if item["source"] == "unreviewed_sequence_minimization"
         )
-        self.assertEqual(
-            progress["sequence_minimizations_without_review"][0]["id"],
-            "min-001",
-        )
-        self.assertEqual(
-            progress["sequence_minimizations_without_review"][0]["summary"][
-                "setup_checks_retained"
-            ],
-            1,
-        )
-        self.assertEqual(
-            progress["sequence_minimizations_without_review"][0]["summary"][
-                "untested_plan_variants"
-            ],
-            2,
-        )
-        self.assertEqual(
-            progress["sequence_minimizations_without_review"][0]["summary"][
-                "retained_setup_assumptions"
-            ][0]["kind"],
-            "prank_scope",
-        )
+        self.assertEqual(branch["source_ids"], ["min-001"])
+        self.assertEqual(branch["status"], "needs_finding_review")
+        self.assertEqual(branch["next_tool"], "review_finding_evidence")
         await _build_campaign_brief(container, {
             "record_result": False,
         })
@@ -4613,49 +5888,12 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             brief["latest_artifacts"]["sequence_minimizations"][0]["id"],
             "min-001",
         )
-        self.assertEqual(
-            brief["active_work"]["sequence_minimizations_without_review"][0]["id"],
-            "min-001",
+        brief_branch = next(
+            item for item in brief["active_work"]["attack_search_branches"]
+            if item["source"] == "unreviewed_sequence_minimization"
         )
-        self.assertEqual(
-            brief["suggested_next"]["tool"],
-            "review_finding_evidence",
-        )
-        plan = json.loads(await _plan_attack_campaign(container, {
-            "record_result": False,
-        }))
-        self.assertEqual(
-            plan["branches"][0]["source"],
-            "unreviewed_sequence_minimization",
-        )
-        self.assertEqual(
-            plan["branches"][0]["recommended_next_tool"],
-            "review_finding_evidence",
-        )
-        self.assertEqual(
-            plan["branches"][0]["setup_reduction_context"][
-                "setup_checks_retained"
-            ],
-            1,
-        )
-        self.assertIn(
-            "challenge retained setup assumptions",
-            " ".join(plan["branches"][0]["required_setup"]),
-        )
-        self.assertIn(
-            "review untested minimization variants",
-            " ".join(plan["branches"][0]["required_setup"]),
-        )
-        self.assertEqual(
-            plan["branches"][0]["minimization_plan_context"][
-                "untested_plan_variants"
-            ],
-            2,
-        )
-        self.assertIn(
-            "mutate_hypothesis",
-            plan["branches"][0]["stop_or_mutate_condition"],
-        )
+        self.assertEqual(brief_branch["id"], branch["id"])
+        self.assertEqual(brief["suggested_next"], search["next_action"])
 
     async def test_run_sequence_minimization_skips_variants_when_baseline_fails(self):
         container = FakeContainer()
@@ -4702,6 +5940,7 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_run_campaign_fuzz_records_candidate_failure(self):
         container = FakeContainer()
+        await _record_test_foundation(container)
         container.exec_result = (
             1,
             "\n".join([
@@ -4733,19 +5972,24 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(fuzz_run["summary"]["candidate_failure"])
         self.assertEqual(fuzz_run["related_ids"], ["exp-001", "hyp-001", "inv-001"])
-        progress = await _review_campaign_progress(container, {
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
             "record_result": False,
-        })
-        self.assertIn('"candidate_fuzz_failures": 1', progress)
-        plan = await _plan_attack_campaign(container, {
-            "record_result": False,
-        })
-        self.assertIn('"source": "candidate_fuzz_failure"', plan)
-        self.assertIn('"recommended_next_tool": "summarize_trace or extract_call_sequence"', plan)
+        }))
+        branch = next(
+            item for item in search["active_branches"]
+            if item["source"] == "candidate_fuzz_failure"
+        )
+        self.assertEqual(branch["status"], "needs_reduction")
+        self.assertEqual(
+            branch["next_tool"],
+            "summarize_trace or extract_call_sequence",
+        )
         brief = await _build_campaign_brief(container, {
             "record_result": False,
         })
-        self.assertIn('"tool": "summarize_trace or extract_call_sequence"', brief)
+        self.assertIn(branch["id"], brief)
         state = container.files[_CAMPAIGN_STATE_PATH]
         self.assertIn('"fuzz_run": 1', state)
         self.assertIn('"id": "res-001"', state)
@@ -4926,6 +6170,7 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"delta": "1.5"', result)
         self.assertIn('"usd_delta": "1.5"', result)
         self.assertIn('"passed": true', result)
+        self.assertIn('"objective_achieved": true', result)
         self.assertIn("/workspace/campaign/evaluations/eval-001.json", container.files)
         state = container.files[_CAMPAIGN_STATE_PATH]
         self.assertIn('"evaluation": 1', state)
@@ -5407,6 +6652,7 @@ Traces:
 
     async def test_extract_call_sequence_can_reduce_fuzz_run_log(self):
         container = FakeContainer()
+        await _record_test_foundation(container)
         container.files["/workspace/campaign/action-spaces/as-001.json"] = """
 {
   "id": "as-001",
@@ -5473,10 +6719,15 @@ Traces:
         self.assertIn('"generated_harness_noise_filter_v1"', sequence)
         self.assertIn('/workspace/campaign/fuzz-runs/fuzz-001.log', sequence)
         self.assertIn('"fuzz-001"', sequence)
-        progress = await _review_campaign_progress(container, {
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
             "record_result": False,
-        })
-        self.assertIn('"candidate_fuzz_failures": 0', progress)
+        }))
+        self.assertFalse(any(
+            branch["source"] == "candidate_fuzz_failure"
+            for branch in search["active_branches"]
+        ))
         state = container.files[_CAMPAIGN_STATE_PATH]
         self.assertIn('"call_sequence": 1', state)
         self.assertIn("Fuzz run: /workspace/campaign/fuzz-runs/fuzz-001.json", state)
@@ -5581,10 +6832,14 @@ contract Vault {
         state = container.files[_CAMPAIGN_STATE_PATH]
         self.assertIn('"action_space": 1', state)
         self.assertIn("Action-space map", state)
-        progress = await _review_campaign_progress(container, {
-            "record_result": False,
-        })
-        self.assertIn('"action_spaces_without_coverage": 1', progress)
+        loaded_state = await _load_campaign_state(container)
+        gaps = await _derive_attack_surface_gaps(
+            container,
+            loaded_state,
+            json.loads(action_space),
+        )
+        self.assertTrue(gaps)
+        self.assertIn("Vault::deposit(uint256)", {gap["key"] for gap in gaps})
 
     async def test_map_action_space_limits_broad_instascope_roots(self):
         container = FakeContainer()
@@ -5736,7 +6991,10 @@ contract Market {
         payload = json.loads(result)
         self.assertEqual(payload["summary"]["actions"], 2)
         self.assertEqual(payload["summary"]["action_signature_groups"], 1)
-        self.assertEqual(payload["action_families"][0]["key"], "Market::redeem")
+        self.assertEqual(
+            payload["action_families"][0]["key"],
+            "Market::redeem(uint256)",
+        )
         self.assertEqual(payload["action_families"][0]["count"], 2)
         action_space = json.loads(
             container.files["/workspace/campaign/action-spaces/as-001.json"]
@@ -5924,6 +7182,113 @@ abstract contract MintBurnAdapter is Base {
         self.assertEqual(by_key["Vault::sweep"]["exposure"], "gated")
         self.assertIn("/workspace/campaign/live-reachability/lr-001.json", container.files)
 
+    async def test_overloads_remain_distinct_through_live_coverage_and_attack_graph(self):
+        container = FakeContainer()
+        source_root = "/audit/src/Vault_abcd"
+        source_file = f"{source_root}/Vault.sol"
+        container.files[source_file] = """pragma solidity ^0.8.20;
+contract Vault {
+    uint256 total;
+    function withdraw(uint256 amount) external {
+        total -= amount; payable(msg.sender).transfer(amount);
+    }
+    function withdraw(address payable to, uint256 amount) external {
+        total -= amount; to.transfer(amount);
+    }
+}
+"""
+        container.files["/workspace/campaign/scope-manifest.json"] = json.dumps({
+            "ranked_profiles": [{
+                "profile": "contract_Vault_abcd",
+                "contract": "Vault",
+                "address": "0x1111111111111111111111111111111111111111",
+                "src": source_root,
+                "priority_score": 10,
+            }],
+        })
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            await _map_action_space(container, {
+                "files": [source_file],
+                "record_result": False,
+            })
+        action_space = json.loads(
+            container.files["/workspace/campaign/action-spaces/as-001.json"]
+        )
+        overloads = [
+            action for action in action_space["actions"]
+            if action["function"] == "withdraw"
+        ]
+        self.assertEqual(len(overloads), 2)
+        self.assertEqual({item["action_key"] for item in overloads}, {"Vault::withdraw"})
+        self.assertEqual({item["overload_count"] for item in overloads}, {2})
+        definition_keys = {item["action_definition_key"] for item in overloads}
+        self.assertEqual(
+            definition_keys,
+            {"Vault::withdraw(uint256)", "Vault::withdraw(address,uint256)"},
+        )
+
+        legacy_text = "forge test completed for Vault::withdraw"
+        legacy_normalized = _coverage_normalize_text(legacy_text)
+        self.assertTrue(all(
+            not _coverage_action_referenced(
+                item, legacy_text, legacy_normalized
+            )
+            for item in overloads
+        ))
+        exact_key = "Vault::withdraw(uint256)"
+        exact_record = {
+            "section": "experiment",
+            "id": "exp-exact",
+            "text": exact_key,
+            "normalized": _coverage_normalize_text(exact_key),
+            "action_keys": [exact_key],
+            "coverage_keys": [],
+        }
+        records = [exact_record]
+        record_index = _coverage_record_index(records)
+        references = {
+            item["action_definition_key"]: _coverage_references_for_action(
+                item,
+                records,
+                record_index=record_index,
+            )
+            for item in overloads
+        }
+        self.assertTrue(references[exact_key])
+        self.assertFalse(references["Vault::withdraw(address,uint256)"])
+
+        live = json.loads(await _map_live_reachability(container, {
+            "action_space": "as-001",
+            "execute_probes": False,
+            "record_result": False,
+        }))
+        live_overloads = [
+            item for item in live["profiles"][0]["action_exposures"]
+            if item["function"] == "withdraw"
+        ]
+        self.assertEqual(
+            {item["action_definition_key"] for item in live_overloads},
+            definition_keys,
+        )
+        self.assertEqual({item["action_key"] for item in live_overloads}, {"Vault::withdraw"})
+
+        graph = json.loads(await _build_attack_graph(container, {
+            "action_space": "as-001",
+            "live_reachability": "lr-001",
+            "mode": "reachability_aware",
+            "max_candidates": 50,
+            "record_result": False,
+        }))
+        candidates = [
+            item for item in graph["candidate_chains"]
+            if item.get("action_key") == "Vault::withdraw"
+        ]
+        self.assertEqual(
+            {item["action_definition_key"] for item in candidates},
+            definition_keys,
+        )
+        self.assertEqual(len({item["attack_key"] for item in candidates}), 2)
+
     async def test_inventory_live_targets_records_bounded_probe_artifact(self):
         container = FakeContainer()
         container.exec_result = (
@@ -5958,6 +7323,31 @@ abstract contract MintBurnAdapter is Base {
         self.assertEqual(payload["targets"][0]["target_binding"]["kind"], "active_proxy")
         self.assertEqual(payload["targets"][0]["values"]["total_assets"], "1000")
         self.assertIn("/workspace/campaign/live-inventory/linv-001.json", container.files)
+
+    async def test_inventory_cache_keeps_targets_older_than_twelve_batches(self):
+        container = FakeContainer()
+        paths = []
+        oldest_address = "0x1111111111111111111111111111111111111111"
+        for index in range(13):
+            path = f"/workspace/campaign/live-inventory/linv-{index + 1:03d}.json"
+            address = (
+                oldest_address
+                if index == 0
+                else f"0x{index + 1:040x}"
+            )
+            container.files[path] = json.dumps({
+                "id": f"linv-{index + 1:03d}",
+                "targets": [{"label": f"target-{index}", "address": address}],
+            })
+            paths.append(path)
+
+        entries = await _live_inventory_entries_by_address(container, paths)
+
+        self.assertIn(oldest_address, entries)
+        self.assertEqual(
+            entries[oldest_address][0]["inventory_id"],
+            "linv-001",
+        )
 
     async def test_inventory_live_targets_records_related_call_target(self):
         container = FakeContainer()
@@ -6424,6 +7814,117 @@ abstract contract MintBurnAdapter is Base {
         )
         self.assertEqual(reachability["probe_concurrency"], 2)
 
+    async def test_authority_probe_batch_is_bounded_and_keeps_profile_order(self):
+        addresses = [
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            "0x3333333333333333333333333333333333333333",
+        ]
+
+        class AuthorityConcurrencyContainer(FakeContainer):
+            def __init__(self):
+                super().__init__()
+                self.authority_active = 0
+                self.max_authority_active = 0
+                self.authority_completion_order = []
+                self.release_first = asyncio.Event()
+
+            async def exec(
+                self,
+                command: str,
+                working_dir: str = "/audit",
+                timeout: int = 120,
+                extra_env: dict[str, str] | None = None,
+            ) -> tuple[int, str]:
+                self.exec_calls.append((command, working_dir, timeout))
+                self.exec_envs.append(extra_env)
+                target = next(address for address in addresses if address in command)
+                if "authority_can_call_" not in command:
+                    return 0, "\n".join([
+                        "code=0x60006000",
+                        "authority=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    ])
+
+                self.authority_active += 1
+                self.max_authority_active = max(
+                    self.max_authority_active,
+                    self.authority_active,
+                )
+                try:
+                    if target == addresses[0]:
+                        # With a serial implementation this times out because the
+                        # third probe can never begin and release the first.
+                        await asyncio.wait_for(self.release_first.wait(), timeout=0.5)
+                    elif target == addresses[1]:
+                        await asyncio.sleep(0)
+                    else:
+                        self.release_first.set()
+                    self.authority_completion_order.append(target)
+                    return 0, "authority_can_call_1=true"
+                finally:
+                    self.authority_active -= 1
+
+        container = AuthorityConcurrencyContainer()
+        profiles = []
+        actions = []
+        for index, address in enumerate(addresses, start=1):
+            contract = f"Teller{index}"
+            source_root = f"/audit/src/{contract}"
+            profiles.append({
+                "profile": f"contract_{contract}",
+                "contract": contract,
+                "address": address,
+                "src": source_root,
+            })
+            actions.append({
+                "contract": contract,
+                "contract_kind": "contract",
+                "function": "deposit",
+                "file": f"{source_root}/{contract}.sol",
+                "line": 10,
+                "visibility": "external",
+                "mutability": "nonpayable",
+                "parameters": [{"name": "amount", "raw": "uint256 amount"}],
+                "affordances": ["value_in_or_mint", "modifier_gated"],
+                "modifiers": ["requiresAuth"],
+                "hints": {},
+            })
+        container.files["/workspace/campaign/scope-manifest.json"] = json.dumps({
+            "ranked_profiles": profiles,
+        })
+        container.files[
+            "/workspace/campaign/action-spaces/as-001.json"
+        ] = json.dumps({
+            "id": "as-001",
+            "actions": actions,
+            "observations": [],
+        })
+
+        payload = json.loads(await _map_live_reachability(container, {
+            "action_space": "as-001",
+            "execute_probes": True,
+            "probe_concurrency": 2,
+            "rpc_url": "http://rpc.test",
+            "record_result": False,
+        }))
+
+        self.assertEqual(container.max_authority_active, 2)
+        self.assertEqual(
+            container.authority_completion_order,
+            [addresses[1], addresses[2], addresses[0]],
+        )
+        self.assertEqual(
+            [profile["address"] for profile in payload["profiles"]],
+            addresses,
+        )
+        self.assertEqual(
+            [
+                profile["action_exposures"][0]["reachability"]["kind"]
+                for profile in payload["profiles"]
+            ],
+            ["public_authorized"] * 3,
+        )
+
     async def test_build_attack_graph_creates_required_action_skeletons(self):
         container = FakeContainer()
         container.files["/workspace/campaign/action-spaces/as-001.json"] = json.dumps({
@@ -6478,7 +7979,21 @@ abstract contract MintBurnAdapter is Base {
         self.assertEqual(candidate["actions"][0]["target"], "0x1111111111111111111111111111111111111111")
         self.assertEqual(candidate["candidate_id"], "agcand-001")
         self.assertEqual(candidate["actions"][0]["live_status"], "deployed")
+        self.assertEqual(
+            candidate["attack_key"],
+            "0x1111111111111111111111111111111111111111:"
+            "/audit/src/Vault.sol:Vault::deposit:10:exposed",
+        )
         self.assertIn("/workspace/campaign/attack-graphs/ag-001.json", container.files)
+        artifact = json.loads(
+            container.files["/workspace/campaign/attack-graphs/ag-001.json"]
+        )
+        node_ids = {node["id"] for node in artifact["nodes"]}
+        self.assertIn(
+            "contract:Vault:0x1111111111111111111111111111111111111111",
+            node_ids,
+        )
+        self.assertIn("action:/audit/src/Vault.sol:Vault::deposit:10", node_ids)
 
     async def test_build_attack_graph_prioritizes_active_proxy_binding(self):
         container = FakeContainer()
@@ -6885,12 +8400,12 @@ abstract contract MintBurnAdapter is Base {
                     "address": address,
                     "action_exposures": [{
                         **exposure,
-                        "action_uid": f"/audit/src/Vault.sol:Vault::sweep:{index}",
-                        "line": index,
+                        "action_uid": "/audit/src/Vault.sol:Vault::sweep:10",
+                        "line": 10,
                         "target_address": address,
                     }],
                 }
-                for index, address in enumerate(addresses, start=1)
+                for address in addresses
             ],
         })
 
@@ -6943,6 +8458,8 @@ abstract contract MintBurnAdapter is Base {
                 {
                     "contract": "CErc20Delegator",
                     "address": market_a,
+                    "network": "eth-mainnet",
+                    "chain_id": 1,
                     "action_exposures": [
                         exposure("CErc20Delegator", "mint", market_a, ["value_in_or_mint"]),
                         exposure("CErc20Delegator", "redeem", market_a, ["value_out_or_burn"]),
@@ -6952,6 +8469,8 @@ abstract contract MintBurnAdapter is Base {
                 {
                     "contract": "CErc20Delegator",
                     "address": market_b,
+                    "network": "eth-mainnet",
+                    "chain_id": 1,
                     "action_exposures": [
                         exposure("CErc20Delegator", "borrow", market_b, ["credit_or_liquidation", "value_out_or_burn"]),
                     ],
@@ -6959,6 +8478,8 @@ abstract contract MintBurnAdapter is Base {
                 {
                     "contract": "Unitroller",
                     "address": controller,
+                    "network": "eth-mainnet",
+                    "chain_id": 1,
                     "action_exposures": [
                         exposure("Unitroller", "enterMarkets", controller, ["credit_or_liquidation"]),
                     ],
@@ -6979,20 +8500,26 @@ abstract contract MintBurnAdapter is Base {
         self.assertEqual(candidate["market_inventory"]["borrow_market"], market_b)
         self.assertIn("external::donateUnderlyingToMarket", json.dumps(candidate["actions"]))
 
-        workbench = json.loads(await _prepare_fork_exploit_workbench(container, {
+        sequence = json.loads(await _compose_sequence_experiment(container, {
             "attack_graph": "ag-001",
             "candidate_id": "agcand-001",
-            "record_result": False,
         }))
-        self.assertEqual(workbench["mechanism"], "lending")
-        persisted = json.loads(
-            container.files["/workspace/campaign/fork-workbenches/fw-001/workbench.json"]
+        self.assertEqual(
+            sequence["mechanism_validation"]["mechanism"],
+            "lending",
         )
-        self.assertIn("market_inventory", json.dumps(persisted))
-        self.assertIn("borrow_capacity_and_unwind", json.dumps(persisted))
-        sequence = json.loads(await _compose_sequence_experiment(
-            container,
-            workbench["compose_sequence_experiment_args"],
+        sequence_plan = json.loads(
+            container.files[
+                "/workspace/experiments/"
+                "exp-001-test-lending-exchange-rate-collateral-inflation-chain/"
+                "sequence.json"
+            ]
+        )
+        validation = sequence_plan["mechanism_validation_plan"]
+        self.assertIn("borrow_capacity_and_unwind", json.dumps(validation))
+        self.assertFalse(any(
+            path.startswith("/workspace/campaign/fork-workbenches/")
+            for path in container.files
         ))
         self.assertEqual(sequence["target_addresses"]["CollateralMarket"], market_a)
         self.assertEqual(sequence["target_addresses"]["BorrowMarket"], market_b)
@@ -7003,6 +8530,369 @@ abstract contract MintBurnAdapter is Base {
         scaffold = container.files[scaffold_path]
         self.assertIn("IReentbotProCollateralMarket", scaffold)
         self.assertIn("IReentbotProBorrowMarket", scaffold)
+
+    async def test_attack_graph_keeps_same_address_lending_patterns_chain_scoped(self):
+        container = FakeContainer()
+        container.files["/workspace/campaign/action-spaces/as-001.json"] = json.dumps({
+            "id": "as-001",
+            "actions": [],
+            "observations": [],
+        })
+        market_a = "0x1111111111111111111111111111111111111111"
+        market_b = "0x2222222222222222222222222222222222222222"
+        controller = "0x3333333333333333333333333333333333333333"
+
+        def exposure(contract, function, address, affordances):
+            return {
+                "action_key": f"{contract}::{function}",
+                "action_definition_key": f"{contract}::{function}()",
+                "contract": contract,
+                "function": function,
+                "signature": f"{function}()",
+                "file": f"/audit/src/{contract}.sol",
+                "target_address": address,
+                "affordances": affordances,
+                "reachability": {"kind": "public", "attacker_reachable": True},
+                "live_status": "deployed",
+                "exposure": "exposed",
+            }
+
+        profiles = []
+        for network, chain_id in (("eth-mainnet", 1), ("base-mainnet", 8453)):
+            profiles.extend([
+                {
+                    "contract": "CErc20Delegator",
+                    "address": market_a,
+                    "network": network,
+                    "chain_id": chain_id,
+                    "action_exposures": [
+                        exposure("CErc20Delegator", "mint", market_a, ["value_in_or_mint"]),
+                        exposure("CErc20Delegator", "redeem", market_a, ["value_out_or_burn"]),
+                        exposure("CErc20Delegator", "exchangeRateCurrent", market_a, ["valuation_dependency"]),
+                    ],
+                },
+                {
+                    "contract": "CErc20Delegator",
+                    "address": market_b,
+                    "network": network,
+                    "chain_id": chain_id,
+                    "action_exposures": [
+                        exposure("CErc20Delegator", "borrow", market_b, ["credit_or_liquidation", "value_out_or_burn"]),
+                    ],
+                },
+                {
+                    "contract": "Unitroller",
+                    "address": controller,
+                    "network": network,
+                    "chain_id": chain_id,
+                    "action_exposures": [
+                        exposure("Unitroller", "enterMarkets", controller, ["credit_or_liquidation"]),
+                    ],
+                },
+            ])
+        container.files["/workspace/campaign/live-reachability/lr-001.json"] = json.dumps({
+            "id": "lr-001",
+            "profiles": profiles,
+        })
+
+        payload = json.loads(await _build_attack_graph(container, {
+            "action_space": "as-001",
+            "live_reachability": "lr-001",
+            "max_candidates": 30,
+            "record_result": False,
+        }))
+        lending = [
+            item for item in payload["candidate_chains"]
+            if item.get("mechanism") == "lending_exchange_rate_inflation"
+        ]
+        self.assertEqual({item["chain_id"] for item in lending}, {1, 8453})
+        self.assertEqual(len({item["attack_key"] for item in lending}), 2)
+        self.assertTrue(all(
+            len({action.get("chain_id") for action in item["actions"]}) == 1
+            for item in lending
+        ))
+
+    async def test_attack_graph_keeps_same_address_queue_lifecycles_chain_scoped(self):
+        container = FakeContainer()
+        container.files["/workspace/campaign/action-spaces/as-001.json"] = json.dumps({
+            "id": "as-001",
+            "actions": [],
+            "observations": [],
+        })
+        address = "0x1111111111111111111111111111111111111111"
+
+        def exposure(function, *, gated=False):
+            return {
+                "action_key": f"BoringOnChainQueue::{function}",
+                "action_definition_key": f"BoringOnChainQueue::{function}()",
+                "contract": "BoringOnChainQueue",
+                "function": function,
+                "signature": f"{function}()",
+                "file": "/audit/src/Queue.sol",
+                "target_address": address,
+                "affordances": ["value_out_or_burn"] if gated else ["signed_authorization"],
+                "reachability": (
+                    {"kind": "role_gated", "attacker_reachable": False, "confidence": "high"}
+                    if gated else {"kind": "public", "attacker_reachable": True}
+                ),
+                "live_status": "deployed",
+                "exposure": "gated" if gated else "exposed",
+            }
+
+        profiles = [
+            {
+                "contract": "BoringOnChainQueue",
+                "address": address,
+                "network": network,
+                "chain_id": chain_id,
+                "action_exposures": [
+                    exposure("requestOnChainWithdrawWithPermit"),
+                    exposure("solveOnChainWithdraws", gated=True),
+                ],
+            }
+            for network, chain_id in (("eth-mainnet", 1), ("base-mainnet", 8453))
+        ]
+        container.files["/workspace/campaign/live-reachability/lr-001.json"] = json.dumps({
+            "id": "lr-001",
+            "profiles": profiles,
+        })
+
+        payload = json.loads(await _build_attack_graph(container, {
+            "action_space": "as-001",
+            "live_reachability": "lr-001",
+            "max_candidates": 30,
+            "record_result": False,
+        }))
+        queues = [
+            item for item in payload["candidate_chains"]
+            if item.get("mechanism") == "queue_solver_accounting"
+        ]
+        self.assertEqual({item["chain_id"] for item in queues}, {1, 8453})
+        self.assertEqual(len({item["attack_key"] for item in queues}), 2)
+
+    async def test_attack_graph_dedupe_and_nodes_are_chain_qualified(self):
+        container = FakeContainer()
+        container.files["/workspace/campaign/action-spaces/as-001.json"] = json.dumps({
+            "id": "as-001",
+            "actions": [],
+            "observations": [],
+        })
+        address = "0x1111111111111111111111111111111111111111"
+
+        def exposure():
+            return {
+                "action_key": "Vault::sweep",
+                "action_definition_key": "Vault::sweep(address)",
+                "contract": "Vault",
+                "function": "sweep",
+                "signature": "sweep(address)",
+                "file": "/audit/src/Vault.sol",
+                "target_address": address,
+                "affordances": ["value_out_or_burn", "modifier_gated"],
+                "reachability": {
+                    "kind": "role_gated",
+                    "attacker_reachable": False,
+                    "confidence": "high",
+                },
+                "target_binding": {
+                    "kind": "active_proxy",
+                    "economically_significant_hint": True,
+                },
+                "live_status": "deployed",
+                "exposure": "gated",
+            }
+
+        container.files["/workspace/campaign/live-reachability/lr-001.json"] = json.dumps({
+            "id": "lr-001",
+            "profiles": [
+                {
+                    "contract": "Vault",
+                    "address": address,
+                    "network": network,
+                    "chain_id": chain_id,
+                    "action_exposures": [exposure()],
+                }
+                for network, chain_id in (("eth-mainnet", 1), ("base-mainnet", 8453))
+            ],
+        })
+
+        payload = json.loads(await _build_attack_graph(container, {
+            "action_space": "as-001",
+            "live_reachability": "lr-001",
+            "max_candidates": 30,
+            "record_result": False,
+        }))
+        sweeps = [
+            item for item in payload["candidate_chains"]
+            if item.get("action_key") == "Vault::sweep"
+        ]
+        self.assertEqual({item["chain_id"] for item in sweeps}, {1, 8453})
+        self.assertEqual(len({item["attack_key"] for item in sweeps}), 2)
+        graph = json.loads(
+            container.files["/workspace/campaign/attack-graphs/ag-001.json"]
+        )
+        action_nodes = [
+            node for node in graph["nodes"]
+            if node.get("kind") == "entrypoint"
+            and node.get("label") == "Vault::sweep"
+        ]
+        self.assertEqual({node["chain_id"] for node in action_nodes}, {1, 8453})
+        self.assertEqual(len({node["id"] for node in action_nodes}), 2)
+
+    def test_attack_graph_topology_uses_source_action_uid(self):
+        address_a = "0x1111111111111111111111111111111111111111"
+        address_b = "0x2222222222222222222222222222222222222222"
+
+        def exposure(file, line, address, *, action_uid=None):
+            item = {
+                "action_key": "Vault::withdraw",
+                "action_definition_key": "Vault::withdraw(uint256)",
+                "contract": "Vault",
+                "function": "withdraw",
+                "signature": "withdraw(uint256)",
+                "file": file,
+                "line": line,
+                "target_address": address,
+                "network": "eth-mainnet",
+                "chain_id": 1,
+                "reachability": {"kind": "public", "attacker_reachable": True},
+                "exposure": "exposed",
+            }
+            if action_uid:
+                item["action_uid"] = action_uid
+            return item
+
+        uid_a = "/audit/a/Vault.sol:Vault::withdraw(uint256):10"
+        uid_b = "/audit/b/Vault.sol:Vault::withdraw(uint256):20"
+        nodes, edges = _attack_graph_nodes_edges_from_exposures([
+            exposure("/audit/a/Vault.sol", 10, address_a, action_uid=uid_a),
+            exposure("/audit/b/Vault.sol", 20, address_b, action_uid=uid_b),
+        ])
+        actions = [node for node in nodes if node.get("kind") == "entrypoint"]
+        self.assertEqual(
+            {node["id"] for node in actions},
+            {f"action:1:{uid_a}", f"action:1:{uid_b}"},
+        )
+        self.assertEqual(
+            {node["legacy_id"] for node in actions},
+            {"action:1:Vault::withdraw(uint256)"},
+        )
+        has_entrypoint = [
+            edge for edge in edges if edge.get("kind") == "has_entrypoint"
+        ]
+        self.assertEqual(len(has_entrypoint), 2)
+        self.assertEqual(len({edge["to"] for edge in has_entrypoint}), 2)
+
+        fallback_nodes, _edges = _attack_graph_nodes_edges_from_exposures([
+            exposure("/audit/a/Vault.sol", 10, address_a),
+            exposure("/audit/b/Vault.sol", 20, address_b),
+        ])
+        fallback_actions = [
+            node for node in fallback_nodes if node.get("kind") == "entrypoint"
+        ]
+        self.assertEqual(len({node["id"] for node in fallback_actions}), 2)
+        self.assertTrue(all(
+            node["id"] != "action:1:Vault::withdraw(uint256)"
+            for node in fallback_actions
+        ))
+
+    async def test_attack_graph_candidates_and_branches_use_source_action_uid(self):
+        container = FakeContainer()
+        for section, title in (
+            ("protocol_model", "Protocol model"),
+            ("value_flow", "Value flow"),
+            ("invariant", "Invariant"),
+        ):
+            await _update_campaign(container, {
+                "section": section,
+                "title": title,
+                "content": f"{title} with concrete source references.",
+            })
+
+        target = "0x1111111111111111111111111111111111111111"
+        action_path = "/workspace/campaign/action-spaces/as-001.json"
+        live_path = "/workspace/campaign/live-reachability/lr-001.json"
+        container.files[action_path] = json.dumps({
+            "id": "as-001",
+            "actions": [],
+            "observations": [],
+        })
+
+        def exposure(file, line):
+            return {
+                "action_key": "Vault::withdraw",
+                "action_definition_key": "Vault::withdraw(uint256)",
+                "action_uid": f"{file}:Vault::withdraw(uint256):{line}",
+                "contract": "Vault",
+                "function": "withdraw",
+                "signature": "withdraw(uint256)",
+                "file": file,
+                "line": line,
+                "target_address": target,
+                "network": "eth-mainnet",
+                "chain_id": 1,
+                "affordances": [
+                    "value_out_or_burn",
+                    "token_or_native_transfer",
+                ],
+                "parameters": [{"name": "amount", "raw": "uint256 amount"}],
+                "reachability": {"kind": "public", "attacker_reachable": True},
+                "live_status": "deployed",
+                "exposure": "exposed",
+            }
+
+        exposures = [
+            exposure("/audit/a/Vault.sol", 10),
+            exposure("/audit/b/Vault.sol", 20),
+        ]
+        container.files[live_path] = json.dumps({
+            "id": "lr-001",
+            "summary": {"live_deployed_profiles": 1},
+            "profiles": [{
+                "contract": "Vault",
+                "address": target,
+                "network": "eth-mainnet",
+                "chain_id": 1,
+                "action_exposures": exposures,
+            }],
+        })
+
+        graph = json.loads(await _build_attack_graph(container, {
+            "action_space": "as-001",
+            "live_reachability": "lr-001",
+            "mode": "reachability_aware",
+            "max_candidates": 20,
+        }))
+        candidates = [
+            item for item in graph["candidate_chains"]
+            if item.get("action_definition_key") == "Vault::withdraw(uint256)"
+        ]
+        self.assertEqual(len(candidates), 2)
+        attack_keys = {item["attack_key"] for item in candidates}
+        self.assertEqual(len(attack_keys), 2)
+        self.assertEqual(
+            {item["action_uid"] for item in candidates},
+            {item["action_uid"] for item in exposures},
+        )
+        self.assertTrue(all(
+            any(uid in attack_key for attack_key in attack_keys)
+            for uid in {item["action_uid"] for item in exposures}
+        ))
+
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
+        branches = [
+            item for item in search["active_branches"]
+            if item.get("source") == "attack_graph_candidate"
+            and item.get("title") == "Test live-reachable Vault::withdraw"
+        ]
+        self.assertEqual(len(branches), 2)
+        self.assertEqual(
+            {item["key"] for item in branches},
+            {f"attack_graph:{attack_key}" for attack_key in attack_keys},
+        )
 
     async def test_build_attack_graph_source_only_mode_uses_only_action_space(self):
         container = FakeContainer()
@@ -7590,6 +9480,11 @@ abstract contract MintBurnAdapter is Base {
         })
         container.files["/workspace/campaign/protocol-graphs/pg-001.json"] = json.dumps({
             "id": "pg-001",
+            "source": {
+                "action_space": (
+                    "/workspace/campaign/action-spaces/as-001.json"
+                ),
+            },
             "nodes": [],
             "edges": [],
         })
@@ -7625,6 +9520,129 @@ abstract contract MintBurnAdapter is Base {
         # protocol/action context exists; the source-only graph is additive.
         self.assertIn("map_live_reachability", branches)
         self.assertEqual(result["next_action"]["tool"], "map_live_reachability")
+
+    async def test_attack_search_rebuilds_source_graph_after_live_binding(self):
+        container = FakeContainer()
+        await self._record_foundation(container)
+        action_path = "/workspace/campaign/action-spaces/as-001.json"
+        protocol_path = "/workspace/campaign/protocol-graphs/pg-001.json"
+        live_path = "/workspace/campaign/live-reachability/lr-001.json"
+        graph_path = "/workspace/campaign/attack-graphs/ag-001.json"
+        container.files[action_path] = json.dumps({
+            "id": "as-001",
+            "actions": [],
+            "observations": [],
+        })
+        container.files[protocol_path] = json.dumps({
+            "id": "pg-001",
+            "nodes": [],
+            "edges": [],
+        })
+        container.files[graph_path] = json.dumps({
+            "id": "ag-001",
+            "mode": "source_only",
+            "needs_live_context": True,
+            "action_space_path": action_path,
+            "protocol_graph_path": protocol_path,
+            "live_reachability_path": None,
+            "candidate_chains": [{
+                "candidate_id": "agcand-stale",
+                "attack_key": "stale:Vault::withdraw",
+                "action_key": "Vault::withdraw",
+                "title": "Stale source-only candidate",
+                "actions": [],
+            }],
+        })
+        container.files[live_path] = json.dumps({
+            "id": "lr-001",
+            "summary": {"live_deployed_profiles": 1},
+            "profiles": [{
+                "contract": "Vault",
+                "address": "0x1111111111111111111111111111111111111111",
+            }],
+        })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Source graph and live binding",
+            "content": "Live context arrived after the source-only graph.",
+            "evidence": [action_path, protocol_path, graph_path, live_path],
+        })
+
+        result = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
+            "record_result": False,
+        }))
+
+        refresh = next(
+            branch for branch in result["active_branches"]
+            if branch.get("source") == "stale_attack_graph"
+        )
+        required = refresh["required_args"]["build_attack_graph"]
+        self.assertEqual(required["mode"], "reachability_aware")
+        self.assertEqual(required["action_space"], action_path)
+        self.assertEqual(required["live_reachability"], live_path)
+        self.assertFalse(any(
+            branch.get("source") == "attack_graph_candidate"
+            for branch in result["active_branches"]
+        ))
+
+    async def test_attack_search_rebuilds_graph_for_newer_action_space(self):
+        container = FakeContainer()
+        await self._record_foundation(container)
+        first_action_path = "/workspace/campaign/action-spaces/as-001.json"
+        latest_action_path = "/workspace/campaign/action-spaces/as-002.json"
+        protocol_path = "/workspace/campaign/protocol-graphs/pg-001.json"
+        graph_path = "/workspace/campaign/attack-graphs/ag-001.json"
+        for identifier, path in (
+            ("as-001", first_action_path),
+            ("as-002", latest_action_path),
+        ):
+            container.files[path] = json.dumps({
+                "id": identifier,
+                "actions": [],
+                "observations": [],
+            })
+        container.files[protocol_path] = json.dumps({
+            "id": "pg-001",
+            "nodes": [],
+            "edges": [],
+        })
+        container.files[graph_path] = json.dumps({
+            "id": "ag-001",
+            "mode": "source_only",
+            "needs_live_context": True,
+            "action_space_path": first_action_path,
+            "protocol_graph_path": protocol_path,
+            "live_reachability_path": None,
+            "candidate_chains": [],
+        })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Updated action map",
+            "content": "The callable grammar changed after graph construction.",
+            "evidence": [
+                first_action_path,
+                latest_action_path,
+                protocol_path,
+                graph_path,
+            ],
+        })
+
+        result = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
+            "record_result": False,
+        }))
+
+        refresh = next(
+            branch for branch in result["active_branches"]
+            if branch.get("source") == "stale_attack_graph"
+        )
+        self.assertEqual(
+            refresh["required_args"]["build_attack_graph"]["action_space"],
+            latest_action_path,
+        )
 
     async def test_build_attack_graph_consumes_state_transition_model(self):
         container = FakeContainer()
@@ -7737,6 +9755,579 @@ abstract contract MintBurnAdapter is Base {
         self.assertEqual(
             payload["summary"]["generic_invariant_candidates"], 1
         )
+
+    async def test_state_model_candidate_binds_live_target_and_stops_remapping(self):
+        container = FakeContainer()
+        target = "0x1111111111111111111111111111111111111111"
+        action_path = "/workspace/campaign/action-spaces/as-001.json"
+        model_path = "/workspace/campaign/state-transition-models/stm-001.json"
+        live_path = "/workspace/campaign/live-reachability/lr-001.json"
+        graph_path = "/workspace/campaign/attack-graphs/ag-001.json"
+        action = {
+            "contract": "Bland",
+            "function": "x",
+            "file": "/audit/src/Bland.sol",
+            "line": 10,
+            "visibility": "external",
+            "mutability": "nonpayable",
+            "parameters": [],
+            "affordances": ["mapping_state_write", "state_mutating_entrypoint"],
+            "modifiers": [],
+        }
+        container.files[action_path] = json.dumps({
+            "id": "as-001",
+            "actions": [action],
+            "observations": [],
+        })
+        container.files[model_path] = self._bland_state_transition_model()
+        target_binding = {
+            "kind": "deployed_economic_contract",
+            "live_deployed": True,
+        }
+        container.files[live_path] = json.dumps({
+            "id": "lr-001",
+            "profiles": [{
+                "contract": "Bland",
+                "address": target,
+                "action_exposures": [{
+                    **action,
+                    "action_key": "Bland::x",
+                    "target_address": target,
+                    "reachability": {
+                        "kind": "public",
+                        "attacker_reachable": True,
+                    },
+                    "live_status": "deployed",
+                    "exposure": "exposed",
+                    "target_binding": target_binding,
+                }],
+            }],
+        })
+
+        payload = json.loads(await _build_attack_graph(container, {
+            "action_space": action_path,
+            "live_reachability": live_path,
+            "mode": "reachability_aware",
+            "state_transition_model": model_path,
+            "max_candidates": 50,
+            "record_result": False,
+        }))
+        candidate = next(
+            item for item in payload["candidate_chains"]
+            if item.get("candidate_kind") == "generic_invariant"
+        )
+        self.assertEqual(candidate["target_address"], target)
+        self.assertEqual(candidate["target_binding"], target_binding)
+        self.assertEqual(candidate["exposure"], "exposed")
+        self.assertEqual(candidate["live_status"], "deployed")
+        self.assertEqual(candidate["actions"][0]["target"], target)
+        self.assertEqual(candidate["actions"][0]["live_exposure"], "exposed")
+        self.assertNotIn("live_blockers", candidate["actions"][0])
+        self.assertNotIn("blockers", candidate)
+        self.assertIn("planning context, not proof", " ".join(
+            candidate["planning_notes"]
+        ))
+        self.assertNotIn("map_live_reachability", candidate["recommended_next_tool"])
+        self.assertEqual(candidate["source"]["live_reachability"], live_path)
+
+        await self._record_foundation(container)
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Live-bound state-model graph",
+            "content": "The action, model, live map, and graph are current.",
+            "evidence": [action_path, model_path, live_path, graph_path],
+        })
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
+        branch = next(
+            item for item in search["active_branches"]
+            if item.get("generic_invariant")
+        )
+        self.assertEqual(branch["status"], "needs_inventory")
+        self.assertEqual(branch["next_tool"], "inventory_live_targets")
+        self.assertNotEqual(branch["next_tool"], "map_live_reachability")
+        self.assertEqual(branch["target_actions"][0]["target"], target)
+
+    async def test_state_model_keeps_chain_qualified_clones_and_frontiers_overflow(self):
+        container = FakeContainer()
+        action_path = "/workspace/campaign/action-spaces/as-001.json"
+        model_path = "/workspace/campaign/state-transition-models/stm-001.json"
+        live_path = "/workspace/campaign/live-reachability/lr-001.json"
+        shared_address = "0x1111111111111111111111111111111111111111"
+        action = {
+            "contract": "Bland",
+            "function": "x",
+            "signature": "x()",
+            "file": "/audit/src/Bland.sol",
+            "line": 10,
+            "visibility": "external",
+            "mutability": "nonpayable",
+            "parameters": [],
+            "affordances": [
+                "mapping_state_write",
+                "value_out_or_burn",
+                "state_mutating_entrypoint",
+            ],
+            "modifiers": [],
+        }
+        container.files[action_path] = json.dumps({
+            "id": "as-001",
+            "actions": [action],
+            "observations": [],
+        })
+        container.files[model_path] = json.dumps({
+            "state_transition_model_id": "stm-001",
+            "id": "stm-001",
+            "candidate_invariants": [{
+                "id": "inv-001",
+                "kind": "conservation",
+                "statement": "Credit must remain conserved.",
+                "contract": "Bland",
+                "function": "x",
+                "signature": "x()",
+                "action_definition_key": "Bland::x()",
+                "file": "/audit/src/Bland.sol",
+                "candidate_observations": [],
+            }],
+        })
+        deployments = [
+            # Same 20-byte address on two chains: both are distinct live routes.
+            (shared_address, "ethereum", 1, "active_proxy", True),
+            (shared_address, "optimism", 10, "deployed_economic_contract", True),
+            (
+                "0x2222222222222222222222222222222222222222",
+                "ethereum",
+                1,
+                "deployed_configured_contract",
+                False,
+            ),
+            (
+                "0x3333333333333333333333333333333333333333",
+                "ethereum",
+                1,
+                "deployed_contract",
+                False,
+            ),
+            (
+                "0x4444444444444444444444444444444444444444",
+                "ethereum",
+                1,
+                "unknown_code",
+                False,
+            ),
+        ]
+        profiles = []
+        for index, (
+            address,
+            network,
+            chain_id,
+            binding_kind,
+            economic,
+        ) in enumerate(deployments, start=1):
+            exposure = {
+                **action,
+                "action_key": "Bland::x",
+                "action_definition_key": "Bland::x()",
+                "action_uid": "/audit/src/Bland.sol:Bland::x():10",
+                "target_address": address,
+                "network": network,
+                "chain_id": chain_id,
+                "reachability": {
+                    "kind": "public",
+                    "attacker_reachable": True,
+                },
+                "live_status": "deployed",
+                "exposure": "exposed",
+                "target_binding": {
+                    "kind": binding_kind,
+                    "live_deployed": binding_kind != "unknown_code",
+                    "economically_significant_hint": economic,
+                },
+                "clone_family_key": f"clone-{index}",
+            }
+            profiles.append({
+                "profile": f"contract_Bland_{index}",
+                "contract": "Bland",
+                "address": address,
+                "network": network,
+                "chain_id": chain_id,
+                "action_exposures": [exposure],
+            })
+        container.files[live_path] = json.dumps({
+            "id": "lr-001",
+            "profiles": profiles,
+        })
+
+        payload = json.loads(await _build_attack_graph(container, {
+            "action_space": action_path,
+            "live_reachability": live_path,
+            "mode": "reachability_aware",
+            "state_transition_model": model_path,
+            "max_candidates": 50,
+            "frontier_max_items": 50,
+            "record_result": False,
+        }))
+        generic = [
+            candidate for candidate in payload["candidate_chains"]
+            if candidate.get("candidate_kind") == "generic_invariant"
+        ]
+        self.assertEqual(len(generic), 3)
+        by_identity = {
+            (
+                candidate["target_identity"].get("chain_id"),
+                candidate["target_address"],
+            ): candidate
+            for candidate in generic
+        }
+        self.assertIn((1, shared_address), by_identity)
+        self.assertIn((10, shared_address), by_identity)
+        mainnet = by_identity[(1, shared_address)]
+        optimism = by_identity[(10, shared_address)]
+        self.assertGreater(
+            mainnet["live_binding_score"],
+            optimism["live_binding_score"],
+        )
+        self.assertNotEqual(mainnet["attack_key"], optimism["attack_key"])
+        for chain_id, candidate in ((1, mainnet), (10, optimism)):
+            self.assertIn(f":{chain_id}:{shared_address}", candidate["attack_key"])
+            self.assertIn(":inv-001:conservation:Bland::x()", candidate["attack_key"])
+            self.assertEqual(candidate["actions"][0]["chain_id"], chain_id)
+            self.assertEqual(
+                candidate["actions"][0]["target_identity"]["chain_id"],
+                chain_id,
+            )
+
+        binding = payload["state_transition_model"]
+        self.assertEqual(binding["live_target_cap_per_invariant"], 3)
+        self.assertEqual(binding["live_targets_considered"], 5)
+        self.assertEqual(binding["live_targets_selected"], 3)
+        self.assertEqual(binding["live_targets_omitted"], 2)
+        self.assertTrue(binding["live_target_binding_truncated"])
+        self.assertEqual(
+            binding["live_target_omissions"][0]["omitted_target_count"],
+            2,
+        )
+        artifact = json.loads(
+            container.files["/workspace/campaign/attack-graphs/ag-001.json"]
+        )
+        stm_overflow = [
+            entry for entry in artifact["frontier"]["omitted_by_truncation"]
+            if str(entry.get("attack_key") or "").startswith("stm:stm-001:inv-001")
+        ]
+        self.assertEqual(len(stm_overflow), 2)
+        self.assertTrue(all(entry.get("target_identity") for entry in stm_overflow))
+        self.assertEqual(
+            payload["frontier_summary"]["generic_invariant_candidates"],
+            2,
+        )
+
+    async def test_state_model_does_not_reuse_ambiguous_legacy_live_exposure(self):
+        container = FakeContainer()
+        action_path = "/workspace/campaign/action-spaces/as-001.json"
+        model_path = "/workspace/campaign/state-transition-models/stm-001.json"
+        live_path = "/workspace/campaign/live-reachability/lr-001.json"
+        target = "0x1111111111111111111111111111111111111111"
+        actions = [
+            {
+                "contract": "Bland",
+                "function": "x",
+                "signature": "x()",
+                "file": source_file,
+                "line": line,
+                "visibility": "external",
+                "mutability": "nonpayable",
+                "parameters": [],
+                "affordances": ["mapping_state_write"],
+                "modifiers": [],
+            }
+            for source_file, line in (
+                ("/audit/src/First.sol", 10),
+                ("/audit/src/Second.sol", 20),
+            )
+        ]
+        container.files[action_path] = json.dumps({
+            "id": "as-001",
+            "actions": actions,
+            "observations": [],
+        })
+        container.files[model_path] = json.dumps({
+            "id": "stm-001",
+            "candidate_invariants": [{
+                "id": "inv-001",
+                "kind": "conservation",
+                "statement": "Both exact definitions must preserve credit.",
+                "target_actions": [
+                    {
+                        "contract": "Bland",
+                        "function": "x",
+                        "signature": "x()",
+                        "action_definition_key": "Bland::x()",
+                        "file": action["file"],
+                    }
+                    for action in actions
+                ],
+            }],
+        })
+        # This old row lacks file/action_uid, so it cannot identify which of the
+        # two same-signature source definitions it actually exposes.
+        container.files[live_path] = json.dumps({
+            "id": "lr-001",
+            "profiles": [{
+                "profile": "contract_Bland",
+                "contract": "Bland",
+                "address": target,
+                "action_exposures": [{
+                    "contract": "Bland",
+                    "function": "x",
+                    "signature": "x()",
+                    "action_key": "Bland::x",
+                    "action_definition_key": "Bland::x()",
+                    "target_address": target,
+                    "reachability": {
+                        "kind": "public",
+                        "attacker_reachable": True,
+                    },
+                    "live_status": "deployed",
+                    "exposure": "exposed",
+                    "target_binding": {"kind": "active_proxy"},
+                }],
+            }],
+        })
+
+        payload = json.loads(await _build_attack_graph(container, {
+            "action_space": action_path,
+            "live_reachability": live_path,
+            "mode": "reachability_aware",
+            "state_transition_model": model_path,
+            "max_candidates": 50,
+            "record_result": False,
+        }))
+        generic = [
+            candidate for candidate in payload["candidate_chains"]
+            if candidate.get("candidate_kind") == "generic_invariant"
+        ]
+        self.assertEqual(len(generic), 1)
+        self.assertNotIn("target_address", generic[0])
+        self.assertEqual(
+            payload["state_transition_model"]["live_targets_considered"],
+            0,
+        )
+        self.assertIn(
+            "did not bind every modeled action",
+            " ".join(generic[0]["blockers"]),
+        )
+
+    async def test_state_model_carries_unambiguous_inferred_chain_to_action(self):
+        container = FakeContainer()
+        action_path = "/workspace/campaign/action-spaces/as-001.json"
+        model_path = "/workspace/campaign/state-transition-models/stm-001.json"
+        live_path = "/workspace/campaign/live-reachability/lr-001.json"
+        target = "0x1111111111111111111111111111111111111111"
+        action = {
+            "contract": "Bland",
+            "function": "x",
+            "signature": "x()",
+            "file": "/audit/src/Bland.sol",
+            "line": 10,
+            "visibility": "external",
+            "mutability": "nonpayable",
+            "parameters": [],
+            "affordances": ["mapping_state_write"],
+            "modifiers": [],
+        }
+        container.files[action_path] = json.dumps({
+            "id": "as-001",
+            "actions": [action],
+            "observations": [],
+        })
+        container.files[model_path] = json.dumps({
+            "id": "stm-001",
+            "candidate_invariants": [{
+                "id": "inv-001",
+                "kind": "conservation",
+                "statement": "Credit remains conserved.",
+                "contract": "Bland",
+                "function": "x",
+                "signature": "x()",
+                "action_definition_key": "Bland::x()",
+                "file": action["file"],
+            }],
+        })
+        modeled_exposure = {
+            **action,
+            "action_key": "Bland::x",
+            "action_definition_key": "Bland::x()",
+            "action_uid": "/audit/src/Bland.sol:Bland::x():10",
+            "target_address": target,
+            "reachability": {"kind": "public", "attacker_reachable": True},
+            "live_status": "deployed",
+            "exposure": "exposed",
+            "target_binding": {"kind": "active_proxy"},
+        }
+        container.files[live_path] = json.dumps({
+            "id": "lr-001",
+            "profiles": [
+                {
+                    "profile": "legacy_Bland",
+                    "contract": "Bland",
+                    "address": target,
+                    "action_exposures": [modeled_exposure],
+                },
+                {
+                    # A second row proves the address has one concrete chain;
+                    # the old modeled row can inherit it without guessing.
+                    "profile": "chain_marker",
+                    "contract": "Marker",
+                    "address": target,
+                    "network": "optimism",
+                    "chain_id": 10,
+                    "action_exposures": [{
+                        "contract": "Marker",
+                        "function": "ping",
+                        "signature": "ping()",
+                        "action_key": "Marker::ping",
+                        "action_definition_key": "Marker::ping()",
+                        "file": "/audit/src/Marker.sol",
+                        "target_address": target,
+                        "network": "optimism",
+                        "chain_id": 10,
+                        "reachability": {
+                            "kind": "public",
+                            "attacker_reachable": True,
+                        },
+                        "live_status": "deployed",
+                        "exposure": "exposed",
+                        "target_binding": {"kind": "deployed_contract"},
+                    }],
+                },
+            ],
+        })
+
+        payload = json.loads(await _build_attack_graph(container, {
+            "action_space": action_path,
+            "live_reachability": live_path,
+            "mode": "reachability_aware",
+            "state_transition_model": model_path,
+            "max_candidates": 50,
+            "record_result": False,
+        }))
+        candidate = next(
+            item for item in payload["candidate_chains"]
+            if item.get("candidate_kind") == "generic_invariant"
+        )
+        self.assertEqual(candidate["chain_id"], 10)
+        self.assertEqual(candidate["target_identity"]["chain_id"], 10)
+        self.assertEqual(candidate["actions"][0]["chain_id"], 10)
+        self.assertIn(f":10:{target}", candidate["attack_key"])
+
+    async def test_state_model_candidate_parks_after_incoherent_live_binding(self):
+        container = FakeContainer()
+        first = "0x1111111111111111111111111111111111111111"
+        second = "0x2222222222222222222222222222222222222222"
+        action_path = "/workspace/campaign/action-spaces/as-001.json"
+        model_path = "/workspace/campaign/state-transition-models/stm-001.json"
+        live_path = "/workspace/campaign/live-reachability/lr-001.json"
+        graph_path = "/workspace/campaign/attack-graphs/ag-001.json"
+        actions = [
+            {
+                "contract": "Bland",
+                "function": function,
+                "file": "/audit/src/Bland.sol",
+                "line": line,
+                "visibility": "external",
+                "mutability": "nonpayable",
+                "parameters": [],
+                "affordances": ["mapping_state_write", "state_mutating_entrypoint"],
+                "modifiers": [],
+            }
+            for function, line in (("x", 10), ("y", 20))
+        ]
+        container.files[action_path] = json.dumps({
+            "id": "as-001",
+            "actions": actions,
+            "observations": [],
+        })
+        container.files[model_path] = json.dumps({
+            "state_transition_model_id": "stm-001",
+            "id": "stm-001",
+            "candidate_invariants": [{
+                "id": "inv-001",
+                "kind": "conservation",
+                "statement": "The paired transitions must conserve credit.",
+                "target_actions": ["Bland.x", "Bland.y"],
+                "candidate_observations": [],
+            }],
+        })
+        exposures = []
+        for action, target in zip(actions, (first, second), strict=True):
+            exposures.append({
+                **action,
+                "action_key": f"Bland::{action['function']}",
+                "target_address": target,
+                "reachability": {
+                    "kind": "public",
+                    "attacker_reachable": True,
+                },
+                "live_status": "deployed",
+                "exposure": "exposed",
+                "target_binding": {
+                    "kind": "deployed_economic_contract",
+                    "live_deployed": True,
+                },
+            })
+        container.files[live_path] = json.dumps({
+            "id": "lr-001",
+            "profiles": [{
+                "contract": "Bland",
+                "address": first,
+                "action_exposures": exposures,
+            }],
+        })
+
+        payload = json.loads(await _build_attack_graph(container, {
+            "action_space": action_path,
+            "live_reachability": live_path,
+            "mode": "reachability_aware",
+            "state_transition_model": model_path,
+            "max_candidates": 50,
+            "record_result": False,
+        }))
+        candidate = next(
+            item for item in payload["candidate_chains"]
+            if item.get("candidate_kind") == "generic_invariant"
+        )
+        self.assertNotIn("target_address", candidate)
+        self.assertEqual(candidate["reachability"], "needs_live_context")
+        self.assertTrue(any(
+            "one coherent callable target" in blocker
+            for blocker in candidate["blockers"]
+        ))
+        self.assertEqual(candidate["source"]["live_reachability"], live_path)
+        self.assertEqual(
+            {action["live_exposure"] for action in candidate["actions"]},
+            {"source_only"},
+        )
+
+        await self._record_foundation(container)
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Incoherent state-model live bindings",
+            "content": "The live map binds the modeled actions to different targets.",
+            "evidence": [action_path, model_path, live_path, graph_path],
+        })
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
+        branch = next(
+            item for item in search["active_branches"]
+            if item.get("generic_invariant")
+        )
+        self.assertEqual(branch["status"], "parked_needs_live_context")
+        self.assertEqual(branch["next_tool"], "record_fork_context or update_campaign")
+        self.assertNotEqual(branch["next_tool"], "map_live_reachability")
 
     async def test_build_attack_graph_state_transition_model_id_ref_and_frontier(self):
         container = FakeContainer()
@@ -8509,7 +11100,7 @@ abstract contract MintBurnAdapter is Base {
             any(branch.get("generic_invariant") for branch in result["active_branches"])
         )
 
-    async def test_prepare_fork_exploit_workbench_infers_vault_adapter(self):
+    async def test_compose_sequence_embeds_vault_validation_plan(self):
         container = FakeContainer()
         container.files["/workspace/campaign/attack-graphs/ag-001.json"] = json.dumps({
             "id": "ag-001",
@@ -8523,6 +11114,8 @@ abstract contract MintBurnAdapter is Base {
                 "contract": "Vault",
                 "function": "redeem",
                 "target_address": "0x1111111111111111111111111111111111111111",
+                "network": "eth-mainnet",
+                "chain_id": 1,
                 "exposure": "exposed",
                 "live_status": "deployed",
                 "objective": "redeem must not release more assets than shares justify",
@@ -8538,30 +11131,78 @@ abstract contract MintBurnAdapter is Base {
             }],
         })
 
-        result = json.loads(await _prepare_fork_exploit_workbench(container, {
+        result = json.loads(await _compose_sequence_experiment(container, {
             "attack_graph": "ag-001",
             "candidate_id": "agcand-001",
-            "record_result": False,
         }))
 
-        self.assertEqual(result["workbench_id"], "fw-001")
-        self.assertEqual(result["mechanism"], "vault")
-        self.assertEqual(result["target"]["address"], "0x1111111111111111111111111111111111111111")
-        self.assertIn("attacker asset profit", json.dumps(result["objective_templates"]))
+        self.assertEqual(result["experiment_id"], "exp-001")
+        validation = result["mechanism_validation"]
+        self.assertEqual(validation["mechanism"], "vault")
         self.assertEqual(
-            result["compose_sequence_experiment_args"]["candidate_id"],
-            "agcand-001",
+            validation["target"]["address"],
+            "0x1111111111111111111111111111111111111111",
         )
-        workbench = json.loads(
-            container.files["/workspace/campaign/fork-workbenches/fw-001/workbench.json"]
+        self.assertIn(
+            "attacker asset profit",
+            json.dumps(validation["objective_templates"]),
         )
-        self.assertEqual(workbench["mechanism"], "vault")
-        self.assertIn("asset()(address)", json.dumps(workbench))
+        workspace = "/workspace/experiments/exp-001-test-live-reachable-vault-redeem"
+        sequence_path = f"{workspace}/sequence.json"
+        sequence = json.loads(container.files[sequence_path])
+        embedded = sequence["mechanism_validation_plan"]
+        self.assertEqual(embedded["mechanism"], "vault")
+        self.assertIn("asset()(address)", json.dumps(embedded))
+        self.assertIn(
+            "## Mechanism Validation Plan",
+            container.files[f"{workspace}/README.md"],
+        )
+        self.assertFalse(any(
+            path.startswith("/workspace/campaign/fork-workbenches/")
+            for path in container.files
+        ))
         state = json.loads(container.files[_CAMPAIGN_STATE_PATH])
-        self.assertEqual(state["sections"]["experiment"][0]["id"], "fw-001")
-        self.assertIn("Template: fork_workbench", state["sections"]["experiment"][0]["content"])
+        self.assertEqual(
+            [entry["id"] for entry in state["sections"]["experiment"]],
+            ["exp-001"],
+        )
+        self.assertNotIn(
+            "Template: fork_workbench",
+            state["sections"]["experiment"][0]["content"],
+        )
 
-    async def test_prepare_fork_exploit_workbench_infers_lending_adapter(self):
+        before_completion = sequence["mechanism_validation_plan"]
+        await _complete_sequence_experiment(container, {
+            "sequence": "exp-001",
+            "record_result": False,
+        })
+        completed = json.loads(container.files[sequence_path])
+        self.assertEqual(
+            completed["mechanism_validation_plan"],
+            before_completion,
+        )
+
+    def test_progress_unrun_experiments_ignores_legacy_workbench(self):
+        state = {
+            "sections": {
+                "experiment": [{
+                    "id": "exp-legacy",
+                    "title": "Legacy fork workbench",
+                    "content": (
+                        "Template: fork_workbench\n"
+                        "Workbench: /workspace/campaign/fork-workbenches/fw-001"
+                    ),
+                    "status": "open",
+                    "evidence": [
+                        "/workspace/campaign/fork-workbenches/fw-001/workbench.json"
+                    ],
+                }],
+            },
+        }
+
+        self.assertEqual(_progress_unrun_experiments(state), [])
+
+    async def test_compose_sequence_embeds_lending_validation_plan(self):
         container = FakeContainer()
         container.files["/workspace/campaign/attack-graphs/ag-001.json"] = json.dumps({
             "id": "ag-001",
@@ -8575,6 +11216,8 @@ abstract contract MintBurnAdapter is Base {
                 "contract": "CEther",
                 "function": "liquidateBorrow",
                 "target_address": "0x37DE57183491Fa9745d8Fa5DCd950f0c3a4645c9",
+                "network": "eth-mainnet",
+                "chain_id": 1,
                 "exposure": "exposed",
                 "live_status": "deployed",
                 "objective": "liquidation must not seize more collateral than formula permits",
@@ -8590,26 +11233,27 @@ abstract contract MintBurnAdapter is Base {
             }],
         })
 
-        result = json.loads(await _prepare_fork_exploit_workbench(container, {
+        result = json.loads(await _compose_sequence_experiment(container, {
             "attack_graph": "ag-001",
             "candidate_id": "agcand-001",
-            "record_result": False,
         }))
 
-        self.assertEqual(result["mechanism"], "lending")
-        workbench = json.loads(
-            container.files["/workspace/campaign/fork-workbenches/fw-001/workbench.json"]
+        self.assertEqual(result["mechanism_validation"]["mechanism"], "lending")
+        sequence = json.loads(
+            container.files[
+                "/workspace/experiments/"
+                "exp-001-test-live-reachable-cether-liquidateborrow/sequence.json"
+            ]
         )
-        self.assertIn("borrowBalanceStored", json.dumps(workbench))
-        self.assertIn("expected seize tokens", json.dumps(workbench))
+        validation = sequence["mechanism_validation_plan"]
+        self.assertIn("borrowBalanceStored", json.dumps(validation))
+        self.assertIn("expected seize tokens", json.dumps(validation))
 
-    async def test_lending_workbench_carries_liquidation_playbook(self):
+    async def test_lending_sequence_plan_carries_liquidation_playbook(self):
         # The permanent prompt no longer spells out the liquidation checklist
         # (close factor, repay asset, seize tokens, ...). That mechanism-specific
         # playbook must still surface where the mechanism is actually known —
-        # the prepare_fork_exploit_workbench output and the README the agent
-        # reads — which is the branch/tool surface the compressed prompt
-        # delegates to.
+        # the sequence's embedded mechanism plan and README the agent reads.
         container = FakeContainer()
         container.files["/workspace/campaign/attack-graphs/ag-001.json"] = json.dumps({
             "id": "ag-001",
@@ -8623,6 +11267,8 @@ abstract contract MintBurnAdapter is Base {
                 "contract": "CEther",
                 "function": "liquidateBorrow",
                 "target_address": "0x37DE57183491Fa9745d8Fa5DCd950f0c3a4645c9",
+                "network": "eth-mainnet",
+                "chain_id": 1,
                 "exposure": "exposed",
                 "live_status": "deployed",
                 "objective": "liquidation must not seize more collateral than formula permits",
@@ -8638,27 +11284,30 @@ abstract contract MintBurnAdapter is Base {
             }],
         })
 
-        result = json.loads(await _prepare_fork_exploit_workbench(container, {
+        result = json.loads(await _compose_sequence_experiment(container, {
             "attack_graph": "ag-001",
             "candidate_id": "agcand-001",
-            "record_result": False,
         }))
-        self.assertEqual(result["mechanism"], "lending")
+        self.assertEqual(result["mechanism_validation"]["mechanism"], "lending")
 
-        workbench_blob = container.files[
-            "/workspace/campaign/fork-workbenches/fw-001/workbench.json"
+        workspace = (
+            "/workspace/experiments/"
+            "exp-001-test-live-reachable-cether-liquidateborrow"
+        )
+        sequence_blob = container.files[
+            f"{workspace}/sequence.json"
         ]
         readme = container.files[
-            "/workspace/campaign/fork-workbenches/fw-001/README.md"
+            f"{workspace}/README.md"
         ]
         # The detailed mechanism guidance lives in the branch surface, not the
         # permanent prompt.
-        self.assertIn("close factor", workbench_blob)
-        self.assertIn("seize tokens", workbench_blob)
+        self.assertIn("close factor", sequence_blob)
+        self.assertIn("seize tokens", sequence_blob)
         # The README the agent reads carries the same mechanism-specific setup.
         self.assertIn("close factor", readme)
 
-    async def test_prepare_fork_exploit_workbench_infers_bridge_staking_and_generic_adapters(self):
+    async def test_compose_sequence_embeds_bridge_staking_and_generic_adapters(self):
         cases = [
             (
                 "bridge_message_accounting",
@@ -8707,6 +11356,8 @@ abstract contract MintBurnAdapter is Base {
                     "contract": contract,
                     "function": action_key.split("::", 1)[1],
                     "target_address": "0x1111111111111111111111111111111111111111",
+                    "network": "eth-mainnet",
+                    "chain_id": 1,
                     "exposure": "exposed",
                     "live_status": "deployed",
                     "mechanism": mechanism,
@@ -8723,21 +11374,26 @@ abstract contract MintBurnAdapter is Base {
                 }],
             })
 
-            result = json.loads(await _prepare_fork_exploit_workbench(container, {
+            result = json.loads(await _compose_sequence_experiment(container, {
                 "attack_graph": "ag-001",
                 "candidate_id": "agcand-001",
-                "record_result": False,
             }))
 
-            self.assertEqual(result["mechanism"], expected)
-            persisted = json.loads(
-                container.files["/workspace/campaign/fork-workbenches/fw-001/workbench.json"]
+            self.assertEqual(
+                result["mechanism_validation"]["mechanism"],
+                expected,
             )
+            sequence_path = next(
+                path for path in container.files if path.endswith("/sequence.json")
+            )
+            persisted = json.loads(container.files[sequence_path])[
+                "mechanism_validation_plan"
+            ]
             self.assertIn(setup_kind, json.dumps(persisted))
             if expected == "queue_solver":
                 self.assertIn("provider_safe_event_reconstruction", json.dumps(persisted))
 
-    async def test_prepare_fork_exploit_workbench_prefers_candidate_mechanism_over_override(self):
+    async def test_compose_sequence_prefers_candidate_mechanism_over_override(self):
         container = FakeContainer()
         container.files["/workspace/campaign/attack-graphs/ag-001.json"] = json.dumps({
             "id": "ag-001",
@@ -8750,6 +11406,8 @@ abstract contract MintBurnAdapter is Base {
                 "action_key": "QueueSolver::BoringOnChainQueue",
                 "contract": "BoringOnChainQueue",
                 "target_address": "0x1111111111111111111111111111111111111111",
+                "network": "eth-mainnet",
+                "chain_id": 1,
                 "mechanism": "queue_solver_accounting",
                 "objective": "Queued requests must not settle for excess value.",
                 "actions": [{
@@ -8763,17 +11421,21 @@ abstract contract MintBurnAdapter is Base {
             }],
         })
 
-        result = json.loads(await _prepare_fork_exploit_workbench(container, {
+        result = json.loads(await _compose_sequence_experiment(container, {
             "attack_graph": "ag-001",
             "candidate_id": "agcand-001",
             "mechanism": "vault",
-            "record_result": False,
         }))
 
-        self.assertEqual(result["mechanism"], "queue_solver")
-        persisted = json.loads(
-            container.files["/workspace/campaign/fork-workbenches/fw-001/workbench.json"]
+        self.assertEqual(
+            result["mechanism_validation"]["mechanism"],
+            "queue_solver",
         )
+        persisted = json.loads(next(
+            content
+            for path, content in container.files.items()
+            if path.endswith("/sequence.json")
+        ))["mechanism_validation_plan"]
         self.assertIn("queue nonce", json.dumps(persisted))
 
     def test_infer_fork_workbench_mechanism_unknown_candidate_is_generic(self):
@@ -8917,7 +11579,7 @@ abstract contract MintBurnAdapter is Base {
         roles = {item["role"] for item in adapter["objective_templates"]}
         self.assertIn("state_transition", roles)
 
-    async def test_prepare_fork_exploit_workbench_infers_generic_state_transition(self):
+    async def test_compose_sequence_infers_generic_state_transition(self):
         container = FakeContainer()
         container.files["/workspace/campaign/attack-graphs/ag-001.json"] = json.dumps({
             "id": "ag-001",
@@ -8931,6 +11593,8 @@ abstract contract MintBurnAdapter is Base {
                 "contract": "Registry",
                 "function": "finalizeEntry",
                 "target_address": "0x1111111111111111111111111111111111111111",
+                "network": "eth-mainnet",
+                "chain_id": 1,
                 "exposure": "exposed",
                 "live_status": "deployed",
                 "objective": (
@@ -8949,30 +11613,41 @@ abstract contract MintBurnAdapter is Base {
             }],
         })
 
-        result = json.loads(await _prepare_fork_exploit_workbench(container, {
+        result = json.loads(await _compose_sequence_experiment(container, {
             "attack_graph": "ag-001",
             "candidate_id": "agcand-001",
-            "record_result": False,
         }))
 
-        self.assertEqual(result["mechanism"], "generic_state_transition")
-        workbench = json.loads(
-            container.files["/workspace/campaign/fork-workbenches/fw-001/workbench.json"]
+        self.assertEqual(
+            result["mechanism_validation"]["mechanism"],
+            "generic_state_transition",
         )
-        self.assertEqual(workbench["mechanism"], "generic_state_transition")
-        dumped = json.dumps(workbench)
+        workspace = (
+            "/workspace/experiments/"
+            "exp-001-registry-finalizeentry-caller-bypass"
+        )
+        sequence = json.loads(container.files[f"{workspace}/sequence.json"])
+        self.assertEqual(
+            sequence["mechanism_validation_plan"]["mechanism"],
+            "generic_state_transition",
+        )
+        dumped = json.dumps(sequence["mechanism_validation_plan"])
         self.assertNotIn("asset()(address)", dumped)
         self.assertNotIn("totalAssets", dumped)
         self.assertNotIn("previewRedeem", dumped)
 
         readme = container.files[
-            "/workspace/campaign/fork-workbenches/fw-001/README.md"
+            f"{workspace}/README.md"
         ].lower()
-        self.assertIn("generic invariant", readme)
+        self.assertIn("mechanism: `generic_state_transition`", readme)
+        mechanism_section = readme.split(
+            "## mechanism validation plan",
+            1,
+        )[1].split("## transaction sequence", 1)[0]
         for banned in ("vault", "share", "totalassets"):
-            self.assertNotIn(banned, readme)
+            self.assertNotIn(banned, mechanism_section)
 
-    def _write_stm_workbench_files(
+    def _write_stm_sequence_files(
         self,
         container,
         *,
@@ -9015,6 +11690,8 @@ abstract contract MintBurnAdapter is Base {
             "contract": contract,
             "function": function,
             "target_address": "0x1111111111111111111111111111111111111111",
+            "network": "eth-mainnet",
+            "chain_id": 1,
             "exposure": "exposed",
             "live_status": "deployed",
             "objective": f"Falsify invariant: {invariant['statement']}",
@@ -9036,11 +11713,11 @@ abstract contract MintBurnAdapter is Base {
             "candidate_chains": [candidate],
         })
 
-    async def test_prepare_fork_exploit_workbench_accepts_state_transition_model(self):
-        # Passing the optional arg is accepted and threads model-derived guidance
-        # into the workbench. (The schema surface is pinned in test_tool_registry.)
+    async def test_compose_sequence_accepts_state_transition_model(self):
+        # Passing the optional arg threads model-derived guidance directly into
+        # the sequence plan. The schema surface is pinned in test_tool_registry.
         container = FakeContainer()
-        self._write_stm_workbench_files(
+        self._write_stm_sequence_files(
             container,
             invariant={
                 "id": "inv-001",
@@ -9057,20 +11734,23 @@ abstract contract MintBurnAdapter is Base {
             candidate_invariant={"id": "inv-001"},
         )
 
-        result = json.loads(await _prepare_fork_exploit_workbench(container, {
+        result = json.loads(await _compose_sequence_experiment(container, {
             "attack_graph": "ag-001",
             "candidate_id": "agcand-001",
             "state_transition_model": "stm-001",
-            "record_result": False,
         }))
 
-        self.assertEqual(result["mechanism"], "generic_state_transition")
-        self.assertEqual(result["model_guidance"]["invariant_id"], "inv-001")
+        validation = result["mechanism_validation"]
+        self.assertEqual(validation["mechanism"], "generic_state_transition")
+        self.assertEqual(
+            validation["model_guidance"]["invariant_id"],
+            "inv-001",
+        )
 
-    async def test_prepare_fork_exploit_workbench_consumes_matched_invariant(self):
+    async def test_compose_sequence_consumes_matched_invariant(self):
         container = FakeContainer()
         statement = "Only the entry creator may finalize an entry."
-        self._write_stm_workbench_files(
+        self._write_stm_sequence_files(
             container,
             invariant={
                 "id": "inv-001",
@@ -9093,58 +11773,57 @@ abstract contract MintBurnAdapter is Base {
             },
         )
 
-        result = json.loads(await _prepare_fork_exploit_workbench(container, {
+        result = json.loads(await _compose_sequence_experiment(container, {
             "attack_graph": "ag-001",
             "candidate_id": "agcand-001",
             "state_transition_model": "stm-001",
-            "record_result": False,
         }))
 
-        guidance = result["model_guidance"]
+        validation = result["mechanism_validation"]
+        guidance = validation["model_guidance"]
         self.assertEqual(guidance["invariant_id"], "inv-001")
         self.assertEqual(guidance["kind"], "authorization_binding")
         self.assertEqual(guidance["statement"], statement)
         # The invariant statement drives the lead objective and the success
         # condition the agent will assert against.
-        self.assertIn(statement, json.dumps(result["objective_templates"]))
+        self.assertIn(statement, json.dumps(validation["objective_templates"]))
         self.assertEqual(
-            result["objective_templates"][0]["role"], "invariant_falsification"
+            validation["objective_templates"][0]["role"],
+            "invariant_falsification",
         )
-        compose = result["compose_sequence_experiment_args"]
-        self.assertEqual(compose["mechanism"], "generic_state_transition")
-        self.assertEqual(compose["invariant_id"], "inv-001")
-        self.assertIn(statement, compose["success_condition"])
+        sequence_path = next(
+            path for path in container.files if path.endswith("/sequence.json")
+        )
+        sequence = json.loads(container.files[sequence_path])
+        plan = sequence["mechanism_validation_plan"]
+        self.assertEqual(plan["mechanism"], "generic_state_transition")
+        self.assertIn("inv-001", sequence["related_ids"])
+        self.assertIn(statement, sequence["success_condition"])
+        self.assertIn(statement, sequence["objective"])
         self.assertTrue(any(
             isinstance(obs, dict)
             and obs.get("source") == "state_transition_model_invariant"
-            for obs in compose["observations"]
+            for obs in sequence["observations"]
         ))
-        # A model experiment prompt's setup became a workbench setup task.
-        workbench = json.loads(
-            container.files[
-                "/workspace/campaign/fork-workbenches/fw-001/workbench.json"
-            ]
-        )
-        self.assertEqual(workbench["model_guidance"]["invariant_id"], "inv-001")
+        # A model experiment prompt's setup became embedded sequence guidance.
+        self.assertEqual(plan["model_guidance"]["invariant_id"], "inv-001")
         self.assertIn(
             "model_experiment_setup",
-            {task["kind"] for task in workbench["setup_tasks"]},
+            {task["kind"] for task in plan["setup_tasks"]},
         )
-        readme = container.files[
-            "/workspace/campaign/fork-workbenches/fw-001/README.md"
-        ]
-        self.assertIn("## Model Guidance", readme)
-        self.assertIn("inv-001", readme)
+        readme = container.files[sequence_path.rsplit("/", 1)[0] + "/README.md"]
+        self.assertIn("## Mechanism Validation Plan", readme)
         self.assertIn(statement, readme)
-        self.assertIn(
-            "/workspace/campaign/state-transition-models/stm-001.json", readme
-        )
+        self.assertFalse(any(
+            path.startswith("/workspace/campaign/fork-workbenches/")
+            for path in container.files
+        ))
 
-    async def test_prepare_fork_exploit_workbench_loads_model_from_candidate_source(self):
+    async def test_compose_sequence_loads_model_from_candidate_source(self):
         # No explicit arg: the candidate's own source.state_transition_model is the
         # fallback locator and still produces model guidance.
         container = FakeContainer()
-        self._write_stm_workbench_files(
+        self._write_stm_sequence_files(
             container,
             invariant={
                 "id": "inv-001",
@@ -9164,23 +11843,30 @@ abstract contract MintBurnAdapter is Base {
             },
         )
 
-        result = json.loads(await _prepare_fork_exploit_workbench(container, {
+        result = json.loads(await _compose_sequence_experiment(container, {
             "attack_graph": "ag-001",
             "candidate_id": "agcand-001",
-            "record_result": False,
         }))
 
-        self.assertEqual(result["model_guidance"]["invariant_id"], "inv-001")
-        self.assertEqual(result["model_guidance"]["kind"], "state_machine")
+        guidance = result["mechanism_validation"]["model_guidance"]
+        self.assertEqual(guidance["invariant_id"], "inv-001")
+        self.assertEqual(guidance["kind"], "state_machine")
+        sequence = json.loads(next(
+            content
+            for path, content in container.files.items()
+            if path.endswith("/sequence.json")
+        ))
         self.assertEqual(
-            result["compose_sequence_experiment_args"]["invariant_id"], "inv-001"
+            sequence["mechanism_validation_plan"]["state_transition_model_path"],
+            "/workspace/campaign/state-transition-models/stm-001.json",
         )
+        self.assertIn("inv-001", sequence["related_ids"])
 
-    async def test_prepare_fork_exploit_workbench_invalid_state_transition_model_errors(
+    async def test_compose_sequence_invalid_state_transition_model_errors(
         self,
     ):
         container = FakeContainer()
-        self._write_stm_workbench_files(
+        self._write_stm_sequence_files(
             container,
             invariant={
                 "id": "inv-001",
@@ -9193,33 +11879,32 @@ abstract contract MintBurnAdapter is Base {
             candidate_invariant={"id": "inv-001"},
         )
 
-        missing = await _prepare_fork_exploit_workbench(container, {
+        missing = await _compose_sequence_experiment(container, {
             "attack_graph": "ag-001",
             "candidate_id": "agcand-001",
             "state_transition_model": "stm-999",
-            "record_result": False,
         })
         self.assertTrue(missing.startswith("Error:"))
         self.assertIn("state_transition_model", missing)
 
-        bad_path = await _prepare_fork_exploit_workbench(container, {
+        bad_path = await _compose_sequence_experiment(container, {
             "attack_graph": "ag-001",
             "candidate_id": "agcand-001",
             "state_transition_model": "/etc/passwd",
-            "record_result": False,
         })
         self.assertTrue(bad_path.startswith("Error:"))
         self.assertIn("state-transition-models", bad_path)
 
-    async def test_prepare_fork_exploit_workbench_generic_invariant_stays_generic(self):
+    async def test_compose_sequence_generic_invariant_stays_generic(self):
         # A generic invariant with no protocol lens must not regress to vault
-        # assumptions: no vault/share/totalAssets terms appear anywhere.
+        # assumptions in its mechanism plan. Generic replay guidance elsewhere
+        # may still list broad accounting examples such as shares.
         container = FakeContainer()
         statement = (
             "Only the authorized caller may consume another account's entry; the "
             "signed/role-checked subject must equal the account whose state changes."
         )
-        self._write_stm_workbench_files(
+        self._write_stm_sequence_files(
             container,
             invariant={
                 "id": "inv-001",
@@ -9245,33 +11930,45 @@ abstract contract MintBurnAdapter is Base {
             },
         )
 
-        result = await _prepare_fork_exploit_workbench(container, {
+        result = await _compose_sequence_experiment(container, {
             "attack_graph": "ag-001",
             "candidate_id": "agcand-001",
             "state_transition_model": "stm-001",
-            "record_result": False,
         })
         parsed = json.loads(result)
-        self.assertEqual(parsed["mechanism"], "generic_state_transition")
-        self.assertEqual(parsed["model_guidance"]["invariant_id"], "inv-001")
+        validation = parsed["mechanism_validation"]
+        self.assertEqual(validation["mechanism"], "generic_state_transition")
+        self.assertEqual(
+            validation["model_guidance"]["invariant_id"],
+            "inv-001",
+        )
 
-        workbench = container.files[
-            "/workspace/campaign/fork-workbenches/fw-001/workbench.json"
-        ]
-        readme = container.files[
-            "/workspace/campaign/fork-workbenches/fw-001/README.md"
-        ]
+        sequence_path = next(
+            path for path in container.files if path.endswith("/sequence.json")
+        )
+        sequence = json.loads(container.files[sequence_path])
+        readme = container.files[sequence_path.rsplit("/", 1)[0] + "/README.md"]
+        mechanism_section = readme.lower().split(
+            "## mechanism validation plan",
+            1,
+        )[1].split("## transaction sequence", 1)[0]
+        validation_text = json.dumps(validation).lower()
+        plan_text = json.dumps(sequence["mechanism_validation_plan"]).lower()
         for banned in ("vault", "share", "totalassets"):
-            self.assertNotIn(banned, result.lower())
-            self.assertNotIn(banned, workbench.lower())
-            self.assertNotIn(banned, readme.lower())
+            self.assertNotIn(banned, validation_text)
+            self.assertNotIn(banned, plan_text)
+            self.assertNotIn(banned, mechanism_section)
+        self.assertFalse(any(
+            path.startswith("/workspace/campaign/fork-workbenches/")
+            for path in container.files
+        ))
 
-    async def test_prepare_fork_exploit_workbench_vault_lens_adds_notes_only(self):
+    async def test_compose_sequence_vault_lens_adds_notes_only(self):
         # A vault_like lens in the model annotates but never replaces the generic
         # invariant objective.
         container = FakeContainer()
         statement = "Per-account credit must stay consistent with the aggregate total."
-        self._write_stm_workbench_files(
+        self._write_stm_sequence_files(
             container,
             invariant={
                 "id": "inv-001",
@@ -9292,22 +11989,22 @@ abstract contract MintBurnAdapter is Base {
             },
         )
 
-        result = json.loads(await _prepare_fork_exploit_workbench(container, {
+        result = json.loads(await _compose_sequence_experiment(container, {
             "attack_graph": "ag-001",
             "candidate_id": "agcand-001",
             "state_transition_model": "stm-001",
-            "record_result": False,
         }))
 
         # The generic invariant objective remains present and leads the list.
-        self.assertEqual(result["mechanism"], "generic_state_transition")
+        validation = result["mechanism_validation"]
+        self.assertEqual(validation["mechanism"], "generic_state_transition")
         self.assertEqual(
-            result["objective_templates"][0]["label"],
+            validation["objective_templates"][0]["label"],
             f"Falsify invariant: {statement}",
         )
-        self.assertIn(statement, json.dumps(result["objective_templates"]))
+        self.assertIn(statement, json.dumps(validation["objective_templates"]))
         # The lens is recorded only as an annotation note.
-        lens_notes = result["model_guidance"]["lens_notes"]
+        lens_notes = validation["model_guidance"]["lens_notes"]
         self.assertTrue(any("vault_like" in note for note in lens_notes))
 
     async def test_attack_search_routes_attack_graph_candidate_to_sequence_materialization(self):
@@ -9349,9 +12046,33 @@ abstract contract MintBurnAdapter is Base {
                 "contract": "Vault",
                 "function": "withdraw",
                 "target_address": "0x1111111111111111111111111111111111111111",
+                "network": "mainnet",
+                "chain_id": 1,
                 "exposure": "exposed",
                 "live_status": "deployed",
                 "objective": "Vault::withdraw must not release unauthorized value.",
+                "hypothesis_card": {
+                    "attacker_control": (
+                        "An unprivileged caller controls the live Vault::withdraw call."
+                    ),
+                    "state_path": [
+                        "attacker invokes Vault::withdraw(amount) against the bound vault"
+                    ],
+                    "invariant_at_risk": (
+                        "Only authorized claim value may leave the vault."
+                    ),
+                    "impact_sink": "unauthorized value leaves the vault",
+                    "material_preconditions": [
+                        "The recorded vault target remains deployed and attacker-callable."
+                    ],
+                    "falsifier": (
+                        "Reject if the same setup produces no unauthorized balance or "
+                        "accounting delta."
+                    ),
+                    "objective": (
+                        "Vault::withdraw must not release unauthorized value."
+                    ),
+                },
                 "actions": [{
                     "actor": "attacker",
                     "contract": "Vault",
@@ -9406,38 +12127,46 @@ abstract contract MintBurnAdapter is Base {
         }))
         self.assertEqual(
             inventory_planned["next_action"]["tool"],
-            "prepare_fork_exploit_workbench",
+            "compose_sequence_experiment",
         )
         branch = next(
             item for item in inventory_planned["active_branches"]
             if item["source"] == "attack_graph_candidate"
         )
-        self.assertEqual(branch["next_tool"], "prepare_fork_exploit_workbench")
-        workbench_args = branch["required_args"]["prepare_fork_exploit_workbench"]
-        self.assertEqual(workbench_args["attack_graph"], "/workspace/campaign/attack-graphs/ag-001.json")
-        self.assertEqual(workbench_args["candidate_id"], "agcand-001")
-
-        await _prepare_fork_exploit_workbench(container, {
-            **workbench_args,
-            "record_result": False,
-        })
-        planned = json.loads(await _attack_search(container, {
-            "action": "sync",
-            "record_result": False,
-        }))
-        self.assertEqual(planned["next_action"]["tool"], "compose_sequence_experiment")
-        planned_branch = next(
-            item for item in planned["active_branches"]
-            if item["source"] == "attack_graph_candidate"
+        self.assertEqual(branch["next_tool"], "compose_sequence_experiment")
+        self.assertTrue(branch["readiness"]["ready"])
+        self.assertEqual(branch["readiness"]["source"], "explicit")
+        self.assertNotIn(
+            "prepare_fork_exploit_workbench",
+            branch["required_args"],
         )
-        required_args = planned_branch["required_args"]["compose_sequence_experiment"]
+        required_args = branch["required_args"]["compose_sequence_experiment"]
         self.assertEqual(required_args["attack_graph"], "/workspace/campaign/attack-graphs/ag-001.json")
         self.assertEqual(required_args["candidate_id"], "agcand-001")
         self.assertEqual(required_args["target_addresses"]["Vault"], "0x1111111111111111111111111111111111111111")
-        self.assertIn("success_condition", required_args)
-        self.assertIn("setup", required_args)
+        self.assertEqual(required_args["mechanism"], "auto")
+        self.assertNotIn("success_condition", required_args)
+        self.assertNotIn("setup", required_args)
 
-        await _compose_sequence_experiment(container, required_args)
+        composed_raw = await _compose_sequence_experiment(container, required_args)
+        self.assertFalse(composed_raw.startswith("Error:"), composed_raw)
+        composed = json.loads(composed_raw)
+        self.assertEqual(
+            composed["mechanism_validation"]["mechanism"],
+            "vault",
+        )
+        sequence_path = next(
+            path for path in container.files if path.endswith("/sequence.json")
+        )
+        sequence = json.loads(container.files[sequence_path])
+        self.assertEqual(
+            sequence["mechanism_validation_plan"]["mechanism"],
+            "vault",
+        )
+        self.assertFalse(any(
+            path.startswith("/workspace/campaign/fork-workbenches/")
+            for path in container.files
+        ))
         refreshed = json.loads(await _attack_search(container, {
             "action": "sync",
             "record_result": False,
@@ -9470,6 +12199,213 @@ abstract contract MintBurnAdapter is Base {
                 for path in refreshed_branch.get("evidence", [])
             )
         )
+
+    async def test_attack_search_blocks_partial_graph_hypothesis_cards(self):
+        base_card = {
+            "attacker_control": (
+                "An unprivileged caller controls the live Vault::withdraw call."
+            ),
+            "state_path": [
+                "attacker invokes Vault::withdraw(amount) against the bound vault"
+            ],
+            "invariant_at_risk": "Only authorized claim value may leave the vault.",
+            "impact_sink": "unauthorized value leaves the vault",
+            "material_preconditions": [
+                "The recorded vault target remains deployed and attacker-callable."
+            ],
+            "falsifier": (
+                "Reject if the same setup produces no unauthorized balance delta."
+            ),
+            "objective": "Vault::withdraw must not release unauthorized value.",
+        }
+        target = "0x1111111111111111111111111111111111111111"
+        for missing_field in ("falsifier", "material_preconditions"):
+            with self.subTest(missing_field=missing_field):
+                container = FakeContainer()
+                for section, title in (
+                    ("protocol_model", "Protocol model"),
+                    ("value_flow", "Value flow"),
+                    ("invariant", "Invariant"),
+                ):
+                    await _update_campaign(container, {
+                        "section": section,
+                        "title": title,
+                        "content": f"{title} with concrete source references.",
+                    })
+                action_path = "/workspace/campaign/action-spaces/as-001.json"
+                live_path = "/workspace/campaign/live-reachability/lr-001.json"
+                graph_path = "/workspace/campaign/attack-graphs/ag-001.json"
+                container.files[action_path] = json.dumps({
+                    "id": "as-001",
+                    "actions": [],
+                    "observations": [],
+                })
+                container.files[live_path] = json.dumps({
+                    "id": "lr-001",
+                    "profiles": [],
+                })
+                card = dict(base_card)
+                card.pop(missing_field)
+                container.files[graph_path] = json.dumps({
+                    "id": "ag-001",
+                    "candidate_chains": [{
+                        "candidate_id": "agcand-001",
+                        "attack_key": "vault-withdraw",
+                        "title": "Test live-reachable Vault::withdraw",
+                        "priority": "critical",
+                        "priority_score": 24,
+                        "action_key": "Vault::withdraw",
+                        "contract": "Vault",
+                        "function": "withdraw",
+                        "target_address": target,
+                        "exposure": "exposed",
+                        "live_status": "deployed",
+                        "objective": base_card["objective"],
+                        "hypothesis_card": card,
+                        "actions": [{
+                            "actor": "attacker",
+                            "contract": "Vault",
+                            "function": "withdraw",
+                            "target": target,
+                            "args": ["amount"],
+                            "expected_effect": "unauthorized value leaves the vault",
+                        }],
+                        "source": {
+                            "action_space": action_path,
+                            "live_reachability": live_path,
+                        },
+                    }],
+                })
+                await _update_campaign(container, {
+                    "section": "result",
+                    "title": "Reachability artifacts",
+                    "content": "Current action, reachability, and attack graphs.",
+                    "evidence": [action_path, live_path, graph_path],
+                })
+
+                initial = json.loads(await _attack_search(container, {
+                    "action": "sync",
+                    "record_result": False,
+                }))
+                branch = next(
+                    item for item in initial["active_branches"]
+                    if item["source"] == "attack_graph_candidate"
+                )
+                await _inventory_live_targets(container, {
+                    **branch["required_args"]["inventory_live_targets"],
+                    "execute_probes": False,
+                })
+                refreshed = json.loads(await _attack_search(container, {
+                    "action": "sync",
+                    "record_result": False,
+                }))
+                branch = next(
+                    item for item in refreshed["active_branches"]
+                    if item["source"] == "attack_graph_candidate"
+                )
+
+                self.assertEqual(branch["status"], "needs_context")
+                self.assertEqual(branch["next_tool"], "source_slice or update_campaign")
+                self.assertFalse(branch["readiness"]["ready"])
+                self.assertIn(
+                    f"hypothesis_card.{missing_field}",
+                    branch["readiness"]["missing"],
+                )
+                self.assertNotIn(
+                    "compose_sequence_experiment",
+                    branch["required_args"],
+                )
+
+                no_evidence_advance = await _attack_search(container, {
+                    "action": "advance",
+                    "branch_id": branch["id"],
+                    "status": "needs_harness",
+                    "hypothesis_card": base_card,
+                    "record_result": False,
+                })
+                self.assertIn(
+                    "evidence is required",
+                    no_evidence_advance,
+                )
+
+                whitespace_evidence_advance = await _attack_search(container, {
+                    "action": "advance",
+                    "branch_id": branch["id"],
+                    "status": "needs_harness",
+                    "hypothesis_card": base_card,
+                    "evidence": ["   \t  "],
+                    "record_result": False,
+                })
+                self.assertIn(
+                    "evidence is required",
+                    whitespace_evidence_advance,
+                )
+
+                incomplete_advance = await _attack_search(container, {
+                    "action": "advance",
+                    "branch_id": branch["id"],
+                    "status": "needs_harness",
+                    "hypothesis_card": card,
+                    "evidence": ["/audit/src/Vault.sol:42"],
+                    "record_result": False,
+                })
+                self.assertTrue(incomplete_advance.startswith("Error:"))
+                self.assertIn(
+                    f"hypothesis_card.{missing_field}",
+                    incomplete_advance,
+                )
+
+                advanced = json.loads(await _attack_search(container, {
+                    "action": "advance",
+                    "branch_id": branch["id"],
+                    "status": "needs_harness",
+                    "hypothesis_card": base_card,
+                    "evidence": ["/audit/src/Vault.sol:42"],
+                    "notes": "Focused source review completed the graph admission card.",
+                    "record_result": False,
+                }))
+                recovered = next(
+                    item for item in advanced["active_branches"]
+                    if item["id"] == branch["id"]
+                )
+                self.assertEqual(recovered["status"], "needs_harness")
+                self.assertEqual(
+                    recovered["next_tool"],
+                    "compose_sequence_experiment",
+                )
+                self.assertTrue(recovered["readiness"]["ready"])
+                self.assertEqual(
+                    recovered["readiness"]["source"],
+                    "attack_search_advance",
+                )
+                self.assertEqual(recovered["hypothesis_card"], base_card)
+                self.assertIn(
+                    "compose_sequence_experiment",
+                    recovered["required_args"],
+                )
+
+                dossier_path = advanced["next_action"]["dossier_path"]
+                dossier = json.loads(container.files[dossier_path])
+                self.assertEqual(dossier["hypothesis_card"], base_card)
+                self.assertIn(
+                    "compose_sequence_experiment",
+                    dossier["required_args"],
+                )
+
+                resynced = json.loads(await _attack_search(container, {
+                    "action": "sync",
+                    "record_result": False,
+                }))
+                persisted = next(
+                    item for item in resynced["active_branches"]
+                    if item["id"] == branch["id"]
+                )
+                self.assertEqual(persisted["status"], "needs_harness")
+                self.assertEqual(persisted["hypothesis_card"], base_card)
+                self.assertIn(
+                    "compose_sequence_experiment",
+                    persisted["required_args"],
+                )
 
     async def test_attack_search_reranks_attack_graph_candidates_with_inventory(self):
         container = FakeContainer()
@@ -9760,7 +12696,7 @@ abstract contract MintBurnAdapter is Base {
         self.assertEqual(alias_branch["target_actions"][0]["target"], live_pool)
         self.assertEqual(result["next_action"]["branch_id"], alias_branch["id"])
 
-    async def test_attack_search_keeps_workbenches_candidate_specific(self):
+    async def test_attack_search_keeps_sequence_plans_candidate_specific(self):
         container = FakeContainer()
         for section, title in (
             ("protocol_model", "Protocol model"),
@@ -9800,8 +12736,32 @@ abstract contract MintBurnAdapter is Base {
                 "action_key": "QueueSolver::BoringOnChainQueue",
                 "contract": "BoringOnChainQueue",
                 "target_address": address,
+                "network": "eth-mainnet",
+                "chain_id": 1,
                 "mechanism": "queue_solver_accounting",
                 "objective": "Queued requests must not settle for excess value.",
+                "hypothesis_card": {
+                    "attacker_control": (
+                        "An unprivileged requester controls the queued-withdraw request."
+                    ),
+                    "state_path": [
+                        "requester creates a queued withdrawal claim",
+                        "authorized solver settles that same claim",
+                    ],
+                    "invariant_at_risk": (
+                        "Queue settlement must not exceed the requester's recorded claim."
+                    ),
+                    "impact_sink": "Settlement transfers excess value to the requester.",
+                    "material_preconditions": [
+                        f"The deployed queue remains bound to {address}.",
+                        "An authorized solver processes the attacker's queued claim.",
+                    ],
+                    "falsifier": (
+                        "Settlement value never exceeds the recorded claim under the "
+                        "same request and solver path."
+                    ),
+                    "objective": "Measure requested value against settled value.",
+                },
                 "actions": [
                     {
                         "actor": "attacker",
@@ -9853,10 +12813,9 @@ abstract contract MintBurnAdapter is Base {
                 "/workspace/campaign/live-inventory/linv-001.json",
             ],
         })
-        await _prepare_fork_exploit_workbench(container, {
+        await _compose_sequence_experiment(container, {
             "attack_graph": "ag-001",
             "candidate_id": "agcand-001",
-            "record_result": False,
         })
 
         planned = json.loads(await _attack_search(container, {
@@ -9868,17 +12827,20 @@ abstract contract MintBurnAdapter is Base {
             item for item in planned["active_branches"]
             if item.get("attack_keys") == [f"economic:queue_solver:{second.lower()}"]
         )
-        self.assertEqual(second_branch["next_tool"], "prepare_fork_exploit_workbench")
+        self.assertEqual(second_branch["next_tool"], "compose_sequence_experiment")
+        self.assertNotIn(
+            "prepare_fork_exploit_workbench",
+            second_branch["required_args"],
+        )
+        compose_args = second_branch["required_args"]["compose_sequence_experiment"]
         self.assertEqual(
-            second_branch["required_args"]["prepare_fork_exploit_workbench"]["candidate_id"],
+            compose_args["candidate_id"],
             "agcand-002",
         )
         self.assertEqual(
-            second_branch["required_args"]["prepare_fork_exploit_workbench"]["mechanism"],
+            compose_args["mechanism"],
             "queue_solver",
         )
-        compose_args = second_branch["required_args"]["compose_sequence_experiment"]
-        self.assertEqual(compose_args["candidate_id"], "agcand-002")
         self.assertEqual(compose_args["target_addresses"]["BoringOnChainQueue"], second)
         self.assertNotIn("setup", compose_args)
 
@@ -9922,6 +12884,10 @@ abstract contract MintBurnAdapter is Base {
                     "action_key": "QueueSolver::BoringOnChainQueue",
                     "contract": "BoringOnChainQueue",
                     "target_address": target,
+                    "target_binding": {
+                        "binding_kind": "no_code",
+                        "address": target,
+                    },
                     "mechanism": "queue_solver_accounting",
                     "objective": "Queued requests must not settle for excess value.",
                     "actions": [
@@ -10035,6 +13001,7 @@ abstract contract MintBurnAdapter is Base {
             "action": "decision",
             "branch_id": parent["id"],
             "decision_status": "rejected",
+            "decision_scope": "target",
             "decision": "The target binding points at a dormant implementation, not the live economic target.",
             "failed_assumption": "The selected address is the live target.",
             "impact_assessment": "No unprivileged value release.",
@@ -10051,6 +13018,71 @@ abstract contract MintBurnAdapter is Base {
         )
         self.assertEqual(sibling["status"], "superseded")
         self.assertEqual(sibling["decision_id"], decided["decision_id"])
+
+    def test_target_scope_invalidates_only_the_blocked_address(self):
+        from reentbotpro.tools import (
+            _attack_search_supersede_subsumed_siblings,
+            _attack_search_target_level_invalidity,
+        )
+
+        dead = "0x1111111111111111111111111111111111111111"
+        live = "0x2222222222222222222222222222222222222222"
+        decided = {
+            "id": "branch-parent",
+            "source": "attack_graph_candidate",
+            "status": "rejected",
+            "target_actions": [
+                {"target": dead, "action_key": "Vault::withdraw"},
+                {"target": live, "action_key": "Vault::redeem"},
+            ],
+            "inventory_context": {
+                "hard_blockers": [{
+                    "address": dead,
+                    "target_binding": "no_code",
+                }],
+            },
+        }
+        dead_sibling = {
+            "id": "branch-dead",
+            "source": "attack_graph_candidate",
+            "status": "needs_harness",
+            "target_actions": [
+                {"target": dead, "action_key": "Vault::deposit"},
+            ],
+        }
+        live_sibling = {
+            "id": "branch-live",
+            "source": "attack_graph_candidate",
+            "status": "needs_harness",
+            "target_actions": [
+                {"target": live, "action_key": "Vault::deposit"},
+            ],
+        }
+        search = {"branches": [decided, dead_sibling, live_sibling]}
+
+        invalidated = _attack_search_target_level_invalidity(
+            decided,
+            decision_scope="target",
+        )
+        self.assertEqual(invalidated, {dead.lower()})
+        _attack_search_supersede_subsumed_siblings(
+            search,
+            decided,
+            action_keys=set(),
+            coverage_keys=set(),
+            action_family_keys=set(),
+            clone_family_keys=set(),
+            target_level_invalidity=invalidated,
+            mechanism_level_decision=False,
+            coverage_family_decision=False,
+            decision_id="decision-001",
+            evidence=[],
+            related_ids=[],
+            now="2026-07-14T00:00:00Z",
+        )
+
+        self.assertEqual(dead_sibling["status"], "superseded")
+        self.assertEqual(live_sibling["status"], "needs_harness")
 
     async def test_attack_search_supersedes_same_clone_family_after_mechanism_decision(self):
         container = FakeContainer()
@@ -10154,6 +13186,7 @@ abstract contract MintBurnAdapter is Base {
             "action": "decision",
             "branch_id": first_branch["id"],
             "decision_status": "rejected",
+            "decision_scope": "clone_family",
             "decision": "The same authorization gate prevents unprivileged reward claims across this clone family.",
             "failed_assumption": "Attacker can bypass the same gate.",
             "impact_assessment": "No attacker profit.",
@@ -10286,6 +13319,7 @@ abstract contract MintBurnAdapter is Base {
             "action": "decision",
             "branch_id": claim_branch["id"],
             "decision_status": "rejected",
+            "decision_scope": "action_family",
             "decision": (
                 "Source and live probes bind direct reward claims to msg.sender; "
                 "there is no unauthorized release and no attacker profit."
@@ -10335,6 +13369,19 @@ abstract contract MintBurnAdapter is Base {
                 "parameters": [{"raw": "uint256 amount", "name": "amount"}],
             }],
             "observations": [],
+        })
+        container.files[
+            "/workspace/campaign/live-reachability/lr-001.json"
+        ] = json.dumps({
+            "id": "lr-001",
+            "profiles": [{
+                "profile": "base-vault",
+                "contract": "Vault",
+                "address": "0x1111111111111111111111111111111111111111",
+                "network": "base-mainnet",
+                "chain_id": 8453,
+                "action_exposures": [],
+            }],
         })
         container.files["/workspace/campaign/attack-graphs/ag-001.json"] = json.dumps({
             "id": "ag-001",
@@ -10388,6 +13435,8 @@ abstract contract MintBurnAdapter is Base {
         sequence = json.loads(container.files[f"{workspace}/sequence.json"])
         self.assertEqual(sequence["attack_graph_candidate"]["attack_key"], "vault-withdraw")
         self.assertEqual(sequence["fork"]["fork_block"], 19000000)
+        self.assertEqual(sequence["fork"]["network"], "base-mainnet")
+        self.assertEqual(sequence["fork"]["chain_id"], 8453)
         self.assertIn("attack_graph_candidate", sequence["scaffold"]["planning_context"])
         self.assertEqual(len(sequence["steps"]), 1)
         self.assertTrue(sequence["steps"][0]["executable"])
@@ -10415,6 +13464,206 @@ abstract contract MintBurnAdapter is Base {
         self.assertIn("function _assertPreconditions() internal", contract)
         self.assertIn("assertGt(vaultAddress.code.length, 0", contract)
         self.assertIn("_assertPreconditions();", contract)
+
+    async def test_compose_attack_graph_candidate_rejects_ambiguous_live_chain(self):
+        container = FakeContainer()
+        address = "0x1111111111111111111111111111111111111111"
+        container.files["/workspace/campaign/action-spaces/as-001.json"] = json.dumps({
+            "id": "as-001",
+            "actions": [],
+            "observations": [],
+        })
+        container.files[
+            "/workspace/campaign/live-reachability/lr-001.json"
+        ] = json.dumps({
+            "id": "lr-001",
+            "profiles": [
+                {
+                    "profile": f"vault-{chain_id}",
+                    "contract": "Vault",
+                    "address": address,
+                    "network": network,
+                    "chain_id": chain_id,
+                    "action_exposures": [],
+                }
+                for network, chain_id in (
+                    ("eth-mainnet", 1),
+                    ("base-mainnet", 8453),
+                )
+            ],
+        })
+        container.files["/workspace/campaign/attack-graphs/ag-001.json"] = json.dumps({
+            "id": "ag-001",
+            "candidate_chains": [{
+                "candidate_id": "agcand-001",
+                "title": "Ambiguous vault withdraw",
+                "objective": "Test the exact deployed vault.",
+                "contract": "Vault",
+                "function": "withdraw",
+                "target_address": address,
+                "actions": [{
+                    "actor": "attacker",
+                    "contract": "Vault",
+                    "function": "withdraw",
+                    "target": address,
+                    "args": ["amount"],
+                    "expected_effect": "attempt a bounded withdrawal",
+                }],
+                "source": {
+                    "action_space": "/workspace/campaign/action-spaces/as-001.json",
+                    "live_reachability": "/workspace/campaign/live-reachability/lr-001.json",
+                },
+            }],
+        })
+
+        result = await _compose_sequence_experiment(container, {
+            "attack_graph": "ag-001",
+            "candidate_id": "agcand-001",
+        })
+        self.assertTrue(result.startswith("Error:"))
+        self.assertIn("ambiguous live chain binding", result)
+        self.assertIn("explicit fork_context", result)
+        self.assertFalse(any(
+            path.startswith("/workspace/experiments/")
+            for path in container.files
+        ))
+
+    async def test_compose_attack_graph_candidate_rejects_conflicting_explicit_fork(self):
+        container = FakeContainer()
+        address = "0x1111111111111111111111111111111111111111"
+        container.files["/workspace/campaign/action-spaces/as-001.json"] = json.dumps({
+            "id": "as-001",
+            "actions": [{
+                "contract": "Vault",
+                "function": "withdraw",
+                "signature": "withdraw(uint256)",
+                "file": "/audit/src/Vault.sol",
+                "parameters": [{"name": "amount", "raw": "uint256 amount"}],
+            }],
+            "observations": [],
+        })
+        container.files["/workspace/campaign/attack-graphs/ag-001.json"] = json.dumps({
+            "id": "ag-001",
+            "candidate_chains": [{
+                "candidate_id": "agcand-001",
+                "title": "Base vault withdrawal",
+                "objective": "Test the selected Base deployment.",
+                "contract": "Vault",
+                "function": "withdraw",
+                "target_address": address,
+                "network": "base-mainnet",
+                "chain_id": 8453,
+                "actions": [{
+                    "actor": "attacker",
+                    "contract": "Vault",
+                    "function": "withdraw",
+                    "target": address,
+                    "network": "base-mainnet",
+                    "chain_id": 8453,
+                    "args": ["amount"],
+                    "parameters": [{"name": "amount", "raw": "uint256 amount"}],
+                    "expected_effect": "attempt a bounded withdrawal",
+                }],
+                "source": {
+                    "action_space": "/workspace/campaign/action-spaces/as-001.json",
+                },
+            }],
+        })
+        for context_id, network, chain_id in (
+            ("fc-001", "eth-mainnet", 1),
+            ("fc-002", "base-mainnet", 8453),
+        ):
+            container.files[
+                f"/workspace/campaign/fork-contexts/{context_id}.json"
+            ] = json.dumps({
+                "id": context_id,
+                "network": network,
+                "chain_id": chain_id,
+                "contracts": [{"label": "Vault", "address": address}],
+                "target_addresses": {"Vault": address},
+            })
+        container.files[
+            "/workspace/campaign/fork-contexts/fc-003.json"
+        ] = json.dumps({
+            "id": "fc-003",
+            "network": "base-mainnet",
+            "chain_id": 8453,
+            "contracts": [{
+                "label": "Vault",
+                "address": address,
+                "network": "eth-mainnet",
+                "chain_id": 1,
+            }],
+            "target_addresses": {"Vault": address},
+        })
+
+        rejected = await _compose_sequence_experiment(container, {
+            "attack_graph": "ag-001",
+            "candidate_id": "agcand-001",
+            "fork_context": "fc-001",
+        })
+        self.assertTrue(rejected.startswith("Error:"))
+        self.assertIn("conflicts with selected candidate/action chain", rejected)
+        self.assertFalse(any(
+            path.startswith("/workspace/experiments/")
+            for path in container.files
+        ))
+
+        ambiguous = await _compose_sequence_experiment(container, {
+            "attack_graph": "ag-001",
+            "candidate_id": "agcand-001",
+            "fork_context": "fc-003",
+        })
+        self.assertTrue(ambiguous.startswith("Error:"))
+        self.assertIn("fork_context spans multiple chains", ambiguous)
+
+        accepted = json.loads(await _compose_sequence_experiment(container, {
+            "attack_graph": "ag-001",
+            "candidate_id": "agcand-001",
+            "fork_context": "fc-002",
+        }))
+        self.assertEqual(
+            accepted["fork_context"],
+            "/workspace/campaign/fork-contexts/fc-002.json",
+        )
+        sequence = json.loads(container.files[
+            "/workspace/experiments/exp-001-base-vault-withdrawal/sequence.json"
+        ])
+        self.assertEqual(sequence["fork"]["chain_id"], 8453)
+
+    def test_attack_candidate_fork_context_requires_chain_binding(self):
+        address = "0x1111111111111111111111111111111111111111"
+        candidate = {
+            "candidate_id": "agcand-001",
+            "title": "Unbound vault",
+            "contract": "Vault",
+            "target_address": address,
+            "actions": [{
+                "actor": "attacker",
+                "contract": "Vault",
+                "function": "withdraw",
+                "target": address,
+                "expected_effect": "attempt withdrawal",
+            }],
+        }
+        with self.assertRaisesRegex(ValueError, "no chain-qualified live binding"):
+            _attack_candidate_fork_context(
+                attack_graph={"id": "ag-001"},
+                candidate=candidate,
+                fork_block=123,
+            )
+
+        conflicting = {
+            **candidate,
+            "network": "eth-mainnet",
+            "chain_id": 8453,
+        }
+        with self.assertRaisesRegex(ValueError, "conflicting network/chain_id"):
+            _attack_candidate_fork_context(
+                attack_graph={"id": "ag-001"},
+                candidate=conflicting,
+                fork_block=123,
+            )
 
     async def test_map_action_space_records_economic_callback_and_router_hints(self):
         container = FakeContainer()
@@ -10530,8 +13779,9 @@ contract FlashBorrower {
         self.assertEqual(exact_hint["calldata_roles"]["min_output"], "minOut")
         self.assertIn("sqrtPriceLimitX96", exact_hint["path_terms"])
 
-    async def test_map_protocol_graph_feeds_planner_without_taxonomy(self):
+    async def test_map_protocol_graph_feeds_controller_without_taxonomy(self):
         container = FakeContainer()
+        await _record_test_foundation(container)
         container.files["/audit/src/Vault.sol"] = """
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
@@ -10661,21 +13911,22 @@ contract Vault {
         self.assertIn('"protocol_graph": 1', state)
         self.assertIn("Protocol graph", state)
 
-        plan = await _plan_attack_campaign(container, {
-            "title": "Graph-guided plan",
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
             "focus": "withdraw",
+            "max_branches": 40,
             "record_result": False,
-        })
-        self.assertIn('"source": "protocol_graph_hotspot"', plan)
-        self.assertIn('"key": "Vault::withdraw"', plan)
-        self.assertIn(
-            '"recommended_next_tool": "update_campaign then compose_sequence_experiment with explicit actions or compose_invariant_harness with handler actions"',
-            plan,
+        }))
+        action_map = next(
+            branch for branch in search["active_branches"]
+            if branch["key"] == "map:action_space"
         )
-        self.assertIn("missing invariant artifact", plan)
-        plan_artifact = container.files["/workspace/campaign/plans/plan-001.json"]
-        self.assertIn('"protocol_graphs"', plan_artifact)
-        self.assertIn('"has_protocol_graph": true', plan_artifact)
+        self.assertEqual(action_map["source"], "missing_map")
+        self.assertEqual(action_map["next_tool"], "map_action_space")
+        self.assertFalse(any(
+            path.startswith("/workspace/campaign/plans/")
+            for path in container.files
+        ))
 
     async def test_map_protocol_graph_rejects_unapproved_path(self):
         container = FakeContainer()
@@ -10686,8 +13937,9 @@ contract Vault {
 
         self.assertIn("action source paths must be under", result)
 
-    async def test_plan_attack_campaign_reviews_explicit_uncovered_action_space(self):
+    async def test_attack_search_reviews_explicit_uncovered_action_space(self):
         container = FakeContainer()
+        await _record_test_foundation(container)
         container.files["/workspace/campaign/action-spaces/as-001.json"] = """
 {
   "id": "as-001",
@@ -10707,18 +13959,39 @@ contract Vault {
 }
 """
 
-        result = await _plan_attack_campaign(container, {
-            "title": "Explicit action-space planning",
-            "action_space": "as-001",
-            "record_result": False,
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Explicit action-space map",
+            "content": "Recorded as-001 for controller-derived coverage.",
+            "evidence": ["/workspace/campaign/action-spaces/as-001.json"],
+            "related_ids": ["as-001"],
         })
+        result = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
+            "record_result": False,
+        }))
 
-        self.assertIn('"plan_id": "plan-001"', result)
-        self.assertIn('"recommended_next_tool": "review_attack_surface_coverage"', result)
-        self.assertIn('"/workspace/campaign/action-spaces/as-001.json"', result)
-        self.assertIn("/workspace/campaign/plans/plan-001.json", container.files)
-        state = container.files[_CAMPAIGN_STATE_PATH]
-        self.assertIn('"campaign_plan": 1', state)
+        branch = next(
+            item for item in result["active_branches"]
+            if "Vault::redeem" in (item.get("action_keys") or [])
+        )
+        self.assertEqual(branch["source"], "coverage_high_attention_gap")
+        self.assertEqual(
+            branch["next_tool"],
+            "source_slice then update_campaign or attack_search decision",
+        )
+        self.assertIn(
+            "/workspace/campaign/action-spaces/as-001.json",
+            branch["source_artifacts"],
+        )
+        self.assertFalse(any(
+            path.startswith((
+                "/workspace/campaign/plans/",
+                "/workspace/campaign/coverage-reviews/",
+            ))
+            for path in container.files
+        ))
 
     async def test_compose_sequence_experiment_uses_action_space_matches(self):
         container = FakeContainer()
@@ -11692,6 +14965,7 @@ contract Vault {
 
     async def test_non_runnable_sequence_requires_concretization_before_run(self):
         container = FakeContainer()
+        await _record_test_foundation(container)
 
         await _compose_sequence_experiment(container, {
             "title": "Unbound withdraw",
@@ -11706,12 +14980,17 @@ contract Vault {
             "observations": [],
         })
 
-        progress = json.loads(await _review_campaign_progress(container, {
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
             "record_result": False,
         }))
-        entry = progress["experiments_without_results"][0]
+        entry = next(
+            branch for branch in search["active_branches"]
+            if branch["source"] == "experiment_without_result"
+        )
         self.assertEqual(entry["status"], "needs_concretization")
-        self.assertEqual(entry["sequence_quality"]["executable_sequence_calls"], 0)
+        self.assertEqual(entry["next_tool"], "complete_sequence_experiment")
 
     async def test_partial_proof_with_executable_subset_yields_needs_partial_probe(self):
         # A scaffold with an executable subset but a withheld objective assertion
@@ -11755,16 +15034,6 @@ contract Vault {
             "objective_probe_strategy": "log_only",
             "record_result": False,
         })
-
-        progress = json.loads(await _review_campaign_progress(container, {
-            "record_result": False,
-        }))
-        entry = progress["experiments_without_results"][0]
-        self.assertEqual(entry["status"], "needs_partial_probe")
-        self.assertGreater(
-            entry["sequence_quality"]["executable_sequence_calls"], 0
-        )
-        self.assertIn("partial probe", entry["suggested_action"])
 
         result = json.loads(await _attack_search(container, {
             "action": "sync",
@@ -12081,19 +15350,21 @@ contract Vault {
             "invariant_id": "inv-002",
             "actors": ["attacker", "honestUser"],
             "actions": [
+                    {
+                        "actor": "attacker",
+                        "contract": "Vault",
+                        "function": "deposit",
+                        "args": ["amount"],
+                        "bounds": "amount between 1 and available balance",
+                        "expected_effect": "mint shares without breaking solvency",
+                    },
                 {
                     "actor": "attacker",
-                    "contract": "Vault",
-                    "function": "deposit",
-                    "args": ["amount"],
-                    "bounds": "amount between 1 and available balance",
-                },
-                {
-                    "actor": "attacker",
-                    "contract": "Vault",
-                    "function": "withdraw",
-                    "args": ["amount"],
-                },
+                        "contract": "Vault",
+                        "function": "withdraw",
+                        "args": ["amount"],
+                        "expected_effect": "burn shares and return bounded assets",
+                    },
             ],
             "observations": [{
                 "label": "vault assets",
@@ -12103,6 +15374,9 @@ contract Vault {
 
         self.assertIn('"experiment_id": "exp-001"', result)
         self.assertIn('"actors": [', result)
+        response = json.loads(result)
+        self.assertTrue(response["manual_only"])
+        self.assertTrue(response["manual_completion_required"])
         workspace = "/workspace/experiments/exp-001-vault-share-solvency-invariant"
         self.assertIn(f"{workspace}/README.md", container.files)
         self.assertIn(f"{workspace}/ReentbotProInvariant.t.sol", container.files)
@@ -12176,6 +15450,8 @@ contract Vault {
         self.assertIn('"verifies_allowances": true', plan)
         self.assertIn('"fork_context": true', plan)
         plan_json = json.loads(plan)
+        self.assertTrue(plan_json["manual_only"])
+        self.assertTrue(plan_json["manual_completion_required"])
         self.assertNotIn("runnable", plan_json["scaffold_quality"])
         self.assertEqual(plan_json["scaffold_quality"]["handler_actions"], 2)
         self.assertIn(
@@ -12190,13 +15466,18 @@ contract Vault {
         self.assertIn('"handler_actions"', plan)
         self.assertIn('"fork_context_path"', plan)
         self.assertIn("0x0000000000000000000000000000000000001234", plan)
-        state = container.files[_CAMPAIGN_STATE_PATH]
-        self.assertIn('"id": "exp-001"', state)
-        self.assertIn('"hyp-002"', state)
-        self.assertIn('"inv-002"', state)
-        self.assertIn('"as-001"', state)
-        self.assertIn('"pg-001"', state)
-        self.assertIn('"fc-001"', state)
+        state_text = container.files[_CAMPAIGN_STATE_PATH]
+        self.assertIn('"id": "exp-001"', state_text)
+        self.assertIn('"hyp-002"', state_text)
+        self.assertIn('"inv-002"', state_text)
+        self.assertIn('"as-001"', state_text)
+        self.assertIn('"pg-001"', state_text)
+        self.assertIn('"fc-001"', state_text)
+        state = json.loads(state_text)
+        experiment = state["sections"]["experiment"][0]
+        self.assertTrue(experiment["manual_only"])
+        self.assertTrue(experiment["manual_completion_required"])
+        self.assertEqual(_progress_unrun_experiments(state), [])
 
     async def test_compose_invariant_harness_rejects_empty_actions(self):
         container = FakeContainer()
@@ -12209,6 +15490,18 @@ contract Vault {
 
         self.assertIn("requires at least one concrete handler action", result)
         self.assertIn("expected_effect", result)
+
+    async def test_compose_invariant_harness_rejects_placeholder_action(self):
+        container = FakeContainer()
+
+        result = await _compose_invariant_harness(container, {
+            "title": "Placeholder handler",
+            "invariant": "Assets remain solvent.",
+            "actions": [{}],
+        })
+
+        self.assertIn("actions[0] must be concrete", result)
+        self.assertFalse(container.files)
 
     async def test_run_experiment_mirrors_target_local_poc_evidence(self):
         container = FakeContainer()
@@ -13092,6 +16385,74 @@ class CompleteSequenceExperimentTests(unittest.IsolatedAsyncioTestCase):
             any("replaced action list" in change for change in history["applied_changes"])
         )
 
+    async def test_action_replacement_reresolves_exact_overload_metadata(self):
+        container = FakeContainer()
+        action_space_path = "/workspace/campaign/action-spaces/as-001.json"
+        container.files[action_space_path] = json.dumps({
+            "id": "as-001",
+            "actions": [
+                {
+                    "contract": "Vault",
+                    "function": "poke",
+                    "signature": "poke(uint8)",
+                    "file": "/audit/src/Vault.sol",
+                    "parameters": [{"name": "amount", "raw": "uint8 amount"}],
+                },
+                {
+                    "contract": "Vault",
+                    "function": "poke",
+                    "signature": "poke(uint256)",
+                    "file": "/audit/src/Vault.sol",
+                    "parameters": [{"name": "amount", "raw": "uint256 amount"}],
+                },
+            ],
+            "observations": [],
+        })
+        workspace = await self._compose_base(
+            container,
+            action_space="as-001",
+            actions=[{
+                "actor": "attacker",
+                "contract": "Vault",
+                "function": "poke",
+                "args": ["amount"],
+                "parameters": [{"name": "amount", "raw": "uint8 amount"}],
+                "expected_effect": "exercise the narrow overload",
+            }],
+        )
+        before = json.loads(container.files[f"{workspace}/sequence.json"])
+        self.assertEqual(before["matched_actions"][0]["signature"], "poke(uint8)")
+
+        result = json.loads(await _complete_sequence_experiment(container, {
+            "sequence": "exp-001",
+            "target_addresses": {"Vault": self.TARGET},
+            "actions": [{
+                "actor": "attacker",
+                "contract": "Vault",
+                "function": "poke",
+                "args": ["amount"],
+                "parameters": [{"name": "amount", "raw": "uint256 amount"}],
+                "expected_effect": "exercise the wide overload",
+            }],
+            "objective_probe_strategy": "accounting_delta",
+        }))
+
+        after = json.loads(container.files[f"{workspace}/sequence.json"])
+        self.assertEqual(after["matched_actions"][0]["signature"], "poke(uint256)")
+        self.assertEqual(after["unmatched_actions"], [])
+        self.assertTrue(result["steps"][0]["executable"])
+        self.assertTrue(result["scaffold_quality"]["runnable"])
+        contract = container.files[f"{workspace}/ReentbotProSequence.t.sol"]
+        self.assertIn("function poke(uint256 amount) external", contract)
+        self.assertNotIn("function poke(uint8 amount) external", contract)
+        state = json.loads(container.files[_CAMPAIGN_STATE_PATH])
+        experiment = state["sections"]["experiment"][0]
+        self.assertEqual(experiment["action_keys"], ["Vault::poke(uint256)"])
+        self.assertEqual(
+            experiment["coverage_keys"],
+            ["Vault::poke(uint256)@/audit/src/Vault.sol"],
+        )
+
     async def test_unknown_sequence_returns_error(self):
         container = FakeContainer()
         result = await _complete_sequence_experiment(container, {"sequence": "exp-999"})
@@ -13690,6 +17051,68 @@ class ExtractStateTransitionModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(path, container.files)
         return json.loads(container.files[path])
 
+    async def test_matching_action_space_facts_enrich_source_unit(self):
+        container = FakeContainer()
+        source_path = "/audit/src/Target.sol"
+        container.files[source_path] = """
+            pragma solidity ^0.8.20;
+            contract Target {
+                uint256 x;
+                function run() external { x += 1; }
+                function helper() internal { x += 2; }
+            }
+        """
+        action_path = "/workspace/campaign/action-spaces/as-001.json"
+        container.files[action_path] = json.dumps({
+            "id": "as-001",
+            "actions": [{
+                "contract": "Target",
+                "contract_kind": "contract",
+                "function": "run",
+                "file": source_path,
+                "line": 4,
+                "visibility": "external",
+                "mutability": "nonpayable",
+                "parameters": [],
+                "modifiers": [],
+                "affordances": ["state_mutating_entrypoint"],
+                "hints": {
+                    "state_mutations": [{
+                        "target": "mappedTotal",
+                        "line": 4,
+                        "text": "mappedTotal += 1",
+                    }],
+                },
+                "causal_facts": {
+                    "source": "ast_scoped_text",
+                    "state_writes": [{
+                        "variable": "mappedTotal",
+                        "target": "mappedTotal",
+                        "operation": "+=",
+                        "line": 4,
+                    }],
+                },
+                "parse_source": "ast",
+            }],
+            "observations": [],
+        })
+
+        result = json.loads(await _extract_state_transition_model(container, {
+            "files": [source_path],
+            "action_space": action_path,
+            "record_result": False,
+        }))
+        artifact = self._artifact(container, result)
+
+        self.assertEqual(artifact["scope"]["source_units"], 2)
+        self.assertEqual(artifact["scope"]["action_space_units_enriched"], 1)
+        self.assertEqual(artifact["scope"]["action_space_units_merged"], 0)
+        run = next(
+            entry for entry in artifact["entrypoints"]
+            if entry["function"] == "run"
+        )
+        self.assertEqual(run["writes"][0]["target"], "mappedTotal")
+
     async def test_mapping_and_aggregate_writes_produce_conservation(self):
         container, data, _ = await self._run(
             """
@@ -13725,6 +17148,195 @@ class ExtractStateTransitionModelTests(unittest.IsolatedAsyncioTestCase):
         # Records a campaign result with the planning-context framing.
         self.assertIn("State-transition model", state)
         self.assertIn("not vulnerability evidence", state)
+
+    async def test_model_sections_record_retention_and_controller_remaps(self):
+        container = FakeContainer()
+        await _record_test_foundation(container)
+        source_path = "/audit/src/Many.sol"
+        container.files[source_path] = """
+            pragma solidity ^0.8.20;
+            contract Many {
+                uint256 a;
+                uint256 b;
+                uint256 c;
+                function alpha(address target) external {
+                    a += 1;
+                    (bool ok,) = target.call("");
+                    require(ok);
+                }
+                function beta(address target) external {
+                    b += 1;
+                    (bool ok,) = target.call("");
+                    require(ok);
+                }
+                function gamma(address target) external {
+                    c += 1;
+                    (bool ok,) = target.call("");
+                    require(ok);
+                }
+            }
+        """
+
+        response = json.loads(await _extract_state_transition_model(container, {
+            "files": [source_path],
+            "max_items": 2,
+        }))
+        artifact = self._artifact(container, response)
+
+        self.assertEqual(response["status"], "partial")
+        self.assertEqual(
+            artifact["section_retention"],
+            response["section_retention"],
+        )
+        for section in (
+            "tracked_state",
+            "entrypoints",
+            "candidate_invariants",
+        ):
+            retention = artifact["section_retention"][section]
+            self.assertEqual(retention["total"], 3)
+            self.assertEqual(retention["retained"], 2)
+            self.assertEqual(retention["omitted_by_item_limit"], 1)
+            self.assertEqual(len(retention["omitted_frontier"]), 1)
+            self.assertEqual(
+                retention["omitted_sources"],
+                [{"file": source_path, "omitted": 1}],
+            )
+        self.assertEqual(
+            artifact["section_retention"]["candidate_invariants"][
+                "omitted_by_kind"
+            ],
+            {"external_call_safety": 1},
+        )
+        self.assertEqual(artifact["source_inventory"]["files"], [source_path])
+        self.assertTrue(any("not evidence" in note for note in response["notes"]))
+        self.assertTrue(any("not evidence" in note for note in artifact["notes"]))
+
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
+        self.assertEqual(
+            search["next_action"]["source"],
+            "state_transition_model_retention_limit",
+        )
+        self.assertEqual(
+            search["next_action"]["tool"],
+            "extract_state_transition_model",
+        )
+        remap = search["next_action"]["required_args"][
+            "extract_state_transition_model"
+        ]
+        self.assertEqual(remap["files"], [source_path])
+        self.assertEqual(remap["max_items"], 4)
+        self.assertNotIn(
+            "build_attack_graph",
+            {branch["next_tool"] for branch in search["active_branches"]},
+        )
+
+    async def test_hard_model_retention_limit_blocks_clean_readiness(self):
+        container = FakeContainer()
+        await _record_test_foundation(container)
+        action_path = "/workspace/campaign/action-spaces/as-001.json"
+        container.files[action_path] = json.dumps({
+            "id": "as-001",
+            "status": "observed",
+            "scope_batch": {
+                "kind": "source_roots",
+                "series_id": "as-001",
+                "has_more": False,
+            },
+            "source": {
+                "path": "/audit",
+                "files_requested": 1,
+                "files_scanned": 1,
+                "max_items": 2000,
+            },
+            "section_retention": {},
+            "actions": [],
+            "observations": [],
+        })
+        protocol_path = "/workspace/campaign/protocol-graphs/pg-001.json"
+        container.files[protocol_path] = json.dumps({
+            "id": "pg-001",
+            "status": "observed",
+            "source": {"action_space": action_path},
+            "nodes": [],
+            "edges": [],
+        })
+        model_path = "/workspace/campaign/state-transition-models/stm-001.json"
+        container.files[model_path] = json.dumps({
+            "id": "stm-001",
+            "status": "partial",
+            "scope": {"path": "/audit", "focus": "auto"},
+            "source_inventory": {"files": ["/audit/src/Huge.sol"], "count": 1},
+            "section_retention": {
+                "tracked_state": {
+                    "total": 201,
+                    "retained": 200,
+                    "omitted_by_item_limit": 1,
+                    "max_items": 200,
+                    "omitted_sources": [
+                        {"file": "/audit/src/Huge.sol", "omitted": 1}
+                    ],
+                    "omitted_frontier": [{
+                        "file": "/audit/src/Huge.sol",
+                        "contract": "Huge",
+                        "name": "lastState",
+                    }],
+                },
+                "entrypoints": {
+                    "total": 1,
+                    "retained": 1,
+                    "omitted_by_item_limit": 0,
+                    "max_items": 200,
+                },
+                "candidate_invariants": {
+                    "total": 1,
+                    "retained": 1,
+                    "omitted_by_item_limit": 0,
+                    "max_items": 200,
+                },
+            },
+            "tracked_state": [],
+            "entrypoints": [],
+            "candidate_invariants": [],
+        })
+        for title, path in (
+            ("Action map", action_path),
+            ("Protocol graph", protocol_path),
+            ("State model", model_path),
+        ):
+            await _update_campaign(container, {
+                "section": "result",
+                "title": title,
+                "content": f"Recorded {title}.",
+                "evidence": [path],
+            })
+
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
+
+        self.assertFalse(search["campaign_ready"])
+        self.assertEqual(
+            search["next_action"]["source"],
+            "state_transition_model_retention_limit",
+        )
+        self.assertEqual(
+            search["next_action"]["status"],
+            "parked_harness_limit",
+        )
+        retained_limit = next(
+            branch for branch in search["active_branches"]
+            if branch["source"] == "state_transition_model_retention_limit"
+        )
+        self.assertTrue(retained_limit["readiness"]["blocks_campaign_ready"])
+        self.assertIn(
+            "focused omitted source subset",
+            search["next_action"]["tool"],
+        )
 
     async def test_dynamic_call_produces_external_call_safety(self):
         _, data, _ = await self._run(
@@ -13920,6 +17532,133 @@ class ExtractStateTransitionModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sender", names)
         self.assertNotIn("owner", names)
 
+    async def test_same_named_contracts_in_different_files_do_not_share_state(self):
+        container = FakeContainer()
+        container.files["/audit/src/one/Vault.sol"] = """
+            pragma solidity ^0.8.20;
+            contract Vault {
+                mapping(address => uint256) balance;
+                function credit(uint256 amount) external {
+                    balance[msg.sender] += amount;
+                }
+            }
+        """
+        container.files["/audit/src/two/Vault.sol"] = """
+            pragma solidity ^0.8.20;
+            contract Vault {
+                uint256 total;
+                function setTotal(uint256 amount) external { total = amount; }
+            }
+        """
+        result = json.loads(await _extract_state_transition_model(container, {
+            "files": [
+                "/audit/src/one/Vault.sol",
+                "/audit/src/two/Vault.sol",
+            ],
+            "record_result": False,
+        }))
+        artifact = self._artifact(container, result)
+
+        self.assertNotIn("conservation", {
+            invariant["kind"] for invariant in artifact["candidate_invariants"]
+        })
+        self.assertEqual(
+            {state["file"] for state in artifact["tracked_state"]},
+            {"/audit/src/one/Vault.sol", "/audit/src/two/Vault.sol"},
+        )
+
+    async def test_overloaded_invariants_bind_to_exact_action_definitions(self):
+        source = """pragma solidity ^0.8.20;
+contract Executor {
+    mapping(address => uint256) pending;
+    function execute(address target, bytes calldata data) external {
+        pending[msg.sender] += 1;
+        (bool ok,) = target.call(data); require(ok);
+    }
+    function execute(address target, uint256 value) external {
+        pending[msg.sender] += 1;
+        (bool ok,) = target.call{value: value}(""); require(ok);
+    }
+}
+"""
+        container, result, _ = await self._run(source, record_result=False)
+        model = self._artifact(container, result)
+        invariants = [
+            item for item in model["candidate_invariants"]
+            if item["kind"] == "external_call_safety"
+        ]
+        self.assertEqual(len(invariants), 2)
+        self.assertEqual(
+            {item["signature"] for item in invariants},
+            {"execute(address,bytes)", "execute(address,uint256)"},
+        )
+        self.assertEqual(
+            len({item["action_definition_key"] for item in invariants}), 2
+        )
+        prompt_targets = [
+            prompt["target_actions"][0]
+            for prompt in model["experiment_prompts"]
+            if "external_call_safety" in prompt["title"]
+        ]
+        self.assertTrue(all(isinstance(item, dict) for item in prompt_targets))
+        self.assertEqual(
+            {item["action_definition_key"] for item in prompt_targets},
+            {item["action_definition_key"] for item in invariants},
+        )
+
+        action_space = _parse_action_space_file(
+            "/audit/src/Target.sol", source, max_items=100
+        )
+        candidates = _state_transition_model_attack_candidates(
+            model,
+            action_space=action_space,
+            protocol_graph=None,
+            source_path="stm-test",
+            mode="source_only",
+        )
+        overload_candidates = [
+            item for item in candidates
+            if item.get("invariant", {}).get("kind") == "external_call_safety"
+        ]
+        self.assertEqual(len(overload_candidates), 2)
+        self.assertTrue(all(len(item["actions"]) == 1 for item in overload_candidates))
+        self.assertEqual(
+            {
+                item["actions"][0]["action_definition_key"]
+                for item in overload_candidates
+            },
+            {item["action_definition_key"] for item in invariants},
+        )
+
+        legacy_model = {
+            "id": "stm-legacy",
+            "candidate_invariants": [{
+                "id": "inv-legacy",
+                "kind": "external_call_safety",
+                "contract": "Executor",
+                "function": "execute",
+                "target_actions": ["Executor.execute"],
+                "statement": "Legacy action-name-only invariant.",
+            }],
+            "experiment_prompts": [],
+        }
+        ambiguous = _state_transition_model_attack_candidates(
+            legacy_model,
+            action_space=action_space,
+            protocol_graph=None,
+            source_path="stm-legacy",
+            mode="source_only",
+        )[0]
+        self.assertNotIn("actions", ambiguous)
+        unique = _state_transition_model_attack_candidates(
+            legacy_model,
+            action_space={**action_space, "actions": action_space["actions"][:1]},
+            protocol_graph=None,
+            source_path="stm-legacy",
+            mode="source_only",
+        )[0]
+        self.assertEqual(len(unique["actions"]), 1)
+
 
 class AstTransformTests(unittest.TestCase):
     def test_transform_extracts_exact_structure(self):
@@ -13964,6 +17703,21 @@ class AstTransformTests(unittest.TestCase):
         deposit = actions["deposit"]
         self.assertEqual(deposit["mutability"], "payable")
         self.assertIn("accepts_native_value", deposit["affordances"])
+        self.assertEqual(
+            deposit["causal_facts"]["state_writes"][0]["variable"],
+            "_secret",
+        )
+        self.assertIn(
+            "_secret",
+            {
+                item["variable"]
+                for item in observations["totalAssets"]["causal_facts"]["state_reads"]
+            },
+        )
+        self.assertEqual(
+            withdraw["causal_facts"]["external_calls"][0]["function"],
+            "transfer",
+        )
 
         self.assertEqual(observations["totalAssets"]["returns"], "uint256")
         self.assertEqual(
@@ -14121,6 +17875,1179 @@ class AstActionSpaceWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("withdraw", actions)
         self.assertEqual(actions["withdraw"]["parse_source"], "ast")
         self.assertEqual(actions["withdraw"]["modifiers"], ["onlyOwner"])
+
+    async def test_ast_build_info_is_reused_across_scope_pages(self):
+        container = FakeContainer()
+        build_info = "/audit/out/build-info/build.json"
+        container.exec_results = [
+            (0, "/audit\n"),
+            (0, ""),
+            (0, build_info + "\n"),
+            (0, json.dumps({"p": "src/A.sol", "ast": {"nodeType": "SourceUnit"}})),
+        ]
+        first_status = {}
+        first = await _load_ast_sources(
+            container,
+            source_files=["/audit/src/A.sol"],
+            scan_root="/audit",
+            status=first_status,
+        )
+
+        self.assertIn("/audit/src/A.sol", first)
+        self.assertEqual(first_status["build_info_path"], build_info)
+        self.assertFalse(first_status["reused_build_info"])
+        first_exec_count = len(container.exec_calls)
+
+        container.exec_results = [
+            (0, json.dumps({"p": "src/B.sol", "ast": {"nodeType": "SourceUnit"}})),
+        ]
+        second_status = {}
+        second = await _load_ast_sources(
+            container,
+            source_files=["/audit/src/B.sol"],
+            scan_root="/audit",
+            status=second_status,
+            reuse_build_info=first_status,
+        )
+
+        self.assertIn("/audit/src/B.sol", second)
+        self.assertTrue(second_status["reused_build_info"])
+        self.assertEqual(len(container.exec_calls), first_exec_count + 1)
+
+
+class CausalActionAndGraphTests(unittest.IsolatedAsyncioTestCase):
+    SOURCE = """pragma solidity ^0.8.20;
+interface IERC20 { function transfer(address,uint256) external returns (bool); }
+contract Ledger {
+    mapping(address => uint256) credit;
+    uint256 aggregate;
+    uint256 releaseable;
+    IERC20 token;
+
+    function seed(uint256 amount) external {
+        credit[msg.sender] += amount;
+        aggregate += amount;
+    }
+
+    function propagate() external {
+        releaseable = credit[msg.sender] + aggregate;
+    }
+
+    function release(uint256 amount) external {
+        require(releaseable >= amount, "insufficient");
+        token.transfer(msg.sender, amount);
+        releaseable -= amount;
+    }
+
+    function harmless(uint256 amount) external {
+        aggregate = amount;
+    }
+}
+"""
+
+    async def _map(self):
+        container = FakeContainer()
+        container.files["/audit/src/Ledger.sol"] = self.SOURCE
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            await _map_action_space(container, {
+                "files": ["/audit/src/Ledger.sol"],
+                "record_result": False,
+            })
+        artifact = json.loads(
+            container.files["/workspace/campaign/action-spaces/as-001.json"]
+        )
+        return container, artifact
+
+    async def test_action_space_records_reads_writes_calls_and_effect_order(self):
+        _container, artifact = await self._map()
+        actions = {item["function"]: item for item in artifact["actions"]}
+
+        seed = actions["seed"]["causal_facts"]
+        self.assertEqual(seed["source"], "regex_scoped_text")
+        self.assertEqual(
+            {item["variable"] for item in seed["state_writes"]},
+            {"aggregate", "credit"},
+        )
+
+        propagate = actions["propagate"]["causal_facts"]
+        self.assertEqual(
+            {item["variable"] for item in propagate["state_reads"]},
+            {"aggregate", "credit"},
+        )
+        self.assertEqual(
+            {item["variable"] for item in propagate["state_writes"]},
+            {"releaseable"},
+        )
+
+        release = actions["release"]["causal_facts"]
+        self.assertEqual(release["external_calls"][0]["function"], "transfer")
+        self.assertEqual(
+            release["ordering_flags"], ["external_call_before_state_write"]
+        )
+        ordered_kinds = [item["kind"] for item in release["effect_order"]]
+        self.assertLess(
+            ordered_kinds.index("external_call"),
+            ordered_kinds.index("state_write"),
+        )
+
+    async def test_protocol_graph_adds_causal_edges_and_ignores_locals_as_state(self):
+        container = FakeContainer()
+        container.files["/audit/src/Ledger.sol"] = self.SOURCE.replace(
+            "releaseable = credit[msg.sender] + aggregate;",
+            "uint256 localOnly = credit[msg.sender];\n"
+            "        releaseable = localOnly + aggregate;",
+        )
+
+        await _map_protocol_graph(container, {
+            "files": ["/audit/src/Ledger.sol"],
+            "record_result": False,
+        })
+        graph = json.loads(
+            container.files["/workspace/campaign/protocol-graphs/pg-001.json"]
+        )
+        edge_kinds = {item["kind"] for item in graph["edges"]}
+        self.assertLessEqual(
+            {"reads_state", "writes_state", "feeds_state_to", "calls_external"},
+            edge_kinds,
+        )
+        dependencies = [
+            item for item in graph["edges"]
+            if item["kind"] == "feeds_state_to"
+        ]
+        self.assertTrue(any(
+            item["source"] == "action:Ledger.seed"
+            and item["target"] == "action:Ledger.propagate"
+            for item in dependencies
+        ))
+        variables = {node.get("variable") for node in graph["nodes"]}
+        self.assertNotIn("localOnly", variables)
+        self.assertGreaterEqual(graph["summary"]["state_dependency_edges"], 2)
+        self.assertGreaterEqual(graph["summary"]["call_ordering_edges"], 1)
+
+    async def test_protocol_graph_disambiguates_same_named_source_definitions(self):
+        container = FakeContainer()
+        source = """pragma solidity ^0.8.20;
+contract Vault {
+    uint256 public total;
+    function withdraw(uint256 amount) external { total -= amount; }
+}
+"""
+        container.files["/audit/src/A.sol"] = source
+        container.files["/audit/src/B.sol"] = source
+
+        await _map_protocol_graph(container, {
+            "files": ["/audit/src/A.sol", "/audit/src/B.sol"],
+            "record_result": False,
+        })
+        graph = json.loads(
+            container.files["/workspace/campaign/protocol-graphs/pg-001.json"]
+        )
+        nodes_by_id = {item["id"]: item for item in graph["nodes"]}
+        actions = [
+            item for item in graph["nodes"]
+            if item.get("kind") == "entrypoint"
+            and item.get("contract") == "Vault"
+            and item.get("function") == "withdraw"
+        ]
+        self.assertEqual(len(actions), 2)
+        self.assertEqual(len({item["id"] for item in actions}), 2)
+        self.assertTrue(all(
+            item["id"].startswith("action:Vault.withdraw#")
+            and item.get("legacy_id") == "action:Vault.withdraw"
+            for item in actions
+        ))
+        self.assertNotIn("action:Vault.withdraw", nodes_by_id)
+        self.assertTrue(all(
+            edge["source"] in nodes_by_id and edge["target"] in nodes_by_id
+            for edge in graph["edges"]
+        ))
+        for action in actions:
+            source_file = action["locations"][0]["file"]
+            writes = [
+                edge for edge in graph["edges"]
+                if edge["source"] == action["id"]
+                and edge["kind"] == "writes_state"
+            ]
+            self.assertEqual(len(writes), 1)
+            target = nodes_by_id[writes[0]["target"]]
+            self.assertEqual(target["locations"][0]["file"], source_file)
+
+        context = _match_protocol_graph_context(graph, [{
+            "contract": "Vault",
+            "function": "withdraw",
+            "file": "/audit/src/B.sol",
+        }])
+        self.assertEqual(len(context), 1)
+        matched_id = context[0]["node"]["id"]
+        self.assertEqual(
+            nodes_by_id[matched_id]["locations"][0]["file"],
+            "/audit/src/B.sol",
+        )
+
+    async def test_protocol_graph_disambiguates_overloads_and_matches_signature(self):
+        container = FakeContainer()
+        container.files["/audit/src/Vault.sol"] = """
+pragma solidity ^0.8.20;
+contract Vault {
+    uint256 public total;
+    function withdraw(uint256 amount) external { total -= amount; }
+    function withdraw(address to, uint256 amount) external {
+        total -= amount; payable(to).transfer(amount);
+    }
+}
+"""
+        await _map_protocol_graph(container, {
+            "files": ["/audit/src/Vault.sol"],
+            "record_result": False,
+        })
+        graph = json.loads(
+            container.files["/workspace/campaign/protocol-graphs/pg-001.json"]
+        )
+        actions = {
+            item["signature"]: item
+            for item in graph["nodes"]
+            if item.get("kind") == "entrypoint"
+            and item.get("contract") == "Vault"
+            and item.get("function") == "withdraw"
+        }
+        self.assertEqual(
+            set(actions),
+            {"withdraw(uint256)", "withdraw(address,uint256)"},
+        )
+        self.assertTrue(all(
+            item["id"].startswith("action:Vault.withdraw#")
+            and item.get("legacy_id") == "action:Vault.withdraw"
+            for item in actions.values()
+        ))
+        external_call_sources = {
+            edge["source"] for edge in graph["edges"]
+            if edge["kind"] == "calls_external"
+        }
+        self.assertNotIn(
+            actions["withdraw(uint256)"]["id"],
+            external_call_sources,
+        )
+        self.assertIn(
+            actions["withdraw(address,uint256)"]["id"],
+            external_call_sources,
+        )
+
+        exact_context = _match_protocol_graph_context(graph, [{
+            "contract": "Vault",
+            "function": "withdraw",
+            "signature": "withdraw(address, uint256)",
+        }])
+        self.assertEqual(
+            exact_context[0]["matched_node_ids"],
+            [actions["withdraw(address,uint256)"]["id"]],
+        )
+        broad_context = _match_protocol_graph_context(graph, [{
+            "contract": "Vault",
+            "function": "withdraw",
+        }])
+        self.assertEqual(
+            set(broad_context[0]["matched_node_ids"]),
+            {item["id"] for item in actions.values()},
+        )
+
+    async def test_protocol_graph_caps_dense_mismatched_dependency_comparisons(self):
+        writers = "\n".join(
+            f"function w{i}() external {{ credit[address({i + 1})] = {i + 1}; }}"
+            for i in range(5)
+        )
+        readers = "\n".join(
+            f"function r{i}() external view returns (uint256) "
+            f"{{ return credit[address({i + 101})]; }}"
+            for i in range(5)
+        )
+        source = f"""pragma solidity ^0.8.20;
+contract Dense {{
+    mapping(address => uint256) credit;
+    {writers}
+    {readers}
+}}
+"""
+        container = FakeContainer()
+        container.files["/audit/src/Dense.sol"] = source
+        with mock.patch(
+            "reentbotpro.tools._CAUSAL_GRAPH_MAX_DEPENDENCY_COMPARISONS", 3
+        ):
+            await _map_protocol_graph(container, {
+                "files": ["/audit/src/Dense.sol"],
+                "max_items": 100,
+                "record_result": False,
+            })
+        graph = json.loads(
+            container.files["/workspace/campaign/protocol-graphs/pg-001.json"]
+        )
+        self.assertEqual(graph["summary"]["causal_dependency_comparisons"], 3)
+        self.assertEqual(
+            graph["summary"]["causal_dependency_comparison_truncated_files"],
+            1,
+        )
+        self.assertEqual(
+            graph["source"]["causal_dependency_comparison_truncated_files"],
+            ["/audit/src/Dense.sol"],
+        )
+        self.assertFalse(any(
+            edge["kind"] == "feeds_state_to" for edge in graph["edges"]
+        ))
+
+    def test_attack_graph_dedupes_clone_definition_edges_per_target(self):
+        common = {
+            "contract": "Vault",
+            "function": "withdraw",
+            "signature": "withdraw(uint256)",
+            "action_key": "Vault::withdraw",
+            "action_definition_key": "Vault::withdraw(uint256)",
+            "affordances": ["value_out_or_burn"],
+            "exposure": "exposed",
+            "reachability": {"kind": "public", "attacker_reachable": True},
+            "chain_id": 1,
+        }
+        exposures = [
+            {
+                **common,
+                "target_address": "0x1111111111111111111111111111111111111111",
+            },
+            {
+                **common,
+                "target_address": "0x2222222222222222222222222222222222222222",
+            },
+        ]
+        _nodes, edges = _attack_graph_nodes_edges_from_exposures(exposures)
+
+        self.assertEqual(
+            len([edge for edge in edges if edge["kind"] == "has_entrypoint"]),
+            2,
+        )
+        can_call = [edge for edge in edges if edge["kind"] == "can_call"]
+        self.assertEqual(len(can_call), 2)
+        self.assertEqual(
+            {edge["target_address"] for edge in can_call},
+            {item["target_address"] for item in exposures},
+        )
+        self.assertEqual(
+            len([edge for edge in edges if edge["kind"] == "has_gate"]),
+            1,
+        )
+        self.assertEqual(
+            len([
+                edge for edge in edges
+                if edge["kind"] == "can_release_or_burn_value"
+            ]),
+            1,
+        )
+
+    def test_source_only_same_signature_files_are_not_assumed_clones(self):
+        actions = [
+            {
+                "contract": "Vault",
+                "function": "withdraw",
+                "signature": "withdraw(uint256)",
+                "file": file,
+                "line": 10,
+                "visibility": "external",
+                "mutability": "nonpayable",
+                "parameters": [{"name": "amount", "raw": "uint256 amount"}],
+                "affordances": ["value_out_or_burn"],
+            }
+            for file in ("/audit/src/A.sol", "/audit/src/B.sol")
+        ]
+        candidates, _frontier = _source_only_attack_graph_candidates(
+            {"actions": actions, "observations": []},
+            None,
+            "",
+            "as-test",
+            "",
+        )
+
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(len({item["attack_key"] for item in candidates}), 2)
+        self.assertEqual(
+            {item["action_definition_key"] for item in candidates},
+            {"Vault::withdraw(uint256)"},
+        )
+
+    async def test_state_declared_after_function_is_still_in_causal_scope(self):
+        source = """pragma solidity ^0.8.20;
+contract LateState {
+    function noop() external {}
+    uint256 lateValue;
+    function setLate(uint256 value) external { lateValue = value; }
+    function readLate() external view returns (uint256) { return lateValue; }
+}
+"""
+        container = FakeContainer()
+        container.files["/audit/src/LateState.sol"] = source
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            await _map_action_space(container, {
+                "files": ["/audit/src/LateState.sol"],
+                "record_result": False,
+            })
+        artifact = json.loads(
+            container.files["/workspace/campaign/action-spaces/as-001.json"]
+        )
+        set_late = next(
+            item for item in artifact["actions"] if item["function"] == "setLate"
+        )
+        read_late = next(
+            item for item in artifact["observations"]
+            if item["function"] == "readLate"
+        )
+        self.assertEqual(
+            set_late["causal_facts"]["state_writes"][0]["variable"],
+            "lateValue",
+        )
+        self.assertEqual(
+            read_late["causal_facts"]["state_reads"][0]["variable"],
+            "lateValue",
+        )
+
+    async def test_internal_call_scan_distinguishes_member_calls(self):
+        source = """pragma solidity ^0.8.20;
+contract Calls {
+    function helper() public {}
+    function outer() external {
+        helper();
+        this.helper();
+    }
+}
+"""
+        container = FakeContainer()
+        container.files["/audit/src/Calls.sol"] = source
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            await _map_action_space(container, {
+                "files": ["/audit/src/Calls.sol"],
+                "record_result": False,
+            })
+        artifact = json.loads(
+            container.files["/workspace/campaign/action-spaces/as-001.json"]
+        )
+        outer = next(
+            item for item in artifact["actions"] if item["function"] == "outer"
+        )
+        self.assertEqual(
+            [item["function"] for item in outer["causal_facts"]["internal_calls"]],
+            ["helper"],
+        )
+        self.assertTrue(any(
+            item["target"] == "this" and item["function"] == "helper"
+            for item in outer["causal_facts"]["external_calls"]
+        ))
+
+    async def test_shadowed_parameters_locals_and_returns_are_not_storage_facts(self):
+        source = """pragma solidity ^0.8.20;
+interface IERC20 { function transfer(address,uint256) external returns (bool); }
+contract Shadowed {
+    uint256 x;
+    IERC20 token;
+    function parameter(uint256 x) external { x = 7; }
+    function local() external { uint256 x = 8; x++; }
+    function namedReturn() external returns (uint256 x) { x = 9; }
+    function release(uint256 amount) external {
+        require(x >= amount);
+        token.transfer(msg.sender, amount);
+    }
+}
+"""
+        container = FakeContainer()
+        container.files["/audit/src/Shadowed.sol"] = source
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            await _map_action_space(container, {
+                "files": ["/audit/src/Shadowed.sol"],
+                "record_result": False,
+            })
+        artifact = json.loads(
+            container.files["/workspace/campaign/action-spaces/as-001.json"]
+        )
+        actions = {item["function"]: item for item in artifact["actions"]}
+        for function in ("parameter", "local", "namedReturn"):
+            facts = actions[function]["causal_facts"]
+            self.assertFalse(facts.get("state_writes"), (function, facts))
+            self.assertEqual(facts["shadowed_state_names"], ["x"])
+
+        result = json.loads(await _build_attack_graph(container, {
+            "action_space": "as-001",
+            "mode": "source_only",
+            "max_candidates": 50,
+            "record_result": False,
+        }))
+        causal_starts = {
+            item["actions"][0]["function"]
+            for item in result["candidate_chains"]
+            if item.get("candidate_kind") == "causal_state_path"
+        }
+        self.assertTrue(
+            causal_starts.isdisjoint({"parameter", "local", "namedReturn"})
+        )
+
+    async def test_used_state_after_many_unused_declarations_is_not_dropped(self):
+        declarations = "\n".join(
+            f"    uint256 v{index};" for index in range(30)
+        )
+        source = f"""pragma solidity ^0.8.20;
+contract ManyState {{
+{declarations}
+    function setLast(uint256 value) external {{ v29 = value; }}
+    function release() external {{
+        require(v29 > 0);
+        payable(msg.sender).transfer(1);
+    }}
+}}
+"""
+        container = FakeContainer()
+        container.files["/audit/src/ManyState.sol"] = source
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            await _map_action_space(container, {
+                "files": ["/audit/src/ManyState.sol"],
+                "record_result": False,
+            })
+        artifact = json.loads(
+            container.files["/workspace/campaign/action-spaces/as-001.json"]
+        )
+        set_last = next(
+            item for item in artifact["actions"]
+            if item["function"] == "setLast"
+        )
+        self.assertEqual(
+            {item["variable"] for item in set_last["causal_facts"]["state_writes"]},
+            {"v29"},
+        )
+        result = json.loads(await _build_attack_graph(container, {
+            "action_space": "as-001",
+            "mode": "source_only",
+            "max_candidates": 50,
+            "record_result": False,
+        }))
+        self.assertTrue(any(
+            [action["function"] for action in item["actions"]]
+            == ["setLast", "release"]
+            for item in result["candidate_chains"]
+            if item.get("candidate_kind") == "causal_state_path"
+        ))
+
+    async def test_bounded_internal_effects_connect_entrypoint_to_sink(self):
+        source = """pragma solidity ^0.8.20;
+interface IERC20 { function transfer(address,uint256) external returns (bool); }
+contract InternalEffects {
+    uint256 credit;
+    IERC20 token;
+    function seed(uint256 value) external { _stage(value); }
+    function _stage(uint256 value) internal { _store(value); }
+    function _store(uint256 value) internal { credit = value; }
+    function release(uint256 amount) external {
+        require(credit >= amount);
+        token.transfer(msg.sender, amount);
+    }
+}
+"""
+        container = FakeContainer()
+        container.files["/audit/src/InternalEffects.sol"] = source
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            await _map_action_space(container, {
+                "files": ["/audit/src/InternalEffects.sol"],
+                "record_result": False,
+            })
+        artifact = json.loads(
+            container.files["/workspace/campaign/action-spaces/as-001.json"]
+        )
+        seed = next(
+            item for item in artifact["actions"] if item["function"] == "seed"
+        )
+        propagated = seed["causal_facts"]["state_writes"][0]
+        self.assertEqual(propagated["variable"], "credit")
+        self.assertEqual(propagated["via_internal"], ["_stage", "_store"])
+
+        result = json.loads(await _build_attack_graph(container, {
+            "action_space": "as-001",
+            "mode": "source_only",
+            "max_candidates": 50,
+            "record_result": False,
+        }))
+        self.assertTrue(any(
+            [action["function"] for action in item["actions"]]
+            == ["seed", "release"]
+            for item in result["candidate_chains"]
+            if item.get("candidate_kind") == "causal_state_path"
+        ))
+
+    async def test_bare_call_and_untyped_transfer_are_not_impact_sinks(self):
+        source = """pragma solidity ^0.8.20;
+interface Helper {
+    function transfer() external;
+    function call(bytes calldata data) external;
+}
+contract NotValue {
+    uint256 x;
+    Helper helper;
+    function set() external { x = 1; }
+    function unrelatedTransfer() external { require(x > 0); helper.transfer(); }
+    function bareCall(bytes calldata data) external {
+        require(x > 0);
+        helper.call(data);
+    }
+}
+"""
+        container = FakeContainer()
+        container.files["/audit/src/NotValue.sol"] = source
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            await _map_action_space(container, {
+                "files": ["/audit/src/NotValue.sol"],
+                "record_result": False,
+            })
+        result = json.loads(await _build_attack_graph(container, {
+            "action_space": "as-001",
+            "mode": "source_only",
+            "max_candidates": 50,
+            "record_result": False,
+        }))
+        self.assertFalse(any(
+            item.get("candidate_kind") == "causal_state_path"
+            for item in result["candidate_chains"]
+        ))
+
+    async def test_same_contract_name_in_different_files_never_composes(self):
+        first = """pragma solidity ^0.8.20;
+contract Vault { uint256 x; function seed(uint256 value) external { x = value; } }
+"""
+        second = """pragma solidity ^0.8.20;
+interface IERC20 { function transfer(address,uint256) external returns (bool); }
+contract Vault {
+    uint256 x;
+    IERC20 token;
+    function release(uint256 amount) external {
+        require(x >= amount);
+        token.transfer(msg.sender, amount);
+    }
+}
+"""
+        container = FakeContainer()
+        container.files["/audit/src/First.sol"] = first
+        container.files["/audit/src/Second.sol"] = second
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            await _map_action_space(container, {
+                "files": ["/audit/src/First.sol", "/audit/src/Second.sol"],
+                "record_result": False,
+            })
+        result = json.loads(await _build_attack_graph(container, {
+            "action_space": "as-001",
+            "mode": "source_only",
+            "max_candidates": 50,
+            "record_result": False,
+        }))
+        self.assertFalse(any(
+            item.get("candidate_kind") == "causal_state_path"
+            for item in result["candidate_chains"]
+        ))
+
+    async def test_attack_graph_emits_bounded_sink_gated_three_action_path(self):
+        container, _artifact = await self._map()
+
+        result = json.loads(await _build_attack_graph(container, {
+            "action_space": "as-001",
+            "mode": "source_only",
+            "max_candidates": 50,
+            "record_result": False,
+        }))
+        causal = [
+            item for item in result["candidate_chains"]
+            if item.get("candidate_kind") == "causal_state_path"
+        ]
+        self.assertTrue(causal)
+        three_step = next(
+            item for item in causal
+            if [action["function"] for action in item["actions"]]
+            == ["seed", "propagate", "release"]
+        )
+        self.assertEqual(three_step["causal_path"]["depth"], 3)
+        self.assertTrue(three_step["causal_path"]["same_contract"])
+        self.assertLessEqual(
+            max(item["causal_path"]["depth"] for item in causal), 3
+        )
+        self.assertLessEqual(len(causal), 20)
+        self.assertEqual(
+            {item["actions"][-1]["function"] for item in causal},
+            {"release"},
+        )
+        self.assertIn("live reachability not mapped", three_step["blockers"])
+        self.assertEqual(
+            result["summary"]["causal_state_path_candidates"], len(causal)
+        )
+        self.assertEqual(result["causal_search"]["max_depth"], 3)
+        self.assertEqual(result["causal_search"]["candidate_cap"], 20)
+        self.assertLessEqual(
+            result["causal_search"]["expansions"],
+            result["causal_search"]["expansion_cap"],
+        )
+
+        graph = json.loads(
+            container.files["/workspace/campaign/attack-graphs/ag-001.json"]
+        )
+        expected_dependency_edges = {
+            (f"action:{item['writer']}", f"action:{item['reader']}")
+            for item in three_step["causal_path"]["dependencies"]
+        }
+        actual_dependency_edges = {
+            (edge.get("from"), edge.get("to"))
+            for edge in graph["edges"]
+            if edge.get("kind") == "feeds_state_to"
+        }
+        self.assertIn(
+            (
+                "action:Ledger::seed(uint256)",
+                "action:Ledger::propagate()",
+            ),
+            expected_dependency_edges,
+        )
+        self.assertTrue(
+            expected_dependency_edges.issubset(actual_dependency_edges)
+        )
+
+    async def test_writer_reader_without_impact_sink_is_not_a_causal_candidate(self):
+        source = """pragma solidity ^0.8.20;
+contract Plain {
+    uint256 x;
+    uint256 y;
+    function first(uint256 value) external { x = value; }
+    function second() external { y = x; }
+}
+"""
+        container = FakeContainer()
+        container.files["/audit/src/Plain.sol"] = source
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            await _map_action_space(container, {
+                "files": ["/audit/src/Plain.sol"],
+                "record_result": False,
+            })
+        result = json.loads(await _build_attack_graph(container, {
+            "action_space": "as-001",
+            "mode": "source_only",
+            "max_candidates": 50,
+            "record_result": False,
+        }))
+        self.assertFalse(any(
+            item.get("candidate_kind") == "causal_state_path"
+            for item in result["candidate_chains"]
+        ))
+
+    async def test_different_mapping_keys_do_not_form_a_dependency(self):
+        source = """pragma solidity ^0.8.20;
+interface IERC20 { function transfer(address,uint256) external returns (bool); }
+contract Keyed {
+    mapping(address => uint256) credit;
+    IERC20 token;
+    function seedConcrete(uint256 value) external { credit[address(1)] = value; }
+    function releaseCaller() external {
+        uint256 amount = credit[msg.sender];
+        token.transfer(msg.sender, amount);
+    }
+}
+"""
+        container = FakeContainer()
+        container.files["/audit/src/Keyed.sol"] = source
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            await _map_action_space(container, {
+                "files": ["/audit/src/Keyed.sol"],
+                "record_result": False,
+            })
+        artifact = json.loads(
+            container.files["/workspace/campaign/action-spaces/as-001.json"]
+        )
+        actions = {item["function"]: item for item in artifact["actions"]}
+        self.assertEqual(
+            actions["seedConcrete"]["causal_facts"]["state_writes"][0][
+                "access_path"
+            ],
+            "credit[address(1)]",
+        )
+        self.assertEqual(
+            actions["releaseCaller"]["causal_facts"]["state_reads"][0][
+                "access_path"
+            ],
+            "credit[@caller]",
+        )
+
+        result = json.loads(await _build_attack_graph(container, {
+            "action_space": "as-001",
+            "mode": "source_only",
+            "max_candidates": 50,
+            "record_result": False,
+        }))
+        self.assertFalse(any(
+            item.get("candidate_kind") == "causal_state_path"
+            for item in result["candidate_chains"]
+        ))
+
+        await _map_protocol_graph(container, {
+            "files": ["/audit/src/Keyed.sol"],
+            "record_result": False,
+        })
+        graph = json.loads(
+            container.files["/workspace/campaign/protocol-graphs/pg-001.json"]
+        )
+        self.assertFalse(any(
+            edge["kind"] == "feeds_state_to"
+            and edge["source"] == "action:Keyed.seedConcrete"
+            and edge["target"] == "action:Keyed.releaseCaller"
+            for edge in graph["edges"]
+        ))
+
+    async def test_sender_alias_mapping_keys_form_a_precise_dependency(self):
+        source = """pragma solidity ^0.8.20;
+interface IERC20 { function transfer(address,uint256) external returns (bool); }
+contract AliasKeyed {
+    mapping(address => uint256) credit;
+    IERC20 token;
+    function seed(uint256 value) external { credit[msg.sender] = value; }
+    function release() external {
+        uint256 amount = credit[_msgSender()];
+        token.transfer(msg.sender, amount);
+    }
+    function _msgSender() internal view returns (address) { return msg.sender; }
+}
+"""
+        container = FakeContainer()
+        container.files["/audit/src/AliasKeyed.sol"] = source
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            await _map_action_space(container, {
+                "files": ["/audit/src/AliasKeyed.sol"],
+                "record_result": False,
+            })
+        result = json.loads(await _build_attack_graph(container, {
+            "action_space": "as-001",
+            "mode": "source_only",
+            "max_candidates": 50,
+            "record_result": False,
+        }))
+        candidate = next(
+            item for item in result["candidate_chains"]
+            if item.get("candidate_kind") == "causal_state_path"
+            and [action["function"] for action in item["actions"]]
+            == ["seed", "release"]
+        )
+        dependency = candidate["causal_path"]["dependencies"][0]
+        self.assertEqual(dependency["state"], ["credit"])
+        self.assertEqual(
+            dependency["accesses"][0]["compatibility"],
+            "caller_identity_alias",
+        )
+        self.assertEqual(
+            dependency["accesses"][0]["canonical_access"],
+            "credit[@caller]",
+        )
+
+    async def test_reachability_aware_causal_path_binds_every_step_to_same_target(self):
+        container, artifact = await self._map()
+        target = "0x1111111111111111111111111111111111111111"
+        exposures = []
+        for action in artifact["actions"]:
+            action_uid = (
+                action.get("action_uid")
+                or f"{action['file']}:{action['action_definition_key']}:{action['line']}"
+            )
+            exposures.append({
+                "action_key": action["action_key"],
+                "action_definition_key": action["action_definition_key"],
+                "action_uid": action_uid,
+                "contract": "Ledger",
+                "function": action["function"],
+                "signature": action["signature"],
+                "file": action["file"],
+                "line": action["line"],
+                "target_address": target,
+                "network": "eth-mainnet",
+                "chain_id": 1,
+                "affordances": action["affordances"],
+                "parameters": action.get("parameters") or [],
+                "reachability": {"kind": "public", "attacker_reachable": True},
+                "live_status": "deployed",
+                "exposure": "exposed",
+                "target_binding": {
+                    "kind": "deployed_economic_contract",
+                    "live_deployed": True,
+                },
+            })
+        container.files[
+            "/workspace/campaign/live-reachability/lr-001.json"
+        ] = json.dumps({
+            "id": "lr-001",
+            "profiles": [{
+                "contract": "Ledger",
+                "address": target,
+                "network": "eth-mainnet",
+                "chain_id": 1,
+                "action_exposures": exposures,
+            }],
+        })
+
+        result = json.loads(await _build_attack_graph(container, {
+            "action_space": "as-001",
+            "live_reachability": "lr-001",
+            "mode": "reachability_aware",
+            "max_candidates": 50,
+            "record_result": False,
+        }))
+        causal = [
+            item for item in result["candidate_chains"]
+            if item.get("candidate_kind") == "causal_state_path"
+        ]
+        self.assertTrue(causal)
+        self.assertEqual(
+            result["summary"]["live_exposure_action_facts_joined"],
+            sum(bool(action.get("causal_facts")) for action in artifact["actions"]),
+        )
+        three_step = next(
+            item for item in causal if item["causal_path"]["depth"] == 3
+        )
+        self.assertEqual(three_step["target_address"], target)
+        self.assertEqual(
+            {action["target"] for action in three_step["actions"]},
+            {target},
+        )
+        self.assertNotIn("blockers", three_step)
+        exposure_uids = {item["action_uid"] for item in exposures}
+        for dependency in three_step["causal_path"]["dependencies"]:
+            self.assertIn(dependency["writer_action_uid"], exposure_uids)
+            self.assertIn(dependency["reader_action_uid"], exposure_uids)
+
+        graph = json.loads(
+            container.files["/workspace/campaign/attack-graphs/ag-001.json"]
+        )
+        node_ids = {node["id"] for node in graph["nodes"]}
+        uid_node_ids = {f"action:1:{uid}" for uid in exposure_uids}
+        dependency_edges = [
+            edge for edge in graph["edges"]
+            if edge.get("kind") == "feeds_state_to"
+        ]
+        self.assertTrue(dependency_edges)
+        self.assertTrue(uid_node_ids.issubset(node_ids))
+        self.assertTrue(all(
+            edge[endpoint] in uid_node_ids
+            for edge in dependency_edges
+            for endpoint in ("from", "to")
+        ))
+
+    async def test_reachability_does_not_compose_actions_on_different_targets(self):
+        container, artifact = await self._map()
+        first = "0x1111111111111111111111111111111111111111"
+        second = "0x2222222222222222222222222222222222222222"
+        exposures = []
+        for action in artifact["actions"]:
+            target = second if action["function"] == "release" else first
+            exposures.append({
+                "action_key": action["action_key"],
+                "action_definition_key": action["action_definition_key"],
+                "contract": "Ledger",
+                "function": action["function"],
+                "signature": action["signature"],
+                "file": action["file"],
+                "line": action["line"],
+                "target_address": target,
+                "affordances": action["affordances"],
+                "causal_facts": action.get("causal_facts") or {},
+                "parameters": action.get("parameters") or [],
+                "reachability": {"kind": "public", "attacker_reachable": True},
+                "live_status": "deployed",
+                "exposure": "exposed",
+                "target_binding": {
+                    "kind": "deployed_economic_contract",
+                    "live_deployed": True,
+                },
+            })
+        container.files[
+            "/workspace/campaign/live-reachability/lr-001.json"
+        ] = json.dumps({
+            "id": "lr-001",
+            "profiles": [{
+                "contract": "Ledger",
+                "address": first,
+                "action_exposures": exposures,
+            }],
+        })
+
+        result = json.loads(await _build_attack_graph(container, {
+            "action_space": "as-001",
+            "live_reachability": "lr-001",
+            "mode": "reachability_aware",
+            "max_candidates": 50,
+            "record_result": False,
+        }))
+        self.assertFalse(any(
+            item.get("candidate_kind") == "causal_state_path"
+            for item in result["candidate_chains"]
+        ))
+        self.assertGreater(result["causal_search"]["live_binding_misses"], 0)
+
+    async def test_dense_causal_search_stays_within_expansion_budget(self):
+        from reentbotpro.tools import _causal_source_paths
+
+        actions = []
+        for index in range(2000):
+            sink = index % 100 == 99
+            actions.append({
+                "contract": "Dense",
+                "function": f"f{index}",
+                "file": "/audit/src/Dense.sol",
+                "line": index + 1,
+                "visibility": "external",
+                "mutability": "nonpayable",
+                "parameters": [],
+                "affordances": (
+                    ["value_out_or_burn"]
+                    if sink else ["state_mutating_entrypoint"]
+                ),
+                "causal_facts": {
+                    "state_reads": [{"variable": "x", "line": index + 1}],
+                    "state_writes": [{
+                        "variable": "x",
+                        "target": "x",
+                        "operation": "=",
+                        "line": index + 1,
+                    }],
+                    "external_calls": [],
+                    "internal_calls": [],
+                },
+            })
+
+        paths, search = _causal_source_paths({"actions": actions})
+        self.assertTrue(paths)
+        self.assertLessEqual(len(paths), 20)
+        self.assertLessEqual(search["expansions"], search["expansion_cap"])
+        self.assertLessEqual(search["path_pool_count"], search["path_pool_cap"])
+        self.assertLessEqual(
+            search["access_comparisons"], search["access_comparison_cap"]
+        )
+        self.assertTrue(search["truncated"])
+
+    async def test_incompatible_causal_accesses_have_a_hard_comparison_budget(self):
+        from reentbotpro.tools import _causal_source_paths
+
+        actions = []
+        for index in range(400):
+            target = f"x[{index}]"
+            actions.append({
+                "contract": "Dense",
+                "function": f"f{index}",
+                "signature": f"f{index}()",
+                "file": "/audit/src/Dense.sol",
+                "line": index + 1,
+                "visibility": "external",
+                "mutability": "nonpayable",
+                "parameters": [],
+                "affordances": ["state_mutating_entrypoint"],
+                "causal_facts": {
+                    "state_reads": [{
+                        "variable": "x",
+                        "target": target,
+                        "line": index + 1,
+                    }],
+                    "state_writes": [{
+                        "variable": "x",
+                        "target": target,
+                        "operation": "=",
+                        "line": index + 1,
+                    }],
+                    "external_calls": [],
+                    "internal_calls": [],
+                },
+            })
+
+        paths, search = _causal_source_paths({"actions": actions})
+
+        self.assertFalse(paths)
+        self.assertEqual(
+            search["access_comparisons"], search["access_comparison_cap"]
+        )
+        self.assertTrue(search["access_comparison_cap_reached"])
+        self.assertTrue(search["truncated"])
+
+    async def test_causal_path_cap_rotates_sources_and_preserves_omissions(self):
+        from reentbotpro.tools import _causal_source_paths
+
+        actions = []
+        for index in range(30):
+            contract = f"Ledger{index:02d}"
+            file_path = f"/audit/src/{contract}.sol"
+            actions.extend([
+                {
+                    "contract": contract,
+                    "function": "seed",
+                    "signature": "seed()",
+                    "file": file_path,
+                    "line": 10,
+                    "visibility": "external",
+                    "mutability": "nonpayable",
+                    "parameters": [],
+                    "affordances": ["state_mutating_entrypoint"],
+                    "causal_facts": {
+                        "state_reads": [],
+                        "state_writes": [{
+                            "variable": "credit",
+                            "target": "credit[msg.sender]",
+                            "operation": "=",
+                            "line": 10,
+                        }],
+                        "external_calls": [],
+                        "internal_calls": [],
+                    },
+                },
+                {
+                    "contract": contract,
+                    "function": "release",
+                    "signature": "release()",
+                    "file": file_path,
+                    "line": 20,
+                    "visibility": "external",
+                    "mutability": "nonpayable",
+                    "parameters": [],
+                    "affordances": ["value_out_or_burn"],
+                    "causal_facts": {
+                        "state_reads": [{
+                            "variable": "credit",
+                            "target": "credit[msg.sender]",
+                            "line": 20,
+                        }],
+                        "state_writes": [],
+                        "external_calls": [],
+                        "internal_calls": [],
+                    },
+                },
+            ])
+        action_space = {"id": "as-001", "actions": actions, "observations": []}
+
+        paths, search = _causal_source_paths(action_space)
+
+        self.assertEqual(len(paths), 20)
+        self.assertEqual(len({path["storage_context"] for path in paths}), 20)
+        self.assertEqual(search["path_diversity_groups"], 30)
+        self.assertEqual(search["omitted_path_count"], 10)
+        self.assertEqual(len(search["omitted_path_frontier"]), 10)
+        selected_contexts = {path["storage_context"] for path in paths}
+        omitted_contexts = {
+            item["storage_context"]
+            for item in search["omitted_path_frontier"]
+        }
+        self.assertTrue(selected_contexts.isdisjoint(omitted_contexts))
+
+        container = FakeContainer()
+        container.files[
+            "/workspace/campaign/action-spaces/as-001.json"
+        ] = json.dumps(action_space)
+        response = json.loads(await _build_attack_graph(container, {
+            "action_space": "as-001",
+            "mode": "source_only",
+            "max_candidates": 50,
+            "frontier_max_items": 50,
+            "record_result": False,
+        }))
+        self.assertEqual(
+            response["frontier_summary"]["causal_path_omissions"], 10
+        )
+        artifact = json.loads(
+            container.files["/workspace/campaign/attack-graphs/ag-001.json"]
+        )
+        self.assertEqual(len(artifact["frontier"]["causal_path_omissions"]), 10)
 
 
 def _struct_labels_for(
@@ -14335,10 +19262,10 @@ class StructuralActionAffordanceTests(unittest.TestCase):
 
 
 class DelexicalizedActionSpaceCoverageTests(unittest.IsolatedAsyncioTestCase):
-    """map_action_space + review_attack_surface_coverage must surface
+    """Mapping plus controller-internal coverage must surface
     structurally risky functions even with adversarially bland identifiers."""
 
-    async def _map_and_review(self, source, filename="/audit/src/X.sol"):
+    async def _map_and_derive_gaps(self, source, filename="/audit/src/X.sol"):
         container = FakeContainer()
         container.files[filename] = source
         await _map_action_space(container, {
@@ -14349,10 +19276,12 @@ class DelexicalizedActionSpaceCoverageTests(unittest.IsolatedAsyncioTestCase):
             container.files["/workspace/campaign/action-spaces/as-001.json"]
         )
         actions = {a["function"]: a for a in artifact["actions"]}
-        review = json.loads(await _review_attack_surface_coverage(container, {
-            "action_space": "as-001",
-        }))
-        return artifact, actions, review
+        gaps = await _derive_attack_surface_gaps(
+            container,
+            await _load_campaign_state(container),
+            artifact,
+        )
+        return artifact, actions, gaps
 
     async def test_map_action_space_records_structural_labels_for_bland_names(self):
         source = """pragma solidity ^0.8.20;
@@ -14373,7 +19302,7 @@ contract Ledger {
     }
 }
 """
-        _artifact, actions, review = await self._map_and_review(source)
+        _artifact, actions, gaps = await self._map_and_derive_gaps(source)
 
         self.assertIn("f1", actions)
         self.assertIn("f2", actions)
@@ -14388,9 +19317,11 @@ contract Ledger {
         }
         self.assertNotIn("value_in_or_mint", all_labels)
         self.assertNotIn("value_out_or_burn", all_labels)
-        self.assertGreaterEqual(review["summary"]["high_attention_gaps"], 1)
-        gap_keys = {gap["key"] for gap in review["high_attention_gaps"]}
-        self.assertTrue({"Ledger::f1", "Ledger::f2"} & gap_keys)
+        self.assertGreaterEqual(len(gaps), 1)
+        gap_keys = {gap["key"] for gap in gaps}
+        self.assertTrue(
+            {"Ledger::f1(uint256)", "Ledger::f2(uint256)"} & gap_keys
+        )
 
     async def test_dynamic_call_path_is_high_attention_with_bland_names(self):
         source = """pragma solidity ^0.8.20;
@@ -14401,14 +19332,14 @@ contract Forwarder {
     }
 }
 """
-        _artifact, actions, review = await self._map_and_review(source)
+        _artifact, actions, gaps = await self._map_and_derive_gaps(source)
 
         self.assertIn("z", actions)
         labels = actions["z"]["affordances"]
         self.assertIn("dynamic_call_target", labels)
         self.assertIn("external_boundary_crossing", labels)
-        gap_keys = {gap["key"] for gap in review["high_attention_gaps"]}
-        self.assertIn("Forwarder::z", gap_keys)
+        gap_keys = {gap["key"] for gap in gaps}
+        self.assertIn("Forwarder::z(address,bytes)", gap_keys)
 
     async def test_lexical_and_delexicalized_variants_both_surface_gaps(self):
         lexical = """pragma solidity ^0.8.20;
@@ -14445,16 +19376,16 @@ contract B {
     }
 }
 """
-        _a_art, lex_actions, lex_review = await self._map_and_review(
+        _a_art, lex_actions, lex_gaps = await self._map_and_derive_gaps(
             lexical, filename="/audit/src/A.sol"
         )
-        _b_art, delex_actions, delex_review = await self._map_and_review(
+        _b_art, delex_actions, delex_gaps = await self._map_and_derive_gaps(
             delexical, filename="/audit/src/B.sol"
         )
 
         # Both variants surface at least one high-attention open gap.
-        self.assertGreaterEqual(lex_review["summary"]["high_attention_gaps"], 1)
-        self.assertGreaterEqual(delex_review["summary"]["high_attention_gaps"], 1)
+        self.assertGreaterEqual(len(lex_gaps), 1)
+        self.assertGreaterEqual(len(delex_gaps), 1)
 
         # The lexical variant still works through the name-based heuristics.
         lex_labels = {
@@ -14781,120 +19712,222 @@ contract Beta {
         self.assertEqual(payload["function"], "withdraw")
 
 
-class PlannerDecidedKeyFilterTests(unittest.IsolatedAsyncioTestCase):
-    def _gap_item(self, key):
-        contract, _, function = key.partition("::")
-        return {
-            "key": key,
-            "contract": contract,
-            "function": function,
-            "file": "/audit/src/Vault.sol",
-            "line": 20,
-            "attention_score": 6,
-            "affordances": ["value_out_or_burn"],
-            "parameters": [{"name": "amount", "raw": "uint256 amount"}],
-        }
-
-    def _action_gap_branch(self, key, decided):
-        return _plan_branch_from_action_gap(
-            self._gap_item(key),
-            source="coverage_high_attention_gap",
-            source_path="/workspace/campaign/coverage-reviews/cov-001.json",
-            focus="",
-            state={"sections": {}, "counters": {}},
-            has_fork_context=False,
-            has_economics=False,
-            economics_context={},
-            base_score=6,
-            decided_action_keys=decided,
-        )
-
-    def test_action_gap_builder_skips_decided_key(self):
-        self.assertIsNone(self._action_gap_branch("Vault::withdraw", {"Vault::withdraw"}))
-
-    def test_action_gap_builder_keeps_undecided_key(self):
-        branch = self._action_gap_branch("Vault::withdraw", {"Other::thing"})
-        self.assertIsNotNone(branch)
-        self.assertEqual(branch["target_actions"][0]["key"], "Vault::withdraw")
-
-    def test_action_gap_builder_without_decided_set_keeps_branch(self):
-        branch = self._action_gap_branch("Vault::withdraw", None)
-        self.assertIsNotNone(branch)
-
-    def test_protocol_hotspot_builder_skips_decided_key(self):
-        item = {
-            "key": "Vault::withdraw",
-            "contract": "Vault",
-            "function": "withdraw",
-            "affordances": ["value_out_or_burn"],
-            "connected": [],
-        }
-        branch = _plan_branch_from_protocol_hotspot(
-            item,
-            source_path="/workspace/campaign/protocol-graphs/pg-001.json",
-            graph_id="pg-001",
-            focus="",
-            state={},
-            has_fork_context=False,
-            has_economics=False,
-            economics_context={},
-            decided_action_keys={"Vault::withdraw"},
-        )
-        self.assertIsNone(branch)
-
-    def test_plan_add_branch_skips_none(self):
-        branches: dict = {}
-        _plan_add_branch(branches, None)
-        self.assertEqual(branches, {})
-
-    async def test_plan_attack_campaign_skips_decided_action_gaps(self):
+class AttackSearchDecidedKeyFilterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_attack_search_derives_coverage_from_all_action_spaces(self):
         container = FakeContainer()
-        container.files[_CAMPAIGN_STATE_PATH] = json.dumps({
-            "attack_search": {"decided_action_keys": ["Vault::withdraw"]},
+        await _record_test_foundation(container)
+        paths = [
+            "/workspace/campaign/action-spaces/as-001.json",
+            "/workspace/campaign/action-spaces/as-002.json",
+        ]
+        container.files[paths[0]] = json.dumps({
+            "id": "as-001",
+            "actions": [{
+                "contract": "Vault",
+                "function": "withdraw",
+                "file": "/audit/src/Vault.sol",
+                "line": 20,
+                "affordances": ["value_out_or_burn"],
+            }],
+            "observations": [],
         })
-        container.files["/workspace/campaign/coverage-reviews/cov-001.json"] = json.dumps({
-            "id": "cov-001",
-            "title": "Coverage review",
-            "created_at": "2026-01-01T00:00:00+00:00",
-            "action_space_path": "/workspace/campaign/action-spaces/as-001.json",
-            "summary": {"high_attention_gaps": 2, "hypothesized_not_experimented": 0},
-            "high_attention_gaps": [
+        container.files[paths[1]] = json.dumps({
+            "id": "as-002",
+            "actions": [{
+                "contract": "Oracle",
+                "function": "updatePrice",
+                "file": "/audit/src/Oracle.sol",
+                "line": 55,
+                "affordances": ["valuation_dependency"],
+            }],
+            "observations": [],
+        })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Two action-space maps",
+            "content": "Both source roots were mapped.",
+            "evidence": paths,
+            "related_ids": ["as-001", "as-002"],
+        })
+
+        result = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
+            "record_result": False,
+        }))
+        coverage_keys = {
+            key
+            for branch in result["active_branches"]
+            if branch.get("source") == "coverage_high_attention_gap"
+            for key in branch.get("action_keys") or []
+        }
+        self.assertEqual(
+            coverage_keys,
+            {"Oracle::updatePrice", "Vault::withdraw"},
+        )
+
+    async def test_attack_search_reports_campaign_ready_without_meta_fallback(self):
+        container = FakeContainer()
+        await _record_test_foundation(container)
+        artifacts = {
+            "/workspace/campaign/protocol-graphs/pg-001.json": {
+                "id": "pg-001",
+                "source": {
+                    "action_space": (
+                        "/workspace/campaign/action-spaces/as-001.json"
+                    ),
+                },
+                "nodes": [],
+                "edges": [],
+            },
+            "/workspace/campaign/action-spaces/as-001.json": {
+                "id": "as-001",
+                "source": {"files_requested": 1, "files_scanned": 1},
+                "actions": [],
+                "observations": [],
+            },
+            "/workspace/campaign/state-transition-models/stm-001.json": {
+                "id": "stm-001",
+                "candidate_invariants": [],
+            },
+            "/workspace/campaign/live-reachability/lr-001.json": {
+                "id": "lr-001",
+                "summary": {"live_deployed_profiles": 1},
+                "profiles": [],
+            },
+            "/workspace/campaign/attack-graphs/ag-001.json": {
+                "id": "ag-001",
+                "mode": "reachability_aware",
+                "action_space_path": (
+                    "/workspace/campaign/action-spaces/as-001.json"
+                ),
+                "protocol_graph_path": (
+                    "/workspace/campaign/protocol-graphs/pg-001.json"
+                ),
+                "live_reachability_path": (
+                    "/workspace/campaign/live-reachability/lr-001.json"
+                ),
+                "candidate_chains": [],
+                "frontier": [],
+                "state_transition_model": {
+                    "model_id": "stm-001",
+                    "path": (
+                        "/workspace/campaign/state-transition-models/stm-001.json"
+                    ),
+                },
+            },
+        }
+        for path, payload in artifacts.items():
+            container.files[path] = json.dumps(payload)
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Completed campaign maps",
+            "content": "All controller mapping stages completed with no open actions.",
+            "evidence": list(artifacts),
+            "related_ids": ["pg-001", "as-001", "stm-001", "lr-001", "ag-001"],
+        })
+
+        result = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
+            "record_result": False,
+        }))
+        self.assertTrue(result["campaign_ready"])
+        self.assertEqual(result["active_branches"], [])
+        self.assertEqual(result["next_action"]["status"], "campaign_ready")
+        self.assertIsNone(result["next_action"]["tool"])
+        self.assertFalse(result["next_action"]["must_follow"])
+
+    async def test_attack_search_skips_only_decided_action_gap(self):
+        container = FakeContainer()
+        await _record_test_foundation(container)
+        action_space_path = "/workspace/campaign/action-spaces/as-001.json"
+        container.files[action_space_path] = json.dumps({
+            "id": "as-001",
+            "summary": {"actions": 2, "observations": 0, "contracts": 2},
+            "actions": [
                 {
-                    "key": "Vault::withdraw",
                     "contract": "Vault",
                     "function": "withdraw",
                     "file": "/audit/src/Vault.sol",
                     "line": 20,
-                    "attention_score": 6,
                     "affordances": ["value_out_or_burn"],
                     "parameters": [{"name": "amount", "raw": "uint256 amount"}],
                 },
                 {
-                    "key": "Oracle::updatePrice",
                     "contract": "Oracle",
                     "function": "updatePrice",
                     "file": "/audit/src/Oracle.sol",
                     "line": 55,
-                    "attention_score": 5,
                     "affordances": ["valuation_dependency"],
                     "parameters": [{"name": "price", "raw": "uint256 price"}],
                 },
             ],
+            "observations": [],
+        })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Action-space map",
+            "content": "Recorded both uncovered actions.",
+            "evidence": [action_space_path],
+            "related_ids": ["as-001"],
         })
 
-        plan = json.loads(await _plan_attack_campaign(container, {
-            "coverage_review": "cov-001",
+        initial = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
             "record_result": False,
         }))
-
-        gap_keys = {
-            action.get("key")
-            for branch in plan.get("branches", [])
+        initial_by_key = {
+            key: branch
+            for branch in initial["active_branches"]
             if branch.get("source") == "coverage_high_attention_gap"
-            for action in branch.get("target_actions") or []
+            for key in branch.get("action_keys") or []
         }
-        self.assertIn("Oracle::updatePrice", gap_keys)
-        self.assertNotIn("Vault::withdraw", gap_keys)
+        self.assertEqual(
+            set(initial_by_key),
+            {"Oracle::updatePrice", "Vault::withdraw"},
+        )
+
+        await _attack_search(container, {
+            "action": "decision",
+            "branch_id": initial_by_key["Vault::withdraw"]["id"],
+            "decision_status": "rejected",
+            "decision": "The role gate prevents an unprivileged withdrawal.",
+            "failed_assumption": "The action was assumed attacker-reachable.",
+            "record_result": False,
+        })
+        after = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "max_branches": 40,
+            "record_result": False,
+        }))
+        remaining_keys = {
+            key
+            for branch in after["active_branches"]
+            if branch.get("source") == "coverage_high_attention_gap"
+            for key in branch.get("action_keys") or []
+        }
+        self.assertEqual(remaining_keys, {"Oracle::updatePrice"})
+
+        state = await _load_campaign_state(container)
+        self.assertIn(
+            "Vault::withdraw@/audit/src/Vault.sol",
+            state["attack_search"]["decided_coverage_keys"],
+        )
+        gaps = await _derive_attack_surface_gaps(
+            container,
+            state,
+            json.loads(container.files[action_space_path]),
+        )
+        self.assertEqual({gap["key"] for gap in gaps}, {"Oracle::updatePrice"})
+        self.assertFalse(any(
+            path.startswith((
+                "/workspace/campaign/plans/",
+                "/workspace/campaign/coverage-reviews/",
+            ))
+            for path in container.files
+        ))
 
 
 class ObjectiveClearlyNonEconomicTests(unittest.TestCase):
@@ -16481,19 +21514,25 @@ class CheckTestOutputTests(unittest.TestCase):
         warning = _check_test_output("compile error: ParserError at line 5")
         self.assertIsNotNone(warning)
 
-    def test_non_foundry_mixed_output_still_uses_heuristic(self):
-        # No Foundry markers, but has both pass and fail indicators -> the
-        # legacy heuristic gates on has_fail AND not has_pass, so this passes.
-        self.assertIsNone(_check_test_output(
+    def test_non_foundry_mixed_output_requires_objective_artifact_at_gate(self):
+        warning = _check_test_output(
             "hardhat: 1 passing\nWarning: assertion error caught"
-        ))
+        )
+        self.assertIsNotNone(warning)
+        self.assertIn("no recognized passing test result", warning)
+
+    def test_arbitrary_nonempty_output_is_not_a_pass_signal(self):
+        warning = _check_test_output("hello world")
+
+        self.assertIsNotNone(warning)
+        self.assertIn("no recognized passing test result", warning)
 
 
 class ObjectiveEvaluationAltPathTests(unittest.TestCase):
-    """§4.12 — non-empty objective_evaluation downgrades test_output warnings."""
+    """§4.12 — raw objective_evaluation text is never a trusted marker."""
 
-    def test_alt_path_active_when_objective_evaluation_is_supplied(self):
-        self.assertTrue(_objective_evaluation_alt_path_active(
+    def test_alt_path_inactive_when_only_reference_is_supplied(self):
+        self.assertFalse(_objective_evaluation_alt_path_active(
             {"objective_evaluation": "eval-001"}
         ))
 
@@ -16506,11 +21545,376 @@ class ObjectiveEvaluationAltPathTests(unittest.TestCase):
         ))
 
 
-class SubmitFindingObjectiveEvaluationAltPathTests(unittest.TestCase):
-    """§4.12 integration — _submit_finding keeps validated=true when test_output
-    looks suspicious but the agent provided an objective_evaluation reference."""
+class ObjectiveEvaluationValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def _fixture(self, *, delta: int = 100):
+        container = FakeContainer()
+        await _record_test_experiment(
+            container,
+            title="Execute measured exploit replay",
+        )
+        container.exec_result = (
+            0,
+            "[PASS] testExploit()\nTest result: ok. 1 passed; 0 failed",
+        )
+        await _run_experiment(container, {
+            "command": "forge test --match-test testExploit -vvv",
+            "experiment_id": "exp-001",
+            "run_kind": "poc_run",
+        })
+        comparison_path = "/workspace/campaign/comparisons/cmp-001.json"
+        container.files[comparison_path] = json.dumps({
+            "id": "cmp-001",
+            "title": "Attacker balance comparison",
+            "created_at": "2026-07-14T00:00:00+00:00",
+            "related_ids": ["exp-001", "res-001"],
+            "changed": [{
+                "key": "erc20:USDC:token:attacker:account",
+                "kind": "erc20_balances",
+                "before": "1000",
+                "after": str(1000 + delta),
+                "delta": delta,
+            }],
+        })
+        await _evaluate_objective(container, {
+            "comparison": "cmp-001",
+            "title": "Measured attacker profit",
+            "objectives": [{
+                "label": "attacker USDC profit",
+                "match": "attacker",
+                "direction": "increase",
+                "min_delta": "1",
+                "decimals": 0,
+                "unit": "USDC",
+                "role": "attacker",
+            }],
+            "related_ids": ["exp-001", "res-001", "cmp-001"],
+            "record_result": False,
+        })
+        campaign_ids = ["exp-001", "res-001", "cmp-001", "eval-001"]
+        evidence = [
+            "/workspace/campaign/results/res-001.log",
+            comparison_path,
+            "/workspace/campaign/evaluations/eval-001.json",
+        ]
+        return container, campaign_ids, evidence
 
-    def test_alt_path_keeps_validated_when_objective_evaluation_linked(self):
+    async def _validation(
+        self,
+        container,
+        campaign_ids,
+        evidence,
+        *,
+        reference="eval-001",
+    ):
+        return await _validate_objective_evaluation(
+            container,
+            reference=reference,
+            campaign_ids=campaign_ids,
+            evidence=evidence,
+        )
+
+    def _review_args(self, campaign_ids, evidence, *, test_output="custom runner ok"):
+        return {
+            "title": "Measured replay proves attacker profit",
+            "severity": "medium",
+            "root_cause": "Withdrawal accounting transfers assets before reducing credit.",
+            "impact": "An unprivileged caller finishes with more USDC than supplied.",
+            "affected_code": [{"file": "/audit/src/Vault.sol", "lines": "42-80"}],
+            "reproduction_steps": [
+                "Run the exploit replay.",
+                "Capture attacker balances before and after.",
+                "Evaluate the positive attacker delta.",
+            ],
+            "campaign_ids": campaign_ids,
+            "evidence": evidence,
+            "objective_evaluation": "eval-001",
+            "validated": True,
+            "test_output": test_output,
+            "capital_required": "Attacker-owned test capital plus gas.",
+            **_exploitability_fields(),
+        }
+
+    async def test_generated_passing_evaluation_is_grounded_and_active(self):
+        container, campaign_ids, evidence = await self._fixture()
+
+        validation = await self._validation(container, campaign_ids, evidence)
+        artifact = json.loads(
+            container.files["/workspace/campaign/evaluations/eval-001.json"]
+        )
+
+        self.assertTrue(artifact["objective_achieved"])
+        self.assertTrue(validation.active, validation.errors)
+        self.assertEqual(validation.evaluation_id, "eval-001")
+        self.assertIn("res-001", validation.lineage_ids)
+
+    async def test_bogus_missing_and_unsafe_references_are_inactive(self):
+        container, campaign_ids, evidence = await self._fixture()
+
+        missing = await self._validation(
+            container,
+            [*campaign_ids[:-1], "eval-999"],
+            [*evidence[:-1], "/workspace/campaign/evaluations/eval-999.json"],
+            reference="eval-999",
+        )
+        bogus = await self._validation(
+            container,
+            campaign_ids,
+            evidence,
+            reference="bogus",
+        )
+        unsafe = await self._validation(
+            container,
+            campaign_ids,
+            evidence,
+            reference="/workspace/campaign/evaluations/../state.json",
+        )
+
+        self.assertFalse(missing.active)
+        self.assertIn("does not exist", " ".join(missing.errors))
+        self.assertFalse(bogus.active)
+        self.assertIn("must be an id", " ".join(bogus.errors))
+        self.assertFalse(unsafe.active)
+        self.assertIn("normalized", " ".join(unsafe.errors))
+
+    async def test_unlinked_or_wrong_experiment_lineage_is_inactive(self):
+        container, campaign_ids, evidence = await self._fixture()
+        await _record_test_experiment(container, title="Unrelated replay")
+
+        unlinked = await self._validation(
+            container,
+            campaign_ids[:-1],
+            evidence[:-1],
+        )
+        wrong_lineage = await self._validation(
+            container,
+            ["exp-002", "res-001", "cmp-001", "eval-001"],
+            evidence,
+        )
+
+        self.assertFalse(unlinked.active)
+        self.assertIn("campaign_ids do not link", " ".join(unlinked.errors))
+        self.assertIn("evidence does not link", " ".join(unlinked.errors))
+        self.assertFalse(wrong_lineage.active)
+        self.assertIn(
+            "not a successful objective-capable run",
+            " ".join(wrong_lineage.errors),
+        )
+
+    async def test_failed_or_internally_inconsistent_evaluation_is_inactive(self):
+        failed_container, campaign_ids, evidence = await self._fixture(delta=0)
+        failed = await self._validation(failed_container, campaign_ids, evidence)
+
+        container, campaign_ids, evidence = await self._fixture()
+        path = "/workspace/campaign/evaluations/eval-001.json"
+        artifact = json.loads(container.files[path])
+        artifact["summary"]["passed"] = 99
+        container.files[path] = json.dumps(artifact)
+        inconsistent = await self._validation(container, campaign_ids, evidence)
+
+        self.assertFalse(failed.active)
+        self.assertIn("did not achieve every objective", " ".join(failed.errors))
+        self.assertFalse(inconsistent.active)
+        self.assertIn("summary passed count", " ".join(inconsistent.errors))
+
+    async def test_legacy_artifact_derives_status_only_from_complete_consistent_fields(self):
+        container, campaign_ids, evidence = await self._fixture()
+        path = "/workspace/campaign/evaluations/eval-001.json"
+        artifact = json.loads(container.files[path])
+        del artifact["objective_achieved"]
+        container.files[path] = json.dumps(artifact)
+
+        validation = await self._validation(container, campaign_ids, evidence)
+
+        self.assertTrue(validation.active, validation.errors)
+        self.assertTrue(validation.legacy_derived_status)
+
+    async def test_experiment_definition_without_executed_result_is_inactive(self):
+        container, campaign_ids, evidence = await self._fixture()
+        artifact_path = "/workspace/campaign/evaluations/eval-001.json"
+        artifact = json.loads(container.files[artifact_path])
+        artifact["related_ids"] = ["exp-001", "cmp-001"]
+        container.files[artifact_path] = json.dumps(artifact)
+
+        validation = await self._validation(
+            container,
+            ["exp-001", "cmp-001", "eval-001"],
+            evidence,
+        )
+
+        self.assertFalse(validation.active)
+        self.assertIn("no shared executed result lineage", " ".join(validation.errors))
+
+    async def test_custom_runner_needs_valid_eval_but_structured_failures_still_block(self):
+        container, campaign_ids, evidence = await self._fixture()
+
+        custom = json.loads(await _review_finding_evidence(
+            container,
+            self._review_args(campaign_ids, evidence),
+        ))
+        foundry_failed = json.loads(await _review_finding_evidence(
+            container,
+            self._review_args(
+                campaign_ids,
+                evidence,
+                test_output="Test result: FAILED. 0 passed; 1 failed",
+            ),
+        ))
+        zero_tests = json.loads(await _review_finding_evidence(
+            container,
+            self._review_args(
+                campaign_ids,
+                evidence,
+                test_output="Test result: ok. 0 passed; 0 failed",
+            ),
+        ))
+
+        self.assertTrue(custom["ready"], custom["blocking_gaps"])
+        self.assertIn("no recognized passing test result", " ".join(custom["warnings"]))
+        self.assertFalse(foundry_failed["ready"])
+        self.assertIn("reports failing tests", " ".join(foundry_failed["blocking_gaps"]))
+        self.assertFalse(zero_tests["ready"])
+        self.assertIn("zero executed tests", " ".join(zero_tests["blocking_gaps"]))
+
+    async def test_custom_runner_with_wrong_lineage_is_blocked(self):
+        container, _campaign_ids, evidence = await self._fixture()
+        await _record_test_experiment(container, title="Unrelated replay")
+
+        review = json.loads(await _review_finding_evidence(
+            container,
+            self._review_args(
+                ["exp-002", "res-001", "cmp-001", "eval-001"],
+                evidence,
+            ),
+        ))
+
+        self.assertFalse(review["ready"])
+        self.assertIn(
+            "no recognized passing test result",
+            " ".join(review["blocking_gaps"]),
+        )
+        self.assertIn(
+            "invalid objective_evaluation",
+            " ".join(review["warnings"]),
+        )
+
+    async def test_checked_submission_revalidates_eval_and_review_lineage(self):
+        container, campaign_ids, evidence = await self._fixture()
+        custom_output = "custom runner completed the exploit assertion"
+        finding_review = json.loads(await _review_finding_evidence(
+            container,
+            self._review_args(
+                campaign_ids,
+                evidence,
+                test_output=custom_output,
+            ),
+        ))
+        self.assertTrue(finding_review["ready"], finding_review["blocking_gaps"])
+        report_ids = [*campaign_ids, "fr-001"]
+        report_evidence = [
+            *evidence,
+            "/workspace/campaign/finding-reviews/fr-001.json",
+        ]
+        report_review = json.loads(await _review_report_quality(container, {
+            "title": "Measured replay proves attacker profit",
+            "severity": "medium",
+            "summary": (
+                "A concrete replay and balance comparison show an attacker-owned "
+                "USDC balance increasing after the vulnerable withdrawal path."
+            ),
+            "root_cause": (
+                "Withdrawal accounting transfers assets before reducing the "
+                "attacker-controlled credit used by the same call."
+            ),
+            "impact": (
+                "An unprivileged caller completes the replay with more USDC "
+                "than the caller supplied."
+            ),
+            "attack_path": [
+                "Fund the attacker account.",
+                "Call the vulnerable withdrawal sequence.",
+                "Measure the positive attacker balance delta.",
+            ],
+            "affected_code": [
+                {"file": "/audit/src/Vault.sol", "lines": "42-80"}
+            ],
+            "reproduction_steps": [
+                "Run the custom replay.",
+                "Capture before and after balances.",
+                "Inspect eval-001.",
+            ],
+            "proof_of_concept": "/workspace/experiments/exp-001/Exploit.t.sol",
+            "validation": "The custom runner completes and eval-001 measures profit.",
+            "test_output": custom_output,
+            "economic_analysis": (
+                "The measured attacker delta is positive after accounting for "
+                "the replayed principal."
+            ),
+            "assumptions": ["The caller is unprivileged."],
+            "limitations": ["Custom runner output is corroborated by eval-001."],
+            "remediation": (
+                "Reduce withdrawal credit before transferring assets and add a "
+                "reentrancy-safe solvency assertion."
+            ),
+            "campaign_ids": report_ids,
+            "evidence": report_evidence,
+            "evidence_review": "fr-001",
+            "objective_evaluation": "eval-001",
+            **_exploitability_fields(),
+        }))
+        self.assertTrue(report_review["ready"], report_review["blocking_gaps"])
+
+        submission = {
+            "title": "Measured replay proves attacker profit",
+            "severity": "medium",
+            "description": "The linked replay and objective artifact prove profit.",
+            "impact": "An unprivileged attacker gains USDC from protocol liquidity.",
+            "affected_code": [
+                {"file": "/audit/src/Vault.sol", "lines": "42-80"}
+            ],
+            "proof_of_concept": "/workspace/experiments/exp-001/Exploit.t.sol",
+            "validated": True,
+            "test_output": custom_output,
+            "campaign_ids": [*report_ids, "rr-001"],
+            "evidence": [
+                *report_evidence,
+                "/workspace/campaign/report-reviews/rr-001.json",
+            ],
+            "reproduction_steps": [
+                "Run the custom replay.",
+                "Compare balances.",
+                "Inspect eval-001.",
+            ],
+            "objective_evaluation": "eval-001",
+            "evidence_review": "fr-001",
+            "report_review": "rr-001",
+            **_exploitability_fields(),
+        }
+        findings: list[dict] = []
+        accepted = await _submit_finding_checked(
+            container,
+            submission,
+            findings,
+        )
+        rejected = await _submit_finding_checked(
+            container,
+            {
+                **submission,
+                "test_output": "Test result: FAILED. 0 passed; 1 failed",
+            },
+            findings,
+        )
+
+        self.assertIn("Finding #1 submitted", accepted)
+        self.assertTrue(findings[0]["validated"])
+        self.assertIn("submit_finding blocked", rejected)
+        self.assertIn("reports failing tests", rejected)
+        self.assertEqual(len(findings), 1)
+
+
+class SubmitFindingObjectiveEvaluationAltPathTests(unittest.TestCase):
+    """The sync sink trusts only validation prepared by the async gate."""
+
+    def test_raw_reference_cannot_mask_structured_foundry_failure(self):
         findings: list[dict] = []
         result = _submit_finding({
             "title": "Multi-suite fuzz with intentional revert traces",
@@ -16519,8 +21923,8 @@ class SubmitFindingObjectiveEvaluationAltPathTests(unittest.TestCase):
             "impact": "Unprivileged attacker drains vault.",
             "affected_code": [{"file": "/audit/src/Vault.sol", "lines": "10-30"}],
             "validated": True,
-            # This output would normally be blocked because of "1 failed" in a
-            # separate harness suite; objective_evaluation justifies acceptance.
+            # A definitive failure remains contradictory even if the caller
+            # also supplies an objective-evaluation reference.
             "test_output": (
                 "Test result: ok. 1 passed; 0 failed; 0 skipped\n"
                 "Test result: FAILED. 0 passed; 1 failed; 0 skipped\n"
@@ -16528,12 +21932,9 @@ class SubmitFindingObjectiveEvaluationAltPathTests(unittest.TestCase):
             "objective_evaluation": "eval-001",
         }, findings)
 
-        # validated is preserved even though _check_test_output produced a warning.
-        self.assertTrue(findings[0]["validated"])
-        # The warning is surfaced via system_note so reviewers see it.
+        self.assertFalse(findings[0]["validated"])
         self.assertIn("system_note", findings[0])
         self.assertIn("failing tests", findings[0]["system_note"])
-        # The summary message still includes the warning text.
         self.assertIn("failing tests", result)
 
     def test_alt_path_inactive_without_objective_evaluation_downgrades(self):
@@ -18156,11 +23557,100 @@ class DiagnoseBuildTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["first_error"]["kind"], "test_discovery")
         self.assertEqual(data["status"], "observed")
 
+    async def test_diagnose_build_accepts_conservative_explicit_diagnostics(self):
+        for command in (
+            "forge build --sizes",
+            "FOUNDRY_PROFILE=ci forge build",
+            (
+                "forge build --out "
+                "/workspace/campaign/build-diagnostics/scratch/forge-out"
+            ),
+            (
+                "forge build -o/workspace/campaign/build-diagnostics/"
+                "scratch/forge-out-short"
+            ),
+            "forge config",
+            "forge inspect Vault storageLayout",
+            "forge test --list --match-contract Vault",
+            "slither src --exclude naming-convention",
+            "slither . > /workspace/campaign/static-analysis/slither.txt",
+            "slither . --json /workspace/campaign/static-analysis/slither.json",
+            "forge build > /output/diagnostics/forge-build.log",
+            "slither . --sarif=-",
+        ):
+            container = FakeContainer()
+            container.exec_result = (0, "diagnostic completed")
+
+            data = json.loads(await _diagnose_build(
+                container,
+                {"command": command, "record_result": False},
+            ))
+
+            self.assertNotIn("error", data, command)
+            self.assertEqual(data["command"], command)
+            self.assertEqual(len(container.exec_calls), 1, command)
+
+    async def test_diagnose_build_rejects_chained_or_state_changing_commands(self):
+        for command in (
+            "make build",
+            "forge test -vvv",
+            "forge install foundry-rs/forge-std",
+            "npm install",
+            "cast send 0xabc 'drain()'",
+            "forge build && rm -rf /audit",
+            "forge build # --out /workspace/campaign/hidden",
+            "forge inspect Vault abi; touch /audit/owned",
+            "forge build | tee /audit/build.log",
+            "FOUNDRY_PROFILE=$(whoami) forge build",
+            "FOUNDRY_OUT=/audit/src forge build",
+            "PATH=/tmp forge build",
+            "forge build --out /audit/src",
+            "forge build -o/audit/src",
+            "forge build --cache-path ../../audit/src",
+            "forge build --contracts /audit/src",
+            "forge config --config-path /audit/foundry.toml",
+            "forge build --broadcast /audit/broadcast",
+            "forge build --ffi",
+            "forge build --use /audit/bin/evil-solc",
+            "forge build --use=0.8.20",
+            "forge build --config-path /workspace/experiments/unsafe.toml",
+            "forge build > /workspace/campaign/attack-search/current.json",
+            "slither . --json /workspace/campaign/state.json",
+            "slither . --json /workspace/campaign/results/res-001.log",
+            "forge build > /output/report.md",
+            "slither . > /audit/slither.txt",
+            "slither . --json /audit/slither.json",
+            "slither . --sarif=/audit/slither.sarif",
+            "slither . --compile-custom-build 'touch /audit/owned'",
+            "slither . --compile-custom 'touch /audit/owned'",
+            "slither . --generate-patches",
+            "slither . --triage-mode",
+            "slither . --solc /tmp/evil-solc",
+            "slither . --config-file /workspace/experiments/unsafe.json",
+            "slither . --etherscan-apikey super-secret",
+            "slither . --foundry-out=/audit/out",
+            (
+                "forge build > /workspace/campaign/one.log "
+                "> /output/two.log"
+            ),
+        ):
+            container = FakeContainer()
+
+            data = json.loads(await _diagnose_build(
+                container,
+                {"command": command},
+            ))
+
+            self.assertEqual(data["error"], "command_not_allowed", command)
+            self.assertNotIn("super-secret", json.dumps(data), command)
+            self.assertEqual(container.exec_calls, [], command)
+            self.assertEqual(container.writes, [], command)
+
     async def test_diagnose_build_marks_unclassified_failure_blocked(self):
         container = FakeContainer()
-        container.exec_result = (1, "make: *** [build] segmentation fault")
+        container.exec_result = (1, "forge: internal compiler process crashed")
 
-        out = await _diagnose_build(container, {"command": "make build"})
+        out = await _diagnose_build(container, {"command": "forge build"})
         data = json.loads(out)
 
         self.assertEqual(data["status"], "blocked")
@@ -18196,9 +23686,22 @@ class DiagnoseBuildTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_diagnose_build_experiment_targets_workspace_and_completion(self):
         container = FakeContainer()
-        await _create_experiment(container, {
+        await _compose_sequence_experiment(container, {
             "title": "Vault replay",
-            "template": "foundry_test",
+            "objective": "Determine whether a deposit can corrupt vault accounting.",
+            "actions": [{
+                "actor": "attacker",
+                "contract": "Vault",
+                "function": "deposit",
+                "args": ["amount"],
+                "expected_effect": "attacker receives shares",
+            }],
+            "observations": [{
+                "label": "attacker shares",
+                "kind": "balance",
+                "subject": "attacker",
+            }],
+            "success_condition": "Attacker receives excess shares.",
         })
         workspace = _experiment_workspace_line(container)
         wrong_iface = "\n".join([
@@ -19129,7 +24632,8 @@ class AttackSearchCuriosityFrontierTests(unittest.TestCase):
             attack_graph_id="ag-1",
             attack_graph_path="/p/ag-1.json",
         )
-        self.assertEqual(structural_ready["status"], "needs_harness")
+        self.assertEqual(structural_ready["status"], "needs_context")
+        self.assertIn("source_slice", structural_ready["next_tool"])
 
         bland = _attack_search_frontier_branch_from_entry(
             {
@@ -19926,24 +25430,45 @@ class RunExperimentRpcInjectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("base-mainnet.g.alchemy.com", env["RPC_URL_8453"])
 
 
-class GeneratedForkTemplateRpcDocsTests(unittest.TestCase):
-    def test_fork_template_documents_run_experiment_injected_env(self):
-        contract = _foundry_template_contract("fork_test", "Fork probe")
+class GeneratedSequenceForkRpcDocsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_concrete_sequence_documents_injected_fork_environment(self):
+        container = FakeContainer()
+        target = "0x1111111111111111111111111111111111111111"
+        container.files["/workspace/campaign/fork-contexts/fc-001.json"] = (
+            json.dumps({
+                "id": "fc-001",
+                "network": "base-mainnet",
+                "chain_id": 8453,
+                "fork_block": 20_000_000,
+                "target_addresses": {"Vault": target},
+            })
+        )
+
+        await _compose_sequence_experiment(container, {
+            "title": "Fork probe",
+            "objective": "Measure whether withdrawal exceeds entitlement.",
+            "fork_context": "fc-001",
+            "actions": [{
+                "actor": "attacker",
+                "contract": "Vault",
+                "function": "withdraw",
+                "target": target,
+                "args": ["amount"],
+                "expected_effect": "assets leave the vault",
+            }],
+            "observations": [{
+                "label": "attacker assets",
+                "kind": "balance",
+                "subject": "attacker",
+            }],
+            "success_condition": "Attacker assets increase beyond entitlement.",
+        })
+
+        workspace = _experiment_workspace_line(container)
+        contract = container.files[f"{workspace}/ReentbotProSequence.t.sol"]
         self.assertIn("injected by run_experiment", contract)
         self.assertIn('vm.envString("ETH_RPC_URL")', contract)
-        self.assertIn('RPC_URL_8453', contract)
-
-    def test_experiment_readme_documents_injected_env(self):
-        readme = _experiment_readme(
-            artifact_id="exp-001",
-            title="Fork probe",
-            template="fork_test",
-            notes="",
-            related_ids=[],
-        )
-        self.assertIn("You do not export `ETH_RPC_URL` by hand", readme)
-        self.assertIn("RPC_URL_<chain_id>", readme)
-        self.assertIn("RPC_URL_BASE_MAINNET", readme)
+        self.assertIn("RPC_URL_<chain_id>", contract)
 
 
 class ToolRpcResolutionWiringTests(unittest.IsolatedAsyncioTestCase):

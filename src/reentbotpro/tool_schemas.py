@@ -36,12 +36,19 @@ TOOLS = [
                     },
                     "max_profiles": {
                         "type": "integer",
-                        "description": "Maximum ranked Foundry profiles to return (default: 40, max: 120)",
+                        "description": (
+                            "Maximum ranked Foundry profiles in the compact response "
+                            "(default: 40, max: 120). The persisted manifest always "
+                            "retains every parsed profile."
+                        ),
                         "default": 40,
                     },
                     "include_low_priority": {
                         "type": "boolean",
-                        "description": "Include low-priority infrastructure/profile entries",
+                        "description": (
+                            "Deprecated compatibility no-op. Infrastructure, bland, "
+                            "and low-attention profiles are always retained in scope."
+                        ),
                         "default": False,
                     },
                 },
@@ -361,6 +368,50 @@ TOOLS = [
                             "ids linked to experiments or results."
                         ),
                     },
+                    "action_keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional exact Contract::signature/action identities. "
+                            "Use these to hand a reviewed coverage branch to a "
+                            "hypothesis, experiment, result, or decision without "
+                            "lexical matching."
+                        ),
+                    },
+                    "coverage_keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional exact Contract::signature@source-file "
+                            "definition identities supplied by attack_search. "
+                            "Preserve these with action_keys so same-named "
+                            "definitions in different files are not conflated."
+                        ),
+                    },
+                    "hypothesis_card": {
+                        "type": "object",
+                        "description": (
+                            "For section=hypothesis, structured experiment-admission "
+                            "facts. Partial cards are preserved as context work; all "
+                            "seven fields plus evidence are required before the "
+                            "controller schedules a harness."
+                        ),
+                        "properties": {
+                            "attacker_control": {"type": "string"},
+                            "state_path": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "invariant_at_risk": {"type": "string"},
+                            "impact_sink": {"type": "string"},
+                            "material_preconditions": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "falsifier": {"type": "string"},
+                            "objective": {"type": "string"},
+                        },
+                    },
                 },
                 "required": ["section", "title", "content"],
             },
@@ -395,45 +446,6 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "review_campaign_progress",
-            "description": (
-                "Review campaign state for process gaps: missing protocol model "
-                "sections, open hypotheses without experiments, experiments "
-                "without results, blocked results needing mutation or decisions, "
-                "failed objective evaluations, mapped action spaces needing "
-                "coverage review, coverage gaps, and ready evidence/report "
-                "reviews. Use this periodically to decide what to do next "
-                "without forcing a vulnerability taxonomy."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "Short progress review title",
-                    },
-                    "focus": {
-                        "type": "string",
-                        "description": "Optional focus such as hypotheses, experiments, evidence, or submissions",
-                    },
-                    "max_items": {
-                        "type": "integer",
-                        "description": "Maximum items per review section (default: 25, max: 100)",
-                        "default": 25,
-                    },
-                    "record_result": {
-                        "type": "boolean",
-                        "description": "Whether to record a campaign result artifact",
-                        "default": True,
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "build_campaign_brief",
             "description": (
                 "Build a compact resume brief for long attack campaigns and "
@@ -461,8 +473,8 @@ TOOLS = [
                     },
                     "record_result": {
                         "type": "boolean",
-                        "description": "Whether to record a campaign result artifact",
-                        "default": True,
+                        "description": "Whether to also record a redundant campaign result artifact",
+                        "default": False,
                     },
                 },
                 "required": [],
@@ -512,8 +524,45 @@ TOOLS = [
                         "description": (
                             "New action=advance status: needs_context, needs_harness, "
                             "needs_run, needs_poc_repair (not exploit evidence), "
-                            "needs_evidence, parked_*."
+                            "needs_evidence, parked_*. An attack-graph branch may "
+                            "advance to needs_harness only when its complete "
+                            "hypothesis_card is already recorded or supplied with "
+                            "concrete evidence in the same call."
                         ),
+                    },
+                    "hypothesis_card": {
+                        "type": "object",
+                        "description": (
+                            "Complete seven-field admission card for action=advance "
+                            "on an attack-graph/STM/economic branch currently blocked "
+                            "only on structured hypothesis context. Supply it with "
+                            "status=needs_harness and evidence; partial cards are "
+                            "rejected and never unlock sequence composition."
+                        ),
+                        "properties": {
+                            "attacker_control": {"type": "string"},
+                            "state_path": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "invariant_at_risk": {"type": "string"},
+                            "impact_sink": {"type": "string"},
+                            "material_preconditions": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "falsifier": {"type": "string"},
+                            "objective": {"type": "string"},
+                        },
+                        "required": [
+                            "attacker_control",
+                            "state_path",
+                            "invariant_at_risk",
+                            "impact_sink",
+                            "material_preconditions",
+                            "falsifier",
+                            "objective",
+                        ],
                     },
                     "decision_status": {
                         "type": "string",
@@ -542,6 +591,22 @@ TOOLS = [
                     "decision": {
                         "type": "string",
                         "description": "Concrete branch decision and why it follows from evidence",
+                    },
+                    "decision_scope": {
+                        "type": "string",
+                        "enum": [
+                            "branch",
+                            "action_family",
+                            "clone_family",
+                            "target",
+                        ],
+                        "description": (
+                            "How far an evidence-backed decision may propagate "
+                            "(default: branch). action_family/clone_family must be "
+                            "chosen explicitly. target propagation is honored only "
+                            "for deterministic inventory or binding hard blockers."
+                        ),
+                        "default": "branch",
                     },
                     "failed_assumption": {
                         "type": "string",
@@ -615,8 +680,8 @@ TOOLS = [
                     },
                     "record_result": {
                         "type": "boolean",
-                        "description": "Whether to record a campaign result artifact",
-                        "default": True,
+                        "description": "Whether to also record a redundant campaign result artifact",
+                        "default": False,
                     },
                 },
                 "required": [],
@@ -632,7 +697,8 @@ TOOLS = [
                 "Solidity source. Use this during orientation or before "
                 "planning complex attack campaigns to map contracts, "
                 "entrypoints, asset/accounting hints, external dependencies, "
-                "and authorization/valuation/callback boundaries. This is "
+                "authorization/valuation/callback boundaries, and bounded "
+                "same-contract state read/write/call dependencies. This is "
                 "source-derived context for LLM reasoning, not a vulnerability "
                 "taxonomy or proof of a bug."
             ),
@@ -652,6 +718,15 @@ TOOLS = [
                             "provided, path is used only for metadata."
                         ),
                     },
+                    "action_space": {
+                        "type": "string",
+                        "description": (
+                            "Optional completed cumulative action-space id/path. "
+                            "Its retained file inventory replaces an independent "
+                            "first-page root scan, and definitions beyond the "
+                            "bounded source graph are projected explicitly."
+                        ),
+                    },
                     "include_tests": {
                         "type": "boolean",
                         "description": "Include test/script Solidity files (default: false)",
@@ -668,8 +743,9 @@ TOOLS = [
                     "max_roots": {
                         "type": "integer",
                         "description": (
-                            "Maximum ranked Instascope profile roots to scan for broad "
-                            "/audit or /audit/src mappings (default: 12, max: 100)."
+                            "Fallback ranked-profile-root scan bound when no "
+                            "cumulative action_space inventory is supplied "
+                            "(default: 12, max: 100)."
                         ),
                         "default": 12,
                     },
@@ -677,7 +753,8 @@ TOOLS = [
                         "type": "integer",
                         "description": (
                             "Maximum graph items per persisted section "
-                            "(default: 2000, max: 10000). Tool return remains compact."
+                            "(default: 2000, max: 10000). The artifact and "
+                            "response report exact retained/omitted counts."
                         ),
                         "default": 2000,
                     },
@@ -698,241 +775,6 @@ TOOLS = [
                     },
                 },
                 "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "review_attack_surface_coverage",
-            "description": (
-                "Compare a mapped protocol action surface against campaign "
-                "hypotheses, experiments, results, and decisions. Use this to "
-                "find high-value callable levers that have not yet been turned "
-                "into attack hypotheses or experiments. This is a process "
-                "coverage review, not a vulnerability taxonomy."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action_space": {
-                        "type": "string",
-                        "description": (
-                            "Action-space id like as-001 or absolute path under "
-                            "/workspace/campaign/action-spaces/"
-                        ),
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Short coverage review title",
-                    },
-                    "focus_contracts": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": (
-                            "Optional contract names to focus on. Leave empty "
-                            "to review all mapped contracts."
-                        ),
-                    },
-                    "affordance_filter": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": (
-                            "Optional affordance labels to focus on, such as "
-                            "value_out_or_burn, credit_or_liquidation, "
-                            "valuation_dependency, or generic_execution."
-                        ),
-                    },
-                    "include_observations": {
-                        "type": "boolean",
-                        "description": (
-                            "Include view/pure observation functions in the "
-                            "coverage review (default: false)."
-                        ),
-                        "default": False,
-                    },
-                    "attention_threshold": {
-                        "type": "integer",
-                        "description": (
-                            "Minimum attention score for high-attention gaps "
-                            "(default: 3)."
-                        ),
-                        "default": 3,
-                    },
-                    "max_items": {
-                        "type": "integer",
-                        "description": "Maximum items per review section (default: 25, max: 100)",
-                        "default": 25,
-                    },
-                    "record_result": {
-                        "type": "boolean",
-                        "description": "Whether to record a campaign result artifact",
-                        "default": True,
-                    },
-                },
-                "required": ["action_space"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "plan_attack_campaign",
-            "description": (
-                "Advisory planning aid. Synthesize campaign state, progress "
-                "reviews, coverage reviews, failed evaluations, fork context, "
-                "and economics artifacts into candidate attack branches with "
-                "gaps and rationale: invariant to challenge, attacker lever, "
-                "setup, experiment shape, evidence to capture, and "
-                "stop-or-mutate condition. This is research context for your "
-                "judgment, not a schedule. It does not decide that a finding "
-                "exists and does not order what to do next. Use attack_search "
-                "to schedule and advance branches; it stays authoritative for "
-                "the next_action and branch transitions."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "Short campaign plan title",
-                    },
-                    "focus": {
-                        "type": "string",
-                        "description": (
-                            "Optional focus such as oracle paths, withdrawals, "
-                            "bridge messages, coverage gaps, failed objectives, "
-                            "or submission readiness."
-                        ),
-                    },
-                    "action_space": {
-                        "type": "string",
-                        "description": (
-                            "Optional action-space id/path to emphasize in the "
-                            "plan."
-                        ),
-                    },
-                    "protocol_graph": {
-                        "type": "string",
-                        "description": (
-                            "Optional protocol-graph id/path to emphasize in "
-                            "the plan."
-                        ),
-                    },
-                    "coverage_review": {
-                        "type": "string",
-                        "description": (
-                            "Optional coverage-review id/path to emphasize in "
-                            "the plan."
-                        ),
-                    },
-                    "progress_review": {
-                        "type": "string",
-                        "description": (
-                            "Optional progress-review id/path to emphasize in "
-                            "the plan."
-                        ),
-                    },
-                    "max_branches": {
-                        "type": "integer",
-                        "description": "Maximum candidate branches to return (default: 6, max: 20)",
-                        "default": 6,
-                    },
-                    "record_result": {
-                        "type": "boolean",
-                        "description": "Whether to record a campaign result artifact",
-                        "default": True,
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_experiment",
-            "description": (
-                "Create a structured experiment workspace and record the "
-                "experiment in campaign state. Use this when you have a "
-                "hypothesis and need a concrete place for a Foundry test, fork "
-                "scenario, mock, harness, notes, or multi-step validation plan. "
-                "This tool provides scaffolding; the LLM must fill in target-"
-                "specific logic."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "Short experiment title",
-                    },
-                    "template": {
-                        "type": "string",
-                        "enum": [
-                            "blank",
-                            "foundry_test",
-                            "fork_test",
-                            "multi_actor",
-                            "malicious_token",
-                            "fake_oracle",
-                            "callback_reentrancy",
-                            "accounting_probe",
-                        ],
-                        "description": (
-                            "Experiment scaffold to create. Choose the closest "
-                            "shape; do not treat this as a vulnerability taxonomy."
-                        ),
-                        "default": "blank",
-                    },
-                    "hypothesis_id": {
-                        "type": "string",
-                        "description": "Related campaign hypothesis id, if any",
-                    },
-                    "invariant_id": {
-                        "type": "string",
-                        "description": "Related campaign invariant id, if any",
-                    },
-                    "target_dir": {
-                        "type": "string",
-                        "description": (
-                            "Directory for experiment files. Default is "
-                            "/workspace/experiments. Use a repo-local path such "
-                            "as /audit/test/reentbot only when the build system "
-                            "requires tests inside the project."
-                        ),
-                        "default": "/workspace/experiments",
-                    },
-                    "write_scaffold_contract": {
-                        "type": "boolean",
-                        "description": (
-                            "Whether to write the starter Solidity test file. "
-                            "Set false when you intend to write a custom test "
-                            "and want to avoid placeholder pragma/import conflicts."
-                        ),
-                        "default": True,
-                    },
-                    "solidity_pragma": {
-                        "type": "string",
-                        "description": (
-                            "Solidity pragma constraint for generated scaffold "
-                            "contracts, default '>=0.8.0 <0.9.0'."
-                        ),
-                    },
-                    "notes": {
-                        "type": "string",
-                        "description": (
-                            "Initial setup, transaction sequence, success "
-                            "condition, or uncertainty to include in README."
-                        ),
-                    },
-                    "priority": {
-                        "type": "string",
-                        "enum": ["critical", "high", "medium", "low"],
-                        "description": "Investigation priority",
-                    },
-                },
-                "required": ["title"],
             },
         },
     },
@@ -1270,7 +1112,8 @@ TOOLS = [
                 "identifier, type error, wrong interface, missing dependency, "
                 "test discovery, or unknown) with file/line, a repair hint, and "
                 "a suggested next action instead of a raw log. Does not mutate "
-                "experiments; it only writes a campaign diagnostic artifact."
+                "experiment source or definitions; besides ordinary compiler "
+                "artifacts, it writes a campaign diagnostic artifact."
             ),
             "parameters": {
                 "type": "object",
@@ -1282,7 +1125,13 @@ TOOLS = [
                     },
                     "command": {
                         "type": "string",
-                        "description": "Explicit build/test-list command to run instead of the auto-chosen one",
+                        "description": (
+                            "Explicit single diagnostic command to run instead of "
+                            "the auto-chosen one: forge build/config/inspect, forge "
+                            "test --list, or slither. Shell chains and arbitrary "
+                            "write/path overrides are rejected; FOUNDRY_PROFILE is "
+                            "the only allowed leading environment assignment."
+                        ),
                     },
                     "profile": {
                         "type": "string",
@@ -1494,8 +1343,9 @@ TOOLS = [
                 "Evaluate a snapshot comparison against LLM-specified "
                 "objectives such as attacker profit, protocol asset loss, debt "
                 "increase, share drift, or an unchanged invariant. Computes raw "
-                "and decimal deltas, optional USD estimates, and records a "
-                "campaign evidence artifact."
+                "and decimal deltas, optional USD estimates, records whether "
+                "every objective was achieved, and preserves comparison/run "
+                "lineage in a campaign evidence artifact."
             ),
             "parameters": {
                 "type": "object",
@@ -1950,8 +1800,11 @@ TOOLS = [
                 "Build a protocol-specific action map from Solidity source: "
                 "public/external entrypoints, read-only observation functions, "
                 "modifiers, role-gating hints, token/native value-flow hints, "
-                "events, and external calls. Use this to choose multi-step "
-                "attack grammars from the target's actual callable surface."
+                "events, external calls, and compact state read/write/call-order "
+                "facts. Broad manifest-backed scopes are processed in explicit "
+                "cumulative profile-root batches so bounded scans never silently "
+                "drop later profiles. Use this to choose multi-step attack "
+                "grammars from the target's actual callable surface."
             ),
             "parameters": {
                 "type": "object",
@@ -1977,24 +1830,58 @@ TOOLS = [
                     "max_files": {
                         "type": "integer",
                         "description": (
-                            "Maximum Solidity files to scan into the persisted artifact "
-                            "(default: 160, max: 500). Tool return remains compact."
+                            "Maximum Solidity files to scan in one batch/file page "
+                            "(default: 160, max: 500). Cumulative snapshots retain "
+                            "prior pages; the tool return remains compact."
                         ),
                         "default": 160,
                     },
                     "max_roots": {
                         "type": "integer",
                         "description": (
-                            "Maximum ranked Instascope profile roots to scan for broad "
-                            "/audit or /audit/src mappings (default: 12, max: 100)."
+                            "Profile-root batch size for broad /audit or /audit/src "
+                            "mappings (default: 12, max: 100). The response's "
+                            "scope_batch supplies exact root/file cursors when more "
+                            "source remains."
                         ),
                         "default": 12,
+                    },
+                    "profile_cursor": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": (
+                            "Zero-based retained-profile-root cursor (default: 0). "
+                            "For continuation use exactly scope_batch.next_cursor."
+                        ),
+                        "default": 0,
+                    },
+                    "source_file_cursor": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": (
+                            "Zero-based file cursor within the selected profile-root "
+                            "batch (default: 0). For continuation use exactly "
+                            "scope_batch.next_file_cursor; this prevents max_files "
+                            "from skipping a large root."
+                        ),
+                        "default": 0,
+                    },
+                    "previous_action_space": {
+                        "type": "string",
+                        "description": (
+                            "Required when either continuation cursor is nonzero: "
+                            "the preceding "
+                            "cumulative action-space id/path whose scope_batch "
+                            "continues at this cursor."
+                        ),
                     },
                     "max_items": {
                         "type": "integer",
                         "description": (
                             "Maximum actions, observations, or graph items to persist in the "
-                            "artifact (default: 2000, max: 10000). Tool return remains compact."
+                            "artifact (default: 2000, max: 10000). Exact omission "
+                            "counts are persisted; attack_search remaps at a larger "
+                            "limit before downstream work. Tool return remains compact."
                         ),
                         "default": 2000,
                     },
@@ -2062,7 +1949,8 @@ TOOLS = [
                         "type": "string",
                         "description": (
                             "Optional action-space id like as-001 or path to "
-                            "cross-reference callable entrypoints"
+                            "reuse the cumulative source inventory and prefer its "
+                            "mapped facts for matching callable definitions"
                         ),
                     },
                     "protocol_graph": {
@@ -2090,14 +1978,21 @@ TOOLS = [
                             "external_boundary",
                         ],
                         "description": (
-                            "Bias which invariant families lead the response "
-                            "(the artifact always keeps every family)"
+                            "Bias which invariant families are retained first. "
+                            "The artifact records exact total/retained/omitted "
+                            "counts plus a bounded omitted-family/source frontier "
+                            "when max_items cannot retain every candidate."
                         ),
                         "default": "auto",
                     },
                     "max_items": {
                         "type": "integer",
-                        "description": "Maximum modeled items per section (default: 50, max: 200)",
+                        "description": (
+                            "Maximum retained modeled items per section (default: "
+                            "50, max: 200); tracked-state, entrypoint, and "
+                            "candidate-invariant omissions are recorded "
+                            "explicitly, never treated as coverage"
+                        ),
                         "default": 50,
                     },
                     "record_result": {
@@ -2119,9 +2014,11 @@ TOOLS = [
                 "spaces. This records code/proxy/admin probes, source-derived "
                 "entrypoint gates, and whether actions appear public, role-gated, "
                 "signature-gated, cross-domain-gated, dormant, or unknown. "
-                "Profiles are grouped by chain and probed against a per-chain "
-                "endpoint; multi-chain or unbound profiles are reported, never "
-                "guessed. It is generic live context for planning, not a "
+                "Profile network/chain_id bindings are retained on every action "
+                "exposure. Profiles are grouped by chain and probed against a per-chain "
+                "endpoint in explicit cumulative batches; multi-chain, unbound, "
+                "and later profiles are reported rather than guessed or silently "
+                "dropped. It is generic live context for planning, not a "
                 "vulnerability claim."
             ),
             "parameters": {
@@ -2192,8 +2089,29 @@ TOOLS = [
                     },
                     "max_profiles": {
                         "type": "integer",
-                        "description": "Maximum deployed profiles to map (default: 25, max: 100)",
+                        "description": (
+                            "Addressed-profile batch size (default: 25, max: 100). "
+                            "The response's scope_batch supplies the next cursor "
+                            "when more profiles remain."
+                        ),
                         "default": 25,
+                    },
+                    "profile_cursor": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": (
+                            "Zero-based addressed-profile cursor (default: 0). "
+                            "For continuation use exactly scope_batch.next_cursor."
+                        ),
+                        "default": 0,
+                    },
+                    "previous_live_reachability": {
+                        "type": "string",
+                        "description": (
+                            "Required with profile_cursor > 0: the preceding "
+                            "cumulative live-reachability id/path whose "
+                            "scope_batch continues at this cursor."
+                        ),
                     },
                     "response_items": {
                         "type": "integer",
@@ -2249,7 +2167,9 @@ TOOLS = [
                         "items": {"type": "object"},
                         "description": (
                             "Targets to probe. Each item should include address "
-                            "and optional label, contract, kind, or selectors."
+                            "and optional label, contract, kind, selectors, "
+                            "network, or chain_id; equal addresses on distinct "
+                            "chains remain distinct targets."
                         ),
                     },
                     "execute_probes": {
@@ -2319,16 +2239,15 @@ TOOLS = [
         "function": {
             "name": "build_attack_graph",
             "description": (
-                "Build an attack graph from source actions and (optionally) live "
-                "reachability. The graph links actors, contracts, entrypoints, "
-                "gates, dependencies, and value/market/bridge affordances into "
-                "concrete candidate transaction-chain skeletons for experiments. "
-                "mode=reachability_aware needs a live-reachability map; "
-                "mode=source_only builds source-derived skeletons that still need "
-                "live binding; mode=auto picks based on available context. The "
-                "response stays compact (top candidates + frontier summary) while "
-                "the artifact preserves a richer low-score/unlabeled branch "
-                "frontier for novelty discovery."
+                "Build an attack graph from source actions and optional live "
+                "reachability. It links entrypoints, gates, dependencies, and "
+                "value affordances into experiment skeletons, including bounded "
+                "two- or three-action causal paths within one contract or across "
+                "unambiguous direct same-file inheritance. reachability_aware "
+                "requires a live map; source_only keeps live-binding blockers; "
+                "auto chooses from context. The compact response returns top "
+                "candidates; the artifact retains the bounded frontier and "
+                "compatible causal paths omitted by the result cap."
             ),
             "parameters": {
                 "type": "object",
@@ -2341,9 +2260,11 @@ TOOLS = [
                         "type": "string",
                         "enum": ["auto", "reachability_aware", "source_only"],
                         "description": (
-                            "auto (default): reachability-aware when a live map "
-                            "exists, else source-only. reachability_aware: require "
-                            "a live-reachability map. source_only: build "
+                            "auto (default): reachability-aware only when a live "
+                            "map contains deployed context, else source-only. "
+                            "reachability_aware: require a live-reachability "
+                            "artifact; auto selects it only when that artifact "
+                            "contains deployed context. source_only: build "
                             "source-derived skeletons without live context (still "
                             "need live binding before high/critical claims)."
                         ),
@@ -2384,7 +2305,8 @@ TOOLS = [
                         "type": "boolean",
                         "description": (
                             "Write a richer low-score/unlabeled/omitted branch "
-                            "frontier to the artifact for novelty discovery "
+                            "frontier, including compatible capped causal paths, "
+                            "to the artifact for novelty discovery "
                             "(default: true). The response only returns a summary."
                         ),
                         "default": True,
@@ -2393,78 +2315,6 @@ TOOLS = [
                         "type": "integer",
                         "description": "Maximum distinct frontier branches preserved in the artifact (default: 50, max: 250)",
                         "default": 50,
-                    },
-                    "related_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Related campaign artifact ids",
-                    },
-                    "record_result": {
-                        "type": "boolean",
-                        "description": "Whether to add a campaign result artifact",
-                        "default": True,
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "prepare_fork_exploit_workbench",
-            "description": (
-                "Prepare a mechanism-aware fork validation workbench for a selected "
-                "attack graph candidate. The workbench infers vault, lending, or "
-                "AMM/oracle setup, blocker checks, snapshot probes, objective "
-                "templates, and compose_sequence_experiment arguments. It is "
-                "planning scaffolding for executable fork tests, not a finding."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "Short workbench title",
-                    },
-                    "attack_graph": {
-                        "type": "string",
-                        "description": "Attack graph id/path containing the candidate",
-                    },
-                    "candidate_id": {
-                        "type": "string",
-                        "description": "Candidate id, attack key, action key, or title",
-                    },
-                    "mechanism": {
-                        "type": "string",
-                        "description": (
-                            "Optional mechanism override: auto, vault, lending, "
-                            "amm_oracle, bridge, queue_solver, staking, "
-                            "generic_execution, or generic_state_transition. "
-                            "Explicit attack-graph mechanism metadata takes "
-                            "precedence. When nothing matches, auto falls back to "
-                            "generic_state_transition (no vault/share assumptions)."
-                        ),
-                        "default": "auto",
-                    },
-                    "fork_context": {
-                        "type": "string",
-                        "description": "Optional fork-context id/path to merge into the plan",
-                    },
-                    "state_transition_model": {
-                        "type": "string",
-                        "description": (
-                            "Optional state-transition-model artifact id/path. When "
-                            "provided, use matching invariants and experiment prompts "
-                            "to build generic objective and observation templates."
-                        ),
-                    },
-                    "fork_block": {
-                        "description": "Optional fork block to carry into generated fork context",
-                    },
-                    "target_addresses": {
-                        "type": "object",
-                        "description": "Optional target address overrides by contract label",
                     },
                     "related_ids": {
                         "type": "array",
@@ -2531,7 +2381,10 @@ TOOLS = [
                         "description": (
                             "Optional fork-context id like fc-001 or path under "
                             "/workspace/campaign/fork-contexts/. Target addresses "
-                            "from this context are merged into the generated scaffold."
+                            "from this context are merged into the generated scaffold. "
+                            "Required when an attack-graph candidate has missing or "
+                            "ambiguous live-chain metadata; the composer never guesses "
+                            "mainnet from an address alone."
                         ),
                     },
                     "call_sequence": {
@@ -2570,10 +2423,40 @@ TOOLS = [
                             "top ranked candidate is used."
                         ),
                     },
+                    "mechanism": {
+                        "type": "string",
+                        "enum": [
+                            "auto",
+                            "vault",
+                            "lending",
+                            "amm_oracle",
+                            "bridge",
+                            "queue_solver",
+                            "staking",
+                            "generic_execution",
+                            "generic_state_transition",
+                        ],
+                        "description": (
+                            "Optional mechanism override for an attack-graph "
+                            "candidate. The composer embeds setup, blocker, "
+                            "snapshot, and objective guidance directly."
+                        ),
+                        "default": "auto",
+                    },
+                    "state_transition_model": {
+                        "type": "string",
+                        "description": (
+                            "Optional state-transition-model id/path used to "
+                            "enrich an attack-graph sequence with a matching "
+                            "invariant and observation guidance."
+                        ),
+                    },
                     "fork_block": {
                         "description": (
                             "Optional fork block to use when materializing an "
-                            "attack-graph candidate without an explicit fork_context."
+                            "attack-graph candidate without an explicit fork_context. "
+                            "The candidate or its referenced live-reachability profile "
+                            "must still bind one unambiguous chain."
                         ),
                     },
                     "actions": {
@@ -2883,10 +2766,11 @@ TOOLS = [
         "function": {
             "name": "compose_invariant_harness",
             "description": (
-                "Create a Foundry invariant/handler scaffold from a selected "
+                "Advanced manual escape hatch: create a Foundry invariant/handler scaffold from a selected "
                 "action grammar and stated invariant. Use this when a "
                 "hypothesis needs breadth across action orderings, actors, and "
-                "parameters rather than a single hand-written sequence."
+                "parameters rather than a single sequence. The controller does "
+                "not recommend or auto-complete this scaffold."
             ),
             "parameters": {
                 "type": "object",
@@ -3088,8 +2972,9 @@ TOOLS = [
                 "trace, objective evaluation, or economics estimate invalidates "
                 "or weakens an assumption. The LLM supplies the interpretation "
                 "and adjacent hypotheses; this tool links evidence, updates the "
-                "source hypothesis status, and creates next hypothesis and "
-                "experiment-plan artifacts."
+                "source hypothesis status, and creates adjacent hypothesis, "
+                "decision, and open-question artifacts. It never creates a "
+                "placeholder experiment workspace."
             ),
             "parameters": {
                 "type": "object",
@@ -3129,7 +3014,31 @@ TOOLS = [
                     },
                     "mutations": {
                         "type": "array",
-                        "items": {"type": "object"},
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "hypothesis": {"type": "string"},
+                                "rationale": {"type": "string"},
+                                "experiment": {
+                                    "type": "string",
+                                    "description": "Proposed falsification test; planning text, not an experiment artifact.",
+                                },
+                                "hypothesis_card": {
+                                    "type": "object",
+                                    "properties": {
+                                        "attacker_control": {"type": "string"},
+                                        "state_path": {"type": "array", "items": {"type": "string"}},
+                                        "invariant_at_risk": {"type": "string"},
+                                        "impact_sink": {"type": "string"},
+                                        "material_preconditions": {"type": "array", "items": {"type": "string"}},
+                                        "falsifier": {"type": "string"},
+                                        "objective": {"type": "string"},
+                                    },
+                                },
+                            },
+                            "required": ["title", "hypothesis", "rationale", "experiment"],
+                        },
                         "description": (
                             "Adjacent hypotheses selected by the LLM. Each item "
                             "requires title, hypothesis, rationale, and "
@@ -3149,11 +3058,6 @@ TOOLS = [
                     "update_source": {
                         "type": "boolean",
                         "description": "Whether to update the source hypothesis status",
-                        "default": True,
-                    },
-                    "create_experiments": {
-                        "type": "boolean",
-                        "description": "Whether to create campaign experiment-plan artifacts for mutations",
                         "default": True,
                     },
                     "record_decision": {
@@ -3334,7 +3238,12 @@ TOOLS = [
                     },
                     "objective_evaluation": {
                         "type": "string",
-                        "description": "Objective evaluation id or path if used",
+                        "description": (
+                            "Passing eval-NNN id or direct campaign evaluation "
+                            "path. It clears proof-strength caveats only when the "
+                            "artifact, comparison, links, and successful result/"
+                            "experiment lineage validate."
+                        ),
                     },
                     "sequence_minimization": {
                         "type": "string",
@@ -3596,7 +3505,11 @@ TOOLS = [
                     },
                     "objective_evaluation": {
                         "type": "string",
-                        "description": "Objective evaluation id or path if used",
+                        "description": (
+                            "Passing eval-NNN id or direct campaign evaluation "
+                            "path; include its id/path and executed result lineage "
+                            "in campaign_ids/evidence."
+                        ),
                     },
                     "sequence_minimization": {
                         "type": "string",
@@ -3713,8 +3626,9 @@ TOOLS = [
                     "objective_evaluation": {
                         "type": "string",
                         "description": (
-                            "Related objective evaluation id or path, if one "
-                            "was used to quantify impact"
+                            "Passing objective evaluation id or path, if used to "
+                            "quantify impact. The submission gate reloads it and "
+                            "checks comparison, review, and executed-run lineage."
                         ),
                     },
                     "preconditions": {
@@ -4110,6 +4024,18 @@ TOOLS = [
 ]
 
 
+# Model-facing workflow hops retired in favor of attack_search and concrete
+# sequence composition. Keep the names as a regression contract; no schemas or
+# toolset memberships exist for them.
+RETIRED_MODEL_TOOLS = frozenset({
+    "create_experiment",
+    "plan_attack_campaign",
+    "prepare_fork_exploit_workbench",
+    "review_attack_surface_coverage",
+    "review_campaign_progress",
+})
+
+
 TOOLSET_DEFINITIONS: dict[str, tuple[str, ...]] = {
     "core": (
         "inspect_scope",
@@ -4123,10 +4049,8 @@ TOOLSET_DEFINITIONS: dict[str, tuple[str, ...]] = {
         "fetch_url",
         "read_campaign",
         "update_campaign",
-        "review_campaign_progress",
         "build_campaign_brief",
         "attack_search",
-        "plan_attack_campaign",
         REQUEST_TOOLSET_NAME,
     ),
     "map": (
@@ -4136,7 +4060,6 @@ TOOLSET_DEFINITIONS: dict[str, tuple[str, ...]] = {
         "map_live_reachability",
         "inventory_live_targets",
         "build_attack_graph",
-        "review_attack_surface_coverage",
         "record_fork_context",
         "estimate_amm_economics",
         "estimate_flash_loan",
@@ -4150,8 +4073,6 @@ TOOLSET_DEFINITIONS: dict[str, tuple[str, ...]] = {
         "observed_tx_miner",
     ),
     "experiment": (
-        "create_experiment",
-        "prepare_fork_exploit_workbench",
         "compose_sequence_experiment",
         "complete_sequence_experiment",
         "compose_invariant_harness",

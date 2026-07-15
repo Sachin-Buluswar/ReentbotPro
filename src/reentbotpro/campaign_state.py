@@ -61,9 +61,6 @@ _CAMPAIGN_ID_PREFIXES = {
     "mutation": "mut",
     "finding_review": "fr",
     "report_review": "rr",
-    "progress_review": "prg",
-    "coverage_review": "cov",
-    "campaign_plan": "plan",
     "protocol_graph": "pg",
     "campaign_brief": "brief",
     "fuzz_run": "fuzz",
@@ -71,12 +68,21 @@ _CAMPAIGN_ID_PREFIXES = {
     "live_reachability": "lr",
     "live_inventory": "linv",
     "attack_graph": "ag",
-    "fork_workbench": "fw",
     "arg_synthesis": "arg",
     "build_diagnostic": "bdiag",
     "observed_tx": "otx",
     "state_transition_model": "stm",
     "chain_registry": "chainreg",
+}
+
+
+# Read-only recognition for artifacts created before the model-facing workflow
+# consolidation. These prefixes are deliberately absent from allocation above.
+_LEGACY_CAMPAIGN_ID_PREFIXES = {
+    "progress_review": "prg",
+    "coverage_review": "cov",
+    "campaign_plan": "plan",
+    "fork_workbench": "fw",
 }
 
 
@@ -95,16 +101,76 @@ _CAMPAIGN_STATUSES = {
 _CAMPAIGN_PRIORITIES = {"critical", "high", "medium", "low"}
 
 
-_EXPERIMENT_TEMPLATES = {
-    "blank",
-    "foundry_test",
-    "fork_test",
-    "multi_actor",
-    "malicious_token",
-    "fake_oracle",
-    "callback_reentrancy",
-    "accounting_probe",
-}
+_HYPOTHESIS_CARD_FIELDS = (
+    "attacker_control",
+    "state_path",
+    "invariant_at_risk",
+    "impact_sink",
+    "material_preconditions",
+    "falsifier",
+    "objective",
+)
+
+
+_FINDING_REVIEW_DIR = "/workspace/campaign/finding-reviews"
+
+
+def _finding_review_reference_id(value: object) -> str:
+    """Return the canonical id for an exact finding-review reference.
+
+    Review ids and their absolute artifact paths are two spellings of the same
+    identity.  Other paths (including nested paths) and generic campaign text
+    are deliberately not treated as review references.
+    """
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if re.fullmatch(r"fr-\d{3,}", text):
+        return text
+    if not text.startswith("/"):
+        return ""
+    normalized = posixpath.normpath(text)
+    if posixpath.dirname(normalized) != _FINDING_REVIEW_DIR:
+        return ""
+    name = posixpath.basename(normalized)
+    if not name.endswith(".json"):
+        return ""
+    review_id = name[:-5]
+    return review_id if re.fullmatch(r"fr-\d{3,}", review_id) else ""
+
+
+def _normalize_hypothesis_card(value: object) -> dict:
+    if value in (None, {}):
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("hypothesis_card must be an object")
+    card = {}
+    for field in _HYPOTHESIS_CARD_FIELDS:
+        raw = value.get(field)
+        if field in {"state_path", "material_preconditions"}:
+            if raw is None:
+                continue
+            if not isinstance(raw, list):
+                raise ValueError(f"hypothesis_card.{field} must be an array")
+            if any(
+                not isinstance(item, str) or not item.strip()
+                for item in raw
+            ):
+                raise ValueError(
+                    f"hypothesis_card.{field} items must be nonempty strings"
+                )
+            items = [item.strip() for item in raw]
+            if items:
+                card[field] = items[:12]
+            continue
+        if raw is None:
+            continue
+        if not isinstance(raw, str):
+            raise ValueError(f"hypothesis_card.{field} must be a string")
+        text = raw.strip()
+        if text:
+            card[field] = text
+    return card
 
 
 _EXPERIMENT_RUN_KINDS = {
@@ -233,8 +299,23 @@ _COVERAGE_EVIDENCE_PREFIXES = (
 _COVERAGE_META_EVIDENCE_PREFIXES = (
     "/workspace/campaign/protocol-graphs/",
     "/workspace/campaign/action-spaces/",
+    "/workspace/campaign/attack-graphs/",
+    "/workspace/campaign/attack-search/",
+    "/workspace/campaign/branch-dossiers/",
+    "/workspace/campaign/state-transition-models/",
+    "/workspace/campaign/source-slices/",
+    "/workspace/campaign/fork-contexts/",
+    "/workspace/campaign/live-reachability/",
+    "/workspace/campaign/live-inventory/",
+    "/workspace/campaign/finding-reviews/",
+    "/workspace/campaign/report-reviews/",
+    "/workspace/campaign/brief.json",
+    "/workspace/campaign/brief.md",
+    # Legacy planning artifacts remain readable for state migration, but they
+    # never establish action coverage and are not worth loading on every sync.
     "/workspace/campaign/coverage-reviews/",
     "/workspace/campaign/progress-reviews/",
+    "/workspace/campaign/fork-workbenches/",
 )
 
 
@@ -379,10 +460,26 @@ async def _update_campaign(container: AuditContainer, args: dict) -> str:
     now = datetime.now(timezone.utc).isoformat()
     evidence = args.get("evidence") or []
     related_ids = args.get("related_ids") or []
+    action_keys = args.get("action_keys")
+    coverage_keys = args.get("coverage_keys")
     if not isinstance(evidence, list):
+        return "Error: evidence must be a list of strings"
+    if any(not isinstance(item, str) for item in evidence):
         return "Error: evidence must be a list of strings"
     if not isinstance(related_ids, list):
         return "Error: related_ids must be a list of strings"
+    if action_keys is not None and not isinstance(action_keys, list):
+        return "Error: action_keys must be a list of strings"
+    if coverage_keys is not None and not isinstance(coverage_keys, list):
+        return "Error: coverage_keys must be a list of strings"
+    if isinstance(action_keys, list) and any(
+        not isinstance(item, str) for item in action_keys
+    ):
+        return "Error: action_keys must be a list of strings"
+    if isinstance(coverage_keys, list) and any(
+        not isinstance(item, str) for item in coverage_keys
+    ):
+        return "Error: coverage_keys must be a list of strings"
     status = args.get("status", "open")
     if status not in _CAMPAIGN_STATUSES:
         return f"Error: unknown campaign status '{status}'"
@@ -390,15 +487,34 @@ async def _update_campaign(container: AuditContainer, args: dict) -> str:
     if priority is not None and priority not in _CAMPAIGN_PRIORITIES:
         return f"Error: unknown campaign priority '{priority}'"
 
+    try:
+        hypothesis_card = (
+            _normalize_hypothesis_card(args.get("hypothesis_card"))
+            if section == "hypothesis" and "hypothesis_card" in args
+            else None
+        )
+    except ValueError as exc:
+        return f"Error: {exc}"
+
     payload = {
         "title": title,
         "content": content,
         "status": status,
         "priority": priority,
-        "evidence": [str(item) for item in evidence],
+        "evidence": [item.strip() for item in evidence if item.strip()],
         "related_ids": [str(item) for item in related_ids],
         "updated_at": now,
     }
+    if hypothesis_card is not None:
+        payload["hypothesis_card"] = hypothesis_card
+    if action_keys is not None:
+        payload["action_keys"] = [
+            str(item).strip() for item in action_keys if str(item).strip()
+        ]
+    if coverage_keys is not None:
+        payload["coverage_keys"] = [
+            str(item).strip() for item in coverage_keys if str(item).strip()
+        ]
 
     if action == "add":
         artifact_id = _next_campaign_id(state, section)
@@ -490,9 +606,11 @@ async def _load_campaign_json_if_exists(
 
 def _progress_evidence_paths(state: dict, prefix: str) -> list[str]:
     paths = []
+    seen = set()
     for entry in state["sections"].get("result", []):
         for evidence in _entry_evidence(entry):
-            if evidence.startswith(prefix) and evidence not in paths:
+            if evidence.startswith(prefix) and evidence not in seen:
+                seen.add(evidence)
                 paths.append(evidence)
     return paths
 
@@ -535,12 +653,23 @@ async def _progress_ready_reviews(
         payload = await _load_campaign_json_if_exists(container, path)
         if not payload or not payload.get("ready"):
             continue
+        candidate = payload.get("candidate") or {}
+        if not isinstance(candidate, dict):
+            candidate = {}
         reviews.append({
             "id": payload.get("id"),
             "kind": kind,
             "title": payload.get("title"),
             "severity": payload.get("severity"),
             "path": path,
+            "campaign_ids": [
+                str(item)
+                for item in candidate.get("campaign_ids") or []
+                if str(item).strip()
+            ],
+            "evidence_review_id": _finding_review_reference_id(
+                candidate.get("evidence_review")
+            ),
         })
     return reviews
 
@@ -609,121 +738,6 @@ async def _progress_blocked_reviews(
     return reviews
 
 
-async def _progress_action_spaces_without_coverage(
-    container: AuditContainer,
-    state: dict,
-) -> list[dict]:
-    action_space_paths = _progress_evidence_paths(
-        state,
-        "/workspace/campaign/action-spaces/",
-    )
-    covered_action_spaces = set()
-    for result in state["sections"].get("result", []):
-        evidence = _entry_evidence(result)
-        if not any(
-            path.startswith("/workspace/campaign/coverage-reviews/")
-            for path in evidence
-        ):
-            continue
-        covered_action_spaces.update(
-            path for path in evidence
-            if path.startswith("/workspace/campaign/action-spaces/")
-        )
-
-    missing = []
-    for path in action_space_paths:
-        if path in covered_action_spaces:
-            continue
-        payload = await _load_campaign_json_if_exists(container, path)
-        missing.append({
-            "id": (payload or {}).get("id"),
-            "path": path,
-            "summary": (payload or {}).get("summary") or {},
-            "suggested_action": "call review_attack_surface_coverage before choosing the next action grammar",
-        })
-    return missing
-
-
-def _coverage_gap_action_key(item: dict) -> str:
-    key = str(item.get("key") or "").strip()
-    if key:
-        return key
-    contract = str(item.get("contract") or "").strip()
-    function = str(item.get("function") or "").strip()
-    return f"{contract}::{function}" if contract else function
-
-
-def _coverage_gap_priority_score(item: dict) -> int:
-    try:
-        score = int(item.get("attention_score", 0) or 0)
-    except (TypeError, ValueError):
-        score = 0
-    affordances = {str(label) for label in item.get("affordances") or []}
-    if affordances.intersection({
-        "value_out_or_burn",
-        "credit_or_liquidation",
-        "valuation_dependency",
-        "market_or_router",
-        "callback_or_flashloan_surface",
-        "cross_domain_or_message",
-        "signed_authorization",
-        "generic_execution",
-        "delegatecall",
-    }):
-        score += 8
-    if affordances.intersection({"value_in_or_mint", "accepts_native_value"}):
-        score += 2
-    if affordances.intersection({"observation"}):
-        score -= 2
-    return score
-
-
-def _compact_coverage_gap(item: dict) -> dict:
-    return {
-        "key": _coverage_gap_action_key(item),
-        "contract": item.get("contract"),
-        "function": item.get("function"),
-        "file": item.get("file"),
-        "line": item.get("line"),
-        "attention_score": item.get("attention_score"),
-        "priority_score": _coverage_gap_priority_score(item),
-        "affordances": item.get("affordances") or [],
-        "modifiers": item.get("modifiers") or [],
-        "parameters": item.get("parameters") or [],
-    }
-
-
-async def _progress_campaign_plans(
-    container: AuditContainer,
-    state: dict,
-) -> list[dict]:
-    plans = []
-    for path in _progress_evidence_paths(
-        state,
-        "/workspace/campaign/plans/",
-    ):
-        payload = await _load_campaign_json_if_exists(container, path)
-        if not payload:
-            continue
-        branches = payload.get("branches") or []
-        plans.append({
-            "id": payload.get("id"),
-            "title": payload.get("title"),
-            "path": path,
-            "summary": payload.get("summary") or {},
-            "top_branch": branches[0] if branches else None,
-            "candidate_next_steps": (
-                payload.get("candidate_next_steps")
-                or payload.get("next_actions")
-                or []
-            ),
-            "created_at": payload.get("created_at"),
-        })
-    return sorted(
-        plans,
-        key=lambda item: str(item.get("created_at") or ""),
-        reverse=True,
-    )
 
 
 async def _progress_candidate_fuzz_runs(
@@ -833,105 +847,46 @@ def _progress_missing_foundation(state: dict) -> list[dict]:
     return missing
 
 
-_HYPOTHESIS_ACTOR_TERMS = {
-    "attacker",
-    "unprivileged",
-    "caller",
-    "user",
-    "depositor",
-    "borrower",
-    "holder",
-    "keeper",
-    "liquidator",
-    "receiver",
-    "anyone",
-}
-
-_HYPOTHESIS_ACTION_TERMS = {
-    "::",
-    ".sol",
-    "function",
-    "call",
-    "deposit",
-    "withdraw",
-    "redeem",
-    "mint",
-    "burn",
-    "transfer",
-    "swap",
-    "borrow",
-    "repay",
-    "liquidate",
-    "claim",
-    "execute",
-    "callback",
-}
-
-_HYPOTHESIS_IMPACT_TERMS = {
-    "asset",
-    "balance",
-    "fund",
-    "loss",
-    "profit",
-    "solvency",
-    "invariant",
-    "accounting",
-    "unauthorized",
-    "share",
-    "debt",
-    "collateral",
-    "lock",
-    "drain",
-    "value",
-}
-
-_HYPOTHESIS_SETUP_TERMS = {
-    "if ",
-    "when ",
-    "precondition",
-    "setup",
-    "before",
-    "after",
-    "objective",
-    "measure",
-    "fork",
-    "deployed",
-    "chain",
-    "address",
-    "source",
-    "line",
-}
-
-
-def _text_contains_any(text: str, terms: set[str]) -> bool:
-    return any(term in text for term in terms)
 
 
 def _hypothesis_experiment_readiness(hypothesis: dict) -> dict:
-    text = re.sub(
-        r"\s+",
-        " ",
-        "\n".join([
-            str(hypothesis.get("title") or ""),
-            str(hypothesis.get("content") or ""),
-            " ".join(str(item) for item in hypothesis.get("evidence") or []),
-        ]),
-    ).lower()
-    evidence = [str(item) for item in hypothesis.get("evidence") or [] if item]
-    missing: list[str] = []
-    if not _text_contains_any(text, _HYPOTHESIS_ACTOR_TERMS):
-        missing.append("attacker-controlled actor or lever")
-    if not _text_contains_any(text, _HYPOTHESIS_ACTION_TERMS):
-        missing.append("target contract/function/action")
-    if not _text_contains_any(text, _HYPOTHESIS_IMPACT_TERMS):
-        missing.append("value/right/invariant at risk")
-    if not _text_contains_any(text, _HYPOTHESIS_SETUP_TERMS):
-        missing.append("setup, precondition, or measurable objective")
+    invalid_card = ""
+    try:
+        card = _normalize_hypothesis_card(hypothesis.get("hypothesis_card"))
+    except ValueError as exc:
+        # Old or hand-edited campaign state is durable input. Treat malformed
+        # cards as context work instead of crashing the authoritative sync.
+        card = {}
+        invalid_card = str(exc)
+    raw_evidence = hypothesis.get("evidence")
+    evidence = (
+        [
+            item.strip()
+            for item in raw_evidence
+            if isinstance(item, str) and item.strip()
+        ]
+        if isinstance(raw_evidence, list)
+        else []
+    )
+    labels = {
+        "attacker_control": "hypothesis_card.attacker_control",
+        "state_path": "hypothesis_card.state_path",
+        "invariant_at_risk": "hypothesis_card.invariant_at_risk",
+        "impact_sink": "hypothesis_card.impact_sink",
+        "material_preconditions": "hypothesis_card.material_preconditions",
+        "falsifier": "hypothesis_card.falsifier",
+        "objective": "hypothesis_card.objective",
+    }
+    missing = [labels[field] for field in _HYPOTHESIS_CARD_FIELDS if not card.get(field)]
+    if invalid_card:
+        missing.insert(0, invalid_card)
     if not evidence:
         missing.append("source, deployment, or probe evidence")
     return {
         "ready": not missing,
         "missing": missing,
+        "hypothesis_card": card,
+        "invalid_card": invalid_card or None,
     }
 
 
@@ -941,18 +896,19 @@ def _progress_hypotheses_without_experiments(state: dict) -> list[dict]:
         if hypothesis.get("status", "open") not in {"open", "testing", "inconclusive"}:
             continue
         hypothesis_id = str(hypothesis.get("id") or "")
-        experiments = _entries_referencing(state, "experiment", hypothesis_id)
-        results = _entries_referencing(state, "result", hypothesis_id)
-        mutations = [
-            item for item in _entry_related_ids(hypothesis)
-            if item.startswith("mut-")
+        experiments = [
+            entry
+            for entry in _entries_referencing(state, "experiment", hypothesis_id)
+            if not entry.get("manual_only")
+            and "Template: fork_workbench" not in str(entry.get("content") or "")
         ]
-        if experiments or results or mutations:
+        results = _entries_referencing(state, "result", hypothesis_id)
+        if experiments or results or hypothesis.get("mutation_children"):
             continue
         readiness = _hypothesis_experiment_readiness(hypothesis)
         if readiness["ready"]:
             suggested_action = (
-                "compose a sequence/invariant experiment or reject the branch "
+                "compose a sequence experiment or reject the branch "
                 "with a decision"
             )
         else:
@@ -1012,35 +968,6 @@ async def _progress_blocked_results(
     return items
 
 
-def _progress_next_actions(review: dict) -> list[str]:
-    actions = []
-    if review["missing_foundation"]:
-        actions.append("Record missing protocol model, value flow/trust-boundary, and invariant/open-question artifacts.")
-    if review["action_spaces_without_coverage"]:
-        actions.append("Review mapped action spaces for under-tested protocol levers with review_attack_surface_coverage.")
-    if review["coverage_high_attention_gaps"]:
-        actions.append("Source-review high-attention coverage gaps; record a concrete hypothesis, open question, parking decision, or rejection.")
-    if review["hypotheses_without_experiments"]:
-        actions.append("Concretize open hypotheses with actor/target/action/objective/evidence before harness work, or reject them explicitly.")
-    if review["experiments_without_results"]:
-        actions.append("Complete non-runnable scaffolds, then run open experiments with run_experiment or mark them blocked with evidence.")
-    if review["failed_evaluations"]:
-        actions.append("Use failed objective evaluations to mutate hypotheses or record rejection decisions.")
-    if review.get("sequence_minimizations_without_review"):
-        actions.append("Promote preserved sequence minimizations into finding evidence reviews or mutate/reject them.")
-    if review.get("candidate_fuzz_failures"):
-        actions.append("Reduce candidate fuzz/invariant failures into trace, sequence, snapshot, and objective evidence.")
-    if review["blocked_results_without_decisions"]:
-        actions.append("Resolve blocked/inconclusive results with decisions or hypothesis mutations.")
-    if review["ready_report_reviews"]:
-        actions.append("Submit ready report-reviewed findings with submit_finding if still in scope.")
-    elif review["ready_finding_reviews"]:
-        actions.append("Run review_report_quality for ready evidence reviews before submit_finding.")
-    if review.get("latest_campaign_plans") and not actions:
-        actions.append("Execute the top branch from the latest campaign plan or refresh the plan if campaign state changed.")
-    if not actions:
-        actions.append("Call plan_attack_campaign or continue mapping the highest-value protocol surfaces; no major process gaps detected.")
-    return actions
 
 
 def _brief_text(value: object, *, max_chars: int = 220) -> str:
@@ -1137,59 +1064,6 @@ async def _brief_latest_artifacts(
     return artifacts[:max_items]
 
 
-def _brief_suggest_next(brief: dict) -> dict:
-    active = brief.get("active_work") or {}
-    ready = brief.get("ready_to_submit") or {}
-    latest = brief.get("latest_artifacts") or {}
-
-    if ready.get("report_reviews"):
-        tool = "submit_finding"
-        rationale = "A report-quality review is marked ready."
-    elif ready.get("finding_reviews"):
-        tool = "review_report_quality"
-        rationale = "Evidence review is ready, but final report quality has not been checked."
-    elif active.get("sequence_minimizations_without_review"):
-        tool = "review_finding_evidence"
-        rationale = "A preserved minimized replay exists without a linked evidence review."
-    elif active.get("failed_evaluations"):
-        tool = "mutate_hypothesis"
-        rationale = "At least one objective evaluation failed or did not match expectations."
-    elif active.get("candidate_fuzz_failures"):
-        tool = "summarize_trace or extract_call_sequence"
-        rationale = "A fuzz or invariant run produced a candidate failure that needs reduction into objective evidence."
-    elif active.get("experiments_without_results"):
-        tool = "run_experiment"
-        rationale = "There are open experiments without linked results."
-    elif active.get("blocked_results_without_decisions"):
-        tool = "mutate_hypothesis or update_campaign decision"
-        rationale = "Blocked or inconclusive results need an explicit interpretation."
-    elif active.get("coverage_high_attention_gaps"):
-        tool = "source_slice then update_campaign or attack_search decision"
-        rationale = "Coverage review found high-attention gaps that need source/context review before hypotheses or tests."
-    elif active.get("hypotheses_without_experiments"):
-        tool = "source_slice, record_fork_context, update_campaign, or compose when experiment-ready"
-        rationale = "Open hypotheses need actor, target/action, objective, and evidence before harness work."
-    elif active.get("action_spaces_without_coverage"):
-        tool = "review_attack_surface_coverage"
-        rationale = "Mapped action spaces have not been compared with current evidence."
-    elif active.get("missing_foundation"):
-        tool = "update_campaign"
-        rationale = "Campaign foundation is incomplete."
-    elif not latest.get("plans"):
-        tool = "plan_attack_campaign"
-        rationale = "No current campaign plan is recorded."
-    else:
-        tool = "plan_attack_campaign"
-        rationale = "Refresh the plan or execute the latest top branch if state has not changed."
-
-    next_actions = list(brief.get("progress_next_actions") or [])
-    if not next_actions:
-        next_actions = [f"Use {tool}: {rationale}"]
-    return {
-        "tool": tool,
-        "rationale": rationale,
-        "next_actions": next_actions[:5],
-    }
 
 
 def _brief_markdown(brief: dict) -> str:
@@ -1209,79 +1083,44 @@ def _brief_markdown(brief: dict) -> str:
     suggestion = brief.get("suggested_next") or {}
     lines.extend([
         "",
-        "## Suggested Next",
-        "- Advisory only: attack_search is authoritative for the required "
-        "next_action and branch transitions; sync it before acting.",
-        f"- Tool: `{suggestion.get('tool', 'plan_attack_campaign')}`",
-        f"- Rationale: {suggestion.get('rationale', '')}",
+        "## Controller Next Action",
+        "- Exact projection: attack_search is authoritative for this next_action "
+        "and all branch transitions.",
+        f"- Status: `{suggestion.get('status', 'unknown')}`",
+        f"- Tool: `{suggestion.get('tool') or 'none'}`",
+        f"- Instructions: {suggestion.get('instructions', '')}",
     ])
-    for action in suggestion.get("next_actions") or []:
-        lines.append(f"- {action}")
-
-    latest = brief.get("latest_artifacts") or {}
-    latest_plan = (latest.get("plans") or [None])[0]
-    if latest_plan:
-        lines.extend(["", "## Latest Plan"])
-        lines.append(
-            f"- {latest_plan.get('id')}: {latest_plan.get('title')} "
-            f"({latest_plan.get('path')})"
-        )
-        top_branch = latest_plan.get("top_branch")
-        if top_branch:
-            lines.append(
-                f"- Top branch: {top_branch.get('id')} "
-                f"{top_branch.get('title')} "
-                f"[{top_branch.get('recommended_next_tool')}]"
-            )
-            blockers = top_branch.get("blockers") or []
-            if blockers:
-                lines.append(f"- Blockers: {'; '.join(blockers)}")
 
     active = brief.get("active_work") or {}
     lines.extend(["", "## Open Work"])
-    for key in (
-        "missing_foundation",
-        "coverage_high_attention_gaps",
-        "hypotheses_without_experiments",
-        "experiments_without_results",
-        "failed_evaluations",
-        "sequence_minimizations_without_review",
-        "candidate_fuzz_failures",
-        "blocked_results_without_decisions",
-    ):
-        items = active.get(key) or []
-        lines.append(f"- {key}: {len(items)}")
-        for item in items[:3]:
-            label = item.get("title") or item.get("id") or item.get("path")
-            detail = item.get("suggested_action") or item.get("path") or ""
-            lines.append(f"  - {label}: {_brief_text(detail, max_chars=120)}")
-
+    controller_branches = active.get("attack_search_branches") or []
+    lines.append(f"- attack_search_branches: {len(controller_branches)}")
+    for item in controller_branches[:5]:
+        lines.append(
+            f"  - {item.get('id')}: {item.get('title')} "
+            f"[{item.get('status')}; {item.get('next_tool')}]"
+        )
+    latest = brief.get("latest_artifacts") or {}
     lines.extend(["", "## Latest Context"])
     for key in (
         "protocol_graphs",
         "action_spaces",
-        "coverage_reviews",
-        "progress_reviews",
+        "state_transition_models",
+        "live_reachability",
+        "live_inventory",
+        "attack_graphs",
         "fuzz_runs",
         "sequence_minimizations",
         "fork_contexts",
         "economics",
+        "finding_reviews",
+        "report_reviews",
     ):
         items = latest.get(key) or []
         lines.append(f"- {key}: {len(items)}")
         for item in items[:2]:
             label = item.get("title") or item.get("id") or item.get("path")
             lines.append(f"  - {label} ({item.get('path')})")
-
-    ready = brief.get("ready_to_submit") or {}
-    if ready.get("finding_reviews") or ready.get("report_reviews"):
-        lines.extend(["", "## Submission Readiness"])
-        for key in ("finding_reviews", "report_reviews"):
-            for item in ready.get(key) or []:
-                lines.append(
-                    f"- {key}: {item.get('id')} {item.get('title')} "
-                    f"({item.get('path')})"
-                )
 
     foundations = brief.get("foundations") or {}
     if any(foundations.values()):

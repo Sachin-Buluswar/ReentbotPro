@@ -15,6 +15,8 @@ from reentbotpro.llm import (
     OAUTH_REDIRECT_URI,
     OAUTH_SCOPE,
     ResponsesLLMClient,
+    _API_MODEL_SETTINGS,
+    _CODEX_MODEL_SETTINGS,
     estimate_responses_request_tokens,
     get_model_settings,
     resolve_reasoning_effort,
@@ -338,23 +340,36 @@ class ResponsesAdapterTests(unittest.TestCase):
 
 
 class ModelSettingsTests(unittest.TestCase):
-    def test_default_model_is_gpt_55(self):
-        self.assertEqual(DEFAULT_MODEL, "gpt-5.5")
+    def test_default_model_is_gpt_56_sol(self):
+        self.assertEqual(DEFAULT_MODEL, "gpt-5.6-sol")
         self.assertEqual(get_model_settings(None).context_window, 1_050_000)
         self.assertEqual(
             get_model_settings(None).reasoning_efforts,
-            ("low", "medium", "high", "xhigh"),
+            ("none", "low", "medium", "high", "xhigh", "max"),
         )
 
-    def test_api_model_context_windows_are_resolved(self):
-        self.assertEqual(get_model_settings("gpt-5.5").context_window, 1_050_000)
-        self.assertEqual(get_model_settings("gpt-5.4").context_window, 1_050_000)
+    def test_api_openai_registry_contains_only_requested_models(self):
         self.assertEqual(
-            get_model_settings("gpt-5.4-2026-03-05").context_window,
-            1_050_000,
+            {name for name in _API_MODEL_SETTINGS if name.startswith("gpt-")},
+            {
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.3-codex-spark",
+            },
         )
-        self.assertEqual(get_model_settings("gpt-5.4-mini").context_window, 400_000)
-        self.assertEqual(get_model_settings("gpt-5.4-nano").context_window, 400_000)
+
+    def test_api_gpt_56_family_settings_are_resolved(self):
+        expected_efforts = ("none", "low", "medium", "high", "xhigh", "max")
+        for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            with self.subTest(model=model):
+                settings = get_model_settings(model)
+                self.assertEqual(settings.context_window, 1_050_000)
+                self.assertEqual(settings.max_output_tokens, 128_000)
+                self.assertEqual(settings.reasoning_efforts, expected_efforts)
+                self.assertEqual(settings.default_reasoning, "xhigh")
+
+    def test_api_gpt_53_codex_spark_is_retained(self):
         self.assertEqual(
             get_model_settings("gpt-5.3-codex-spark").context_window,
             128_000,
@@ -382,13 +397,19 @@ class ModelSettingsTests(unittest.TestCase):
             get_model_settings("qwen/qwen3.7-max").context_window, 1_000_000
         )
         self.assertEqual(
-            get_model_settings("tencent/hy3-preview").context_window, 262_144
-        )
-        self.assertEqual(
-            get_model_settings("nex-agi/nex-n2-pro:free").context_window, 262_144
-        )
-        self.assertEqual(
             get_model_settings("moonshotai/kimi-k2.7-code").context_window, 262_144
+        )
+
+    def test_removed_openrouter_models_use_conservative_fallback(self):
+        self.assertNotIn("tencent/hy3-preview", _API_MODEL_SETTINGS)
+        self.assertNotIn("nex-agi/nex-n2-pro:free", _API_MODEL_SETTINGS)
+        self.assertEqual(
+            get_model_settings("tencent/hy3-preview").context_window,
+            128_000,
+        )
+        self.assertEqual(
+            get_model_settings("nex-agi/nex-n2-pro:free").context_window,
+            128_000,
         )
 
     def test_openrouter_mimo_pro_does_not_match_bare_id(self):
@@ -420,13 +441,14 @@ class ModelSettingsTests(unittest.TestCase):
 
     def test_openrouter_openai_prefix_resolves_to_bare_model(self):
         self.assertEqual(
-            get_model_settings("openai/gpt-5.4").context_window, 1_050_000
+            get_model_settings("openai/gpt-5.6-sol").context_window, 1_050_000
         )
+
+    def test_gpt_56_alias_resolves_to_sol_for_both_providers(self):
+        self.assertEqual(get_model_settings("gpt-5.6"), get_model_settings("gpt-5.6-sol"))
         self.assertEqual(
-            get_model_settings("openai/gpt-5.5").context_window, 1_050_000
-        )
-        self.assertEqual(
-            get_model_settings("openai/gpt-5.4-mini").context_window, 400_000
+            get_model_settings("gpt-5.6", provider_name=OPENAI_CODEX_PROVIDER),
+            get_model_settings("gpt-5.6-sol", provider_name=OPENAI_CODEX_PROVIDER),
         )
 
     def test_unknown_model_uses_conservative_fallback(self):
@@ -441,25 +463,21 @@ class ModelSettingsTests(unittest.TestCase):
         provider = OPENAI_CODEX_PROVIDER
 
         self.assertEqual(
-            get_model_settings("gpt-5.5", provider_name=provider).context_window,
-            272_000,
+            set(_CODEX_MODEL_SETTINGS),
+            {
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.3-codex-spark",
+            },
         )
-        self.assertEqual(
-            get_model_settings("gpt-5.2", provider_name=provider).context_window,
-            272_000,
-        )
-        self.assertEqual(
-            get_model_settings("gpt-5.4", provider_name=provider).context_window,
-            1_000_000,
-        )
-        self.assertEqual(
-            get_model_settings("gpt-5.4-mini", provider_name=provider).context_window,
-            272_000,
-        )
-        self.assertEqual(
-            get_model_settings("gpt-5.3-codex", provider_name=provider).context_window,
-            272_000,
-        )
+        expected_efforts = ("low", "medium", "high", "xhigh", "max")
+        for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            with self.subTest(model=model):
+                settings = get_model_settings(model, provider_name=provider)
+                self.assertEqual(settings.context_window, 272_000)
+                self.assertEqual(settings.reasoning_efforts, expected_efforts)
+                self.assertEqual(settings.default_reasoning, "xhigh")
         self.assertEqual(
             get_model_settings(
                 "gpt-5.3-codex-spark",
@@ -470,30 +488,54 @@ class ModelSettingsTests(unittest.TestCase):
 
     def test_api_provider_is_default_for_backwards_compatibility(self):
         self.assertEqual(
-            get_model_settings("gpt-5.5", provider_name=OPENAI_API_PROVIDER).context_window,
-            get_model_settings("gpt-5.5").context_window,
+            get_model_settings(
+                "gpt-5.6-sol",
+                provider_name=OPENAI_API_PROVIDER,
+            ).context_window,
+            get_model_settings("gpt-5.6-sol").context_window,
         )
 
     def test_default_reasoning_prefers_xhigh_when_supported(self):
-        self.assertEqual(get_model_settings("gpt-5.4").default_reasoning, "xhigh")
+        self.assertEqual(
+            get_model_settings("gpt-5.6-sol").default_reasoning,
+            "xhigh",
+        )
         self.assertEqual(
             get_model_settings(
-                "gpt-5.4",
+                "gpt-5.6-sol",
                 provider_name=OPENAI_CODEX_PROVIDER,
             ).default_reasoning,
             "xhigh",
         )
-        self.assertEqual(get_model_settings("gpt-5.1").default_reasoning, "high")
 
     def test_reasoning_effort_is_adjusted_for_selected_model(self):
-        pro = resolve_reasoning_effort("gpt-5.4-pro", "none")
-        self.assertEqual(pro.display_effort, "medium")
-        self.assertEqual(pro.api_effort, "medium")
-        self.assertIsNotNone(pro.note)
+        api_none = resolve_reasoning_effort("gpt-5.6-sol", "none")
+        self.assertEqual(api_none.display_effort, "none")
+        self.assertEqual(api_none.api_effort, "none")
 
-        legacy = resolve_reasoning_effort("gpt-5", "xhigh")
-        self.assertEqual(legacy.display_effort, "high")
-        self.assertEqual(legacy.api_effort, "high")
+        api_max = resolve_reasoning_effort("gpt-5.6-sol", "max")
+        self.assertEqual(api_max.display_effort, "max")
+        self.assertEqual(api_max.api_effort, "max")
+
+        codex_none = resolve_reasoning_effort(
+            "gpt-5.6-sol",
+            "none",
+            provider_name=OPENAI_CODEX_PROVIDER,
+        )
+        self.assertEqual(codex_none.display_effort, "low")
+        self.assertEqual(codex_none.api_effort, "low")
+        self.assertIsNotNone(codex_none.note)
+
+        spark_max = resolve_reasoning_effort("gpt-5.3-codex-spark", "max")
+        self.assertEqual(spark_max.display_effort, "xhigh")
+        self.assertEqual(spark_max.api_effort, "xhigh")
+
+    def test_unknown_reasoning_effort_falls_back_to_model_default(self):
+        resolved = resolve_reasoning_effort("gpt-5.6-sol", "xhihg")
+
+        self.assertEqual(resolved.display_effort, "xhigh")
+        self.assertEqual(resolved.api_effort, "xhigh")
+        self.assertIn("does not support reasoning effort 'xhihg'", resolved.note)
 
 
 if __name__ == "__main__":

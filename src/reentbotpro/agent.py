@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import posixpath
 import re
 import shlex
 import signal
@@ -22,6 +23,8 @@ from reentbotpro.tools import (
     REQUESTABLE_TOOLSETS,
     TOOL_BY_NAME,
     TOOLS,
+    _command_path_overrides_are_safe,
+    _diagnostic_command_is_safe,
     execute_tool,
     expand_toolsets,
     tools_for_toolsets,
@@ -52,7 +55,7 @@ def _tools_token_overhead(tools: list[dict] | None = None) -> int:
 
 _TOOLS_TOKEN_OVERHEAD = _tools_token_overhead(TOOLS)
 
-# Hard ceiling per API call. GPT-5.4 supports up to 128k output tokens.
+# Hard ceiling per API call. The default GPT-5.6 profile supports 128k output.
 _MAX_OUTPUT_TOKENS = 128_000
 _CONTEXT_RETRY_FACTORS = (0.70, 0.50, 0.30)
 _RECENT_FULL_TOOL_TURNS = 3
@@ -72,26 +75,17 @@ _APPEND_ONLY_BUDGET_FRACTION = 0.7
 _MIN_AUDIT_TURNS = 10000
 _CAMPAIGN_STATE_REQUIRED_BY_TURN = 5
 _ATTACK_SEARCH_REQUIRED_BY_TURN = 3
-_CAMPAIGN_STATE_PATH = "/workspace/campaign/state.json"
 _ATTACK_SEARCH_CURRENT_PATH = "/workspace/campaign/attack-search/current.json"
-_PROGRESS_REVIEW_DIR = "/workspace/campaign/progress-reviews"
-_ATTACK_SEARCH_TERMINAL_STATUSES = {"validated", "rejected", "superseded"}
-_STOP_BLOCKING_STATUSES = {
-    "ready_to_submit",
-    "needs_report_review",
-    "needs_finding_review",
-    "needs_evidence",
-    "needs_reduction",
-    "needs_concretization",
-    "needs_run",
-    "running",
-}
-_STOP_LIVE_BRANCH_STATUSES = {"needs_inventory", "needs_harness", "blocked_revert"}
-_STOP_READY_PROGRESS_KEYS = (
-    "ready_report_reviews",
-    "ready_finding_reviews",
-    "sequence_minimizations_without_review",
-    "candidate_fuzz_failures",
+_FINAL_READINESS_NUDGE = (
+    "Before stopping, call attack_search with action=sync. Treat that fresh "
+    "controller result as authoritative: stopping is allowed only when "
+    "next_action is branchless campaign_ready and every branch is terminal or "
+    "ordinarily parked without an integrity-limit readiness blocker. Any "
+    "nonterminal, nonparked branch—and any controller-derived parked integrity "
+    "limit that explicitly blocks readiness—blocks stopping, "
+    "regardless of its score, taxonomy, or estimated economic significance. "
+    "Follow the returned next action, submit any ready finding, or record an "
+    "explicit evidence-backed decision or parking reason before trying to stop."
 )
 
 _CAMPAIGN_SUMMARY_COUNTERS = (
@@ -99,10 +93,7 @@ _CAMPAIGN_SUMMARY_COUNTERS = (
     ("campaign_updates", "Campaign artifacts recorded"),
     ("action_spaces_mapped", "Action-space maps built"),
     ("protocol_graphs", "Protocol graphs built"),
-    ("progress_reviews", "Campaign progress reviews recorded"),
     ("campaign_briefs", "Campaign resume briefs recorded"),
-    ("coverage_reviews", "Attack-surface coverage reviews recorded"),
-    ("campaign_plans", "Attack campaign plans recorded"),
     ("attack_search_runs", "Attack-search controller syncs"),
     ("sequence_experiments", "Sequence experiments composed"),
     ("sequence_completions", "Sequence experiments completed"),
@@ -125,19 +116,9 @@ _CAMPAIGN_SUMMARY_COUNTERS = (
 _CAMPAIGN_TOOL_TRACKING = {
     "read_campaign": (("campaign_reads",), ()),
     "update_campaign": (("campaign_updates",), ()),
-    "review_campaign_progress": (("campaign_updates", "progress_reviews"), ("result",)),
     "build_campaign_brief": (("campaign_updates", "campaign_briefs"), ("result",)),
     "attack_search": (("campaign_updates", "attack_search_runs"), ("result",)),
     "map_protocol_graph": (("campaign_updates", "protocol_graphs"), ("result",)),
-    "review_attack_surface_coverage": (
-        ("campaign_updates", "coverage_reviews"),
-        ("result",),
-    ),
-    "plan_attack_campaign": (("campaign_updates", "campaign_plans"), ("result",)),
-    "create_experiment": (
-        ("campaign_updates", "experiments_created"),
-        ("experiment",),
-    ),
     "run_experiment": (("campaign_updates", "experiments_run"), ("result",)),
     "run_sequence_minimization": (
         ("campaign_updates", "experiments_run", "sequence_minimizations"),
@@ -251,13 +232,14 @@ def _turn_history_budget(
     context_window: int | None,
     visible_tools: list[dict],
     max_context_is_user_cap: bool,
+    output_reserve: int = _OUTPUT_RESERVE,
 ) -> int:
     """Size one turn's conversation-history budget to the tools it actually sends.
 
     Demand-driven visibility means a turn usually places far fewer than the full
     ``TOOLS`` set on the wire, so its schema overhead is smaller and more of the
     model window can hold history. When ``context_window`` is known we recompute
-    the budget against ``visible_tools``:
+    the budget against ``visible_tools`` and the caller's actual output reserve:
 
     - No user cap: use the visible-tool budget directly, even when it exceeds the
       conservative full-tool ``max_context``. Reclaiming that headroom is the
@@ -273,7 +255,11 @@ def _turn_history_budget(
     """
     if context_window is None:
         return max_context
-    visible_budget = calculate_max_context(context_window, tools=visible_tools)
+    visible_budget = calculate_max_context(
+        context_window,
+        output_reserve=output_reserve,
+        tools=visible_tools,
+    )
     if max_context_is_user_cap:
         return min(max_context, visible_budget)
     return visible_budget
@@ -352,16 +338,43 @@ def _build_findings_summary(findings: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _toolset_tokens(value: object) -> set[str]:
+    """Coerce persisted/in-memory toolset state without splitting strings."""
+    if isinstance(value, str):
+        return {value}
+    if isinstance(value, (set, frozenset, list, tuple)):
+        return {str(item) for item in value}
+    return set()
+
+
+def _specialized_toolsets(value: object) -> set[str]:
+    return expand_toolsets(_toolset_tokens(value)) - set(DEFAULT_TOOLSETS)
+
+
+def _requested_toolsets(explored: dict) -> set[str]:
+    """Return durable, explicitly requested specialized toolsets.
+
+    ``active_toolsets`` predates the durable/controller split. When an older
+    explored-state object has no split fields, treat its specialized members as
+    durable so callers resuming an old run do not unexpectedly lose visibility.
+    """
+    if "requested_toolsets" in explored:
+        requested = _specialized_toolsets(explored.get("requested_toolsets"))
+    else:
+        requested = _specialized_toolsets(explored.get("active_toolsets"))
+    explored["requested_toolsets"] = requested
+    return requested
+
+
 def _active_toolsets(explored: dict | None) -> set[str]:
     if not explored:
         return set(DEFAULT_TOOLSETS)
-    active = explored.setdefault("active_toolsets", set(DEFAULT_TOOLSETS))
-    if not isinstance(active, set):
-        active = set(active or DEFAULT_TOOLSETS)
-        explored["active_toolsets"] = active
-    expanded = expand_toolsets(active)
-    explored["active_toolsets"] = expanded
-    return expanded
+    requested = _requested_toolsets(explored)
+    controller = _specialized_toolsets(explored.get("controller_toolsets"))
+    explored["controller_toolsets"] = controller
+    active = expand_toolsets(requested | controller)
+    explored["active_toolsets"] = active
+    return active
 
 
 def _visible_tools(explored: dict | None) -> list[dict]:
@@ -402,13 +415,21 @@ def _requested_toolsets_from_calls(tool_calls: list[dict]) -> list[str]:
 def _activate_toolsets(explored: dict, requested: list[str] | set[str]) -> set[str]:
     if not requested:
         return set()
-    active = _active_toolsets(explored)
-    before = set(active)
-    for toolset in requested:
-        active.update(expand_toolsets({toolset}))
-    explored["active_toolsets"] = active
-    explored.setdefault("requested_toolsets", set()).update(requested)
-    return active - before
+    before = _active_toolsets(explored)
+    durable = _requested_toolsets(explored)
+    durable.update(_specialized_toolsets(requested))
+    explored["requested_toolsets"] = durable
+    return _active_toolsets(explored) - before
+
+
+def _replace_controller_toolsets(
+    explored: dict,
+    required: list[str] | set[str],
+) -> set[str]:
+    """Replace controller-only visibility while preserving explicit requests."""
+    before = _active_toolsets(explored)
+    explored["controller_toolsets"] = _specialized_toolsets(required)
+    return _active_toolsets(explored) - before
 
 
 def _activate_requested_toolsets(tool_calls: list[dict], explored: dict) -> set[str]:
@@ -453,6 +474,11 @@ def _build_explored_summary(explored: dict) -> str:
     requested_toolsets = explored.get("requested_toolsets", set())
     if requested_toolsets:
         parts.append(f"Requested toolsets: {', '.join(sorted(requested_toolsets))}")
+    controller_toolsets = explored.get("controller_toolsets", set())
+    if controller_toolsets:
+        parts.append(
+            f"Controller toolsets: {', '.join(sorted(controller_toolsets))}"
+        )
     if explored.get("scope_inspections"):
         parts.append(f"Scope inspections: {explored['scope_inspections']}")
 
@@ -733,11 +759,12 @@ def _summarize_diagnose_build(content: str) -> str:
 
 
 def _attack_search_result_skeleton(data: dict) -> dict:
-    kept = _keep_fields(data, ("search_id", "action", "focus"))
+    kept = _keep_fields(data, ("search_id", "action", "focus", "campaign_ready"))
     next_action = data.get("next_action")
     if isinstance(next_action, dict):
         compact = _keep_fields(next_action, (
             "branch_id", "branch_title", "status", "tool", "source", "dossier_path",
+            "campaign_ready", "must_follow",
         ))
         required_args = next_action.get("required_args")
         if isinstance(required_args, dict) and required_args:
@@ -749,7 +776,10 @@ def _attack_search_result_skeleton(data: dict) -> dict:
             kept["next_action"] = compact
     summary = data.get("summary")
     if isinstance(summary, dict):
-        summary_kept = _keep_fields(summary, ("branches", "active", "terminal"))
+        summary_kept = _keep_fields(
+            summary,
+            ("branches", "active", "actionable", "parked", "terminal", "campaign_ready"),
+        )
         if summary_kept:
             kept["summary"] = summary_kept
     active = data.get("active_branches")
@@ -1307,10 +1337,13 @@ def _record_attack_search_branch(explored: dict, next_action: dict | None) -> No
     Stores the compact next_action locator (branch id/title/status/next tool/
     source) plus the dossier path under ``explored["attack_branch"]`` so the
     truncation note can name the current branch and point at its dossier. A
-    branchless next_action (e.g. a completed search) is ignored, leaving any
-    previously recorded branch in place.
+    A freshly derived campaign-ready action clears any previously recorded
+    locator so context recovery cannot resurrect a completed branch.
     """
     if not isinstance(next_action, dict):
+        return
+    if next_action.get("status") in {"campaign_ready", "complete"}:
+        explored.pop("attack_branch", None)
         return
     branch = {
         key: next_action.get(key)
@@ -1373,9 +1406,6 @@ def _update_explored(
                     break
         elif name == REQUEST_TOOLSET_NAME:
             explored["toolset_requests"] = explored.get("toolset_requests", 0) + 1
-            toolset = str(args.get("toolset") or "").strip().lower()
-            if toolset in {*REQUESTABLE_TOOLSETS, "all"}:
-                explored.setdefault("requested_toolsets", set()).add(toolset)
         elif name in _CAMPAIGN_TOOL_TRACKING:
             counters, sections = _CAMPAIGN_TOOL_TRACKING[name]
             for key in counters:
@@ -1385,6 +1415,10 @@ def _update_explored(
                 if section:
                     explored.setdefault("campaign_sections", set()).add(section)
             elif name == "attack_search":
+                if str(args.get("action") or "sync").strip().lower() == "sync":
+                    explored["attack_search_syncs"] = (
+                        explored.get("attack_search_syncs", 0) + 1
+                    )
                 if sections:
                     explored.setdefault("campaign_sections", set()).update(sections)
                 # Demand-driven toolset activation: reveal only the toolsets the
@@ -1402,9 +1436,11 @@ def _update_explored(
                     # dossier) so the truncation note can point a recovering agent
                     # straight at the current branch.
                     _record_attack_search_branch(explored, next_action)
-                    # Activate only what this next_action needs. An empty result
-                    # leaves the active toolsets unchanged (rely on request_toolset).
-                    _activate_toolsets(
+                    # Controller visibility is ephemeral: every successful sync
+                    # replaces the prior controller-only toolsets. Explicit
+                    # request_toolset selections remain durable and are unioned by
+                    # _active_toolsets.
+                    _replace_controller_toolsets(
                         explored,
                         _toolsets_from_attack_search_next_action(next_action),
                     )
@@ -1432,7 +1468,6 @@ _ATTACK_SEARCH_ALWAYS_ALLOWED_TOOLS = {
     # State and scope introspection. These read campaign artifacts or build
     # derived views; they never invent evidence the submission gates rely on.
     "read_campaign",
-    "review_campaign_progress",
     "build_campaign_brief",
     "inspect_scope",
     # Read-only cognitive surface. A security researcher needs to read source,
@@ -1458,8 +1493,9 @@ _ATTACK_SEARCH_ALWAYS_ALLOWED_TOOLS = {
     # Build diagnosis is a diagnostic/cognitive tool: it runs or parses a
     # build/test-list command and classifies blockers (missing import, pragma,
     # compiler, interface, dependency, ...) so the agent can repair setup
-    # instead of re-reading raw logs. It writes only a build-diagnostic artifact
-    # and never mutates an experiment, so branch ordering must not block it.
+    # instead of re-reading raw logs. It writes ordinary compiler outputs plus a
+    # build-diagnostic artifact, but never edits experiment source/definitions,
+    # so branch ordering must not block it.
     "diagnose_build",
     # Generic state-transition / invariant modeling is a cognitive planning
     # tool: it reads source (and optionally action-space/protocol-graph
@@ -1493,13 +1529,60 @@ _ATTACK_SEARCH_ALWAYS_ALLOWED_TOOLS = {
     "get_contract_source",
 }
 
-# Regex used by the run_experiment workspace exception. Validation of the
-# agent's own experiments must not be gated by branch ordering; the workspace
-# under /workspace/experiments/ is created exclusively by tools the campaign
-# already authorised (compose_sequence_experiment, compose_invariant_harness,
-# create_experiment), so allowing run_experiment against it is a clean bypass
-# of the controller without weakening evidence integrity.
-_LOCAL_EXPERIMENT_WORKSPACE_PATTERN = re.compile(r"/workspace/experiments/")
+_LOCAL_EXPERIMENT_ROOT = "/workspace/experiments"
+_LOCAL_EXPERIMENT_ENV_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*=[^\s]*$"
+)
+_LOCAL_EXPERIMENT_FORGE_ACTIONS = {"build", "coverage", "test"}
+_LOCAL_EXPERIMENT_COMMAND_PATH_ROOTS = (
+    "/workspace/experiments/",
+    "/workspace/campaign/static-analysis/",
+    "/output/diagnostics/",
+)
+
+
+def _local_experiment_path(path: object) -> bool:
+    """Return whether *path* normalizes to a workspace below experiments/."""
+    if not isinstance(path, str) or not path.startswith("/") or "\x00" in path:
+        return False
+    normalized = posixpath.normpath(path)
+    return normalized.startswith(_LOCAL_EXPERIMENT_ROOT + "/")
+
+
+def _local_experiment_validation_tokens(tokens: list[str]) -> bool:
+    """Recognize one generated-workspace Foundry validation invocation."""
+    while tokens and _LOCAL_EXPERIMENT_ENV_RE.fullmatch(tokens[0]):
+        if tokens[0].partition("=")[0] != "FOUNDRY_PROFILE":
+            return False
+        tokens = tokens[1:]
+    if not (
+        len(tokens) >= 2
+        and tokens[0] == "forge"
+        and tokens[1] in _LOCAL_EXPERIMENT_FORGE_ACTIONS
+    ):
+        return False
+    if "--ffi" in tokens:
+        return False
+    return _command_path_overrides_are_safe(
+        tokens,
+        allowed_roots=_LOCAL_EXPERIMENT_COMMAND_PATH_ROOTS,
+    )
+
+
+def _local_experiment_root_targets(tokens: list[str]) -> list[str] | None:
+    roots: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--root":
+            index += 1
+            if index >= len(tokens):
+                return None
+            roots.append(tokens[index])
+        elif token.startswith("--root="):
+            roots.append(token.partition("=")[2])
+        index += 1
+    return roots
 
 
 def _run_experiment_targets_local_workspace(tool_args: dict | None) -> bool:
@@ -1514,9 +1597,51 @@ def _run_experiment_targets_local_workspace(tool_args: dict | None) -> bool:
     if not isinstance(tool_args, dict):
         return False
     command = tool_args.get("command")
-    if not isinstance(command, str) or not command:
+    if not isinstance(command, str):
         return False
-    return bool(_LOCAL_EXPERIMENT_WORKSPACE_PATTERN.search(command))
+    command = command.strip()
+    if not command or "\x00" in command:
+        return False
+    # No general shell composition is accepted.  The sole compound form is the
+    # legacy, tightly parsed ``cd <workspace> && <one forge command>`` shape.
+    if any(
+        marker in command
+        for marker in ("#", ";", "|", "`", "$", ">", "<", "\n", "\r")
+    ):
+        return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+
+    validation_tokens = tokens
+    cd_target = ""
+    if "&&" in tokens:
+        if tokens.count("&&") != 1 or tokens.index("&&") != 2:
+            return False
+        if tokens[0] != "cd":
+            return False
+        cd_target = tokens[1]
+        validation_tokens = tokens[3:]
+        if not _local_experiment_path(cd_target):
+            return False
+        if "&" in command.replace("&&", "", 1):
+            return False
+    elif "&" in command:
+        return False
+
+    if not _local_experiment_validation_tokens(validation_tokens):
+        return False
+    root_targets = _local_experiment_root_targets(validation_tokens)
+    if root_targets is None or len(root_targets) > 1:
+        return False
+    if root_targets and not _local_experiment_path(root_targets[0]):
+        return False
+
+    working_dir_is_local = _local_experiment_path(tool_args.get("working_dir"))
+    return working_dir_is_local or bool(cd_target) or bool(root_targets)
 
 
 def _attack_search_expected_tool_names(next_tool: object) -> set[str]:
@@ -1584,7 +1709,7 @@ def _toolsets_from_attack_search_next_action(next_action: dict | None) -> set[st
     """
     if not isinstance(next_action, dict):
         return set()
-    if next_action.get("status") == "complete":
+    if next_action.get("status") in {"campaign_ready", "complete"}:
         return set()
 
     specialized = set(REQUESTABLE_TOOLSETS)
@@ -1601,70 +1726,6 @@ def _toolsets_from_attack_search_next_action(next_action: dict | None) -> set[st
     return toolsets_for_tool_names(_attack_search_expected_tools(next_action))
 
 
-# Leading "VAR=value" environment assignments are configuration, not execution,
-# so they are ignored when matching a diagnostic command shape (e.g. the
-# common FOUNDRY_PROFILE=ci prefix).
-_ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=[^\s]*$")
-
-# Shell syntax that can chain, background, substitute, or append output — any of
-# these can smuggle a state-changing or file-writing command past an otherwise
-# read-only prefix, so their presence disqualifies a command from the diagnostic
-# fast-path. (A single ">" stdout/stderr redirect is handled separately and only
-# allowed into a campaign/output log root.)
-_NON_DIAGNOSTIC_SHELL_TOKENS = (";", "|", "&", "`", "$", ">>", "<", "(", ")", "\n")
-
-# A single redirect is allowed only into these roots so static-analysis output
-# can be captured as campaign evidence; anything else is treated as a write
-# target outside the agent's scratch space and disqualifies the command.
-_DIAGNOSTIC_REDIRECT_ROOTS = ("/workspace/", "/output/")
-
-# Read-only diagnostic command shapes the controller must not block: the agent
-# needs to compile, inspect config/artifacts, list tests, or run static analysis
-# while pursuing an unrelated required next action. These never send
-# transactions, install dependencies, or run stateful generated tests.
-_DIAGNOSTIC_COMMAND_PREFIXES = (
-    ("forge", "build"),
-    ("forge", "config"),
-    ("forge", "inspect"),
-)
-
-
-def _diagnostic_redirect_target_allowed(target: str) -> bool:
-    return any(target.startswith(root) for root in _DIAGNOSTIC_REDIRECT_ROOTS)
-
-
-def _diagnostic_command_core(tokens: list[str]) -> list[str] | None:
-    """Strip validated redirects from a token list, returning the base command.
-
-    Returns ``None`` if a redirect points outside the allowed log roots or uses
-    an unexpected file-descriptor form, so the caller treats the command as
-    non-diagnostic.
-    """
-    base: list[str] = []
-    i = 0
-    n = len(tokens)
-    while i < n:
-        tok = tokens[i]
-        if ">" in tok:
-            fd, _, attached = tok.partition(">")
-            if fd not in ("", "1", "2"):
-                return None
-            if attached:
-                target = attached
-            else:
-                i += 1
-                if i >= n:
-                    return None
-                target = tokens[i]
-            if not _diagnostic_redirect_target_allowed(target):
-                return None
-            i += 1
-            continue
-        base.append(tok)
-        i += 1
-    return base
-
-
 def _run_command_is_diagnostic(tool_args: dict | None) -> bool:
     """Return True for clearly read-only run_command diagnostics.
 
@@ -1678,31 +1739,7 @@ def _run_command_is_diagnostic(tool_args: dict | None) -> bool:
     if not isinstance(tool_args, dict):
         return False
     command = tool_args.get("command")
-    if not isinstance(command, str):
-        return False
-    command = command.strip()
-    if not command:
-        return False
-    if any(meta in command for meta in _NON_DIAGNOSTIC_SHELL_TOKENS):
-        return False
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        return False
-    base = _diagnostic_command_core(tokens)
-    if base is None:
-        return False
-    while base and _ENV_ASSIGNMENT_RE.match(base[0]):
-        base = base[1:]
-    if not base:
-        return False
-    if tuple(base[:2]) in _DIAGNOSTIC_COMMAND_PREFIXES:
-        return True
-    if base[:2] == ["forge", "test"] and "--list" in base:
-        return True
-    if base[0] == "slither":
-        return True
-    return False
+    return _diagnostic_command_is_safe(command)
 
 
 async def _attack_search_tool_guard(
@@ -1736,7 +1773,7 @@ async def _attack_search_tool_guard(
     if not search:
         return None
     next_action = search.get("next_action") or {}
-    if next_action.get("status") == "complete":
+    if next_action.get("status") in {"campaign_ready", "complete"}:
         return None
     expected_tools = _attack_search_expected_tools(next_action)
     if not expected_tools:
@@ -1764,205 +1801,130 @@ async def _attack_search_tool_guard(
     }, indent=2, sort_keys=True)
 
 
-def _campaign_branch_terminal(branch: dict) -> bool:
-    return (
-        branch.get("status") in _ATTACK_SEARCH_TERMINAL_STATUSES
-        or bool(branch.get("terminal_decision"))
-    )
-
-
-def _campaign_branch_score(branch: dict) -> int:
-    try:
-        return int(branch.get("priority_score", 0) or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _campaign_branch_has_economic_signal(branch: dict) -> bool:
-    binding = branch.get("target_binding") or {}
-    if binding.get("economically_significant_hint"):
-        return True
-    if str(binding.get("kind") or "") in {
-        "active_proxy",
-        "deployed_economic_contract",
-        "deployed_configured_contract",
-    }:
-        return True
-    if (branch.get("inventory_context") or {}).get("economically_significant_targets"):
-        return True
-    labels = {
-        str(label)
-        for action in branch.get("target_actions") or []
-        if isinstance(action, dict)
-        for label in action.get("affordances") or []
-    }
-    return bool(labels.intersection({
-        "value_out_or_burn",
-        "credit_or_liquidation",
-        "valuation_dependency",
-        "market_or_router",
-        "callback_or_flashloan_surface",
-        "cross_domain_or_message",
-        "generic_execution",
-        "delegatecall",
-    }))
-
-
-_LOW_SIGNAL_COVERAGE_TERMS = (
-    "mock",
-    "test",
-    "fixture",
-    "certora",
-    "interface",
-    "script",
-    "helper",
-    "library",
-)
-
-
-def _campaign_branch_is_low_signal_coverage_cleanup(branch: dict) -> bool:
-    if str(branch.get("source") or "") != "coverage_high_attention_gap":
-        return False
-    if str(branch.get("status") or "") != "needs_context":
-        return False
-    if _campaign_branch_has_economic_signal(branch):
-        return False
-    score = _campaign_branch_score(branch)
-    text_parts = [
-        str(branch.get("title") or ""),
-        str(branch.get("key") or ""),
-        str(branch.get("instructions") or ""),
-        " ".join(str(item) for item in branch.get("action_keys") or []),
-    ]
-    for action in branch.get("target_actions") or []:
-        if isinstance(action, dict):
-            text_parts.extend([
-                str(action.get("contract") or ""),
-                str(action.get("function") or ""),
-                str(action.get("file") or ""),
-            ])
-    text = " ".join(text_parts).lower()
-    return score < 18 and any(term in text for term in _LOW_SIGNAL_COVERAGE_TERMS)
-
-
-def _campaign_stop_branch_blocker(branch: dict) -> dict | None:
-    if _campaign_branch_terminal(branch):
-        return None
-    if _campaign_branch_is_low_signal_coverage_cleanup(branch):
-        return None
-    status = str(branch.get("status") or "")
-    source = str(branch.get("source") or "")
-    priority = str(branch.get("priority") or "").lower()
-    score = _campaign_branch_score(branch)
-    high_signal = (
-        priority in {"critical", "high"}
-        or score >= 18
-        or _campaign_branch_has_economic_signal(branch)
-    )
-    must_block = (
-        status in _STOP_BLOCKING_STATUSES
-        or source in {
-            "ready_report_review",
-            "ready_finding_review",
-            "result_without_objective",
-            "candidate_fuzz_failure",
-            "unreviewed_sequence_minimization",
-        }
-        or (
-            source == "attack_graph_candidate"
-            and status in _STOP_LIVE_BRANCH_STATUSES
-            and high_signal
-        )
-        or (
-            source == "coverage_high_attention_gap"
-            and high_signal
-        )
-    )
-    if not must_block:
-        return None
-    return {
-        "branch_id": branch.get("id"),
-        "status": status,
-        "source": source,
-        "priority": priority,
-        "priority_score": score,
-        "next_tool": branch.get("next_tool"),
-        "title": str(branch.get("title") or "")[:180],
-    }
-
-
 async def _campaign_stop_readiness(container: AuditContainer) -> dict:
-    blockers = []
     search = await _read_container_json(container, _ATTACK_SEARCH_CURRENT_PATH)
-    if search:
-        active = [
-            branch for branch in search.get("branches") or []
-            if isinstance(branch, dict) and not _campaign_branch_terminal(branch)
-        ]
-        for branch in active:
-            blocker = _campaign_stop_branch_blocker(branch)
-            if blocker:
-                blockers.append({"kind": "active_attack_search_branch", **blocker})
+    if not search:
+        return {
+            "ready": False,
+            "blockers": [{
+                "kind": "missing_attack_search_state",
+                "path": _ATTACK_SEARCH_CURRENT_PATH,
+            }],
+            "omitted_blockers": 0,
+            "checked": {"attack_search": False},
+        }
 
-    state = await _read_container_json(container, _CAMPAIGN_STATE_PATH)
-    latest_progress = None
-    if state:
-        try:
-            progress_count = int(
-                ((state.get("counters") or {}).get("progress_review") or 0)
-            )
-        except (TypeError, ValueError):
-            progress_count = 0
-        if progress_count > 0:
-            latest_progress = await _read_container_json(
-                container,
-                f"{_PROGRESS_REVIEW_DIR}/prg-{progress_count:03d}.json",
-            )
-
-    if latest_progress:
-        summary = latest_progress.get("summary") or {}
-        for key in _STOP_READY_PROGRESS_KEYS:
-            try:
-                count = int(summary.get(key, 0) or 0)
-            except (TypeError, ValueError):
-                count = 0
-            if count > 0:
-                blockers.append({
-                    "kind": "progress_gap",
-                    "gap": key,
-                    "count": count,
-                    "path": latest_progress.get("path")
-                    or f"{_PROGRESS_REVIEW_DIR}/{latest_progress.get('id')}.json",
-                })
-        coverage_gaps = latest_progress.get("coverage_high_attention_gaps") or []
-        unresolved_high_coverage = []
-        for item in coverage_gaps:
-            try:
-                high_gaps = int(
-                    (item.get("summary") or {}).get("high_attention_gaps", 0) or 0
-                )
-            except (AttributeError, TypeError, ValueError):
-                high_gaps = 0
-            if high_gaps > 0:
-                unresolved_high_coverage.append(item)
-        if unresolved_high_coverage:
-            blockers.append({
-                "kind": "progress_gap",
-                "gap": "coverage_high_attention_gaps",
-                "count": len(unresolved_high_coverage),
-                "path": latest_progress.get("path")
-                or f"{_PROGRESS_REVIEW_DIR}/{latest_progress.get('id')}.json",
-            })
+    summary = search.get("summary") or {}
+    next_action = search.get("next_action") or {}
+    actionable = summary.get("actionable")
+    summary_ready = summary.get("campaign_ready") is True
+    actionable_is_zero = (
+        isinstance(actionable, int)
+        and not isinstance(actionable, bool)
+        and actionable == 0
+    )
+    ready_status = str(next_action.get("status") or "") == "campaign_ready"
+    branchless_ready = (
+        ready_status
+        and not next_action.get("branch_id")
+        and not bool(next_action.get("must_follow", False))
+    )
+    blockers = []
+    if not (summary_ready and actionable_is_zero and branchless_ready):
+        blockers.append({
+            "kind": "attack_search_not_ready",
+            "status": next_action.get("status"),
+            "branch_id": next_action.get("branch_id"),
+            "tool": next_action.get("tool"),
+            "actionable": actionable,
+            "campaign_ready": summary.get("campaign_ready"),
+        })
 
     return {
         "ready": not blockers,
         "blockers": blockers[:8],
         "omitted_blockers": max(0, len(blockers) - 8),
-        "checked": {
-            "attack_search": bool(search),
-            "progress_review": bool(latest_progress),
+        "checked": {"attack_search": True},
+    }
+
+
+def _failed_final_readiness_sync(detail: object) -> dict:
+    text = str(detail or "attack_search sync returned no usable result").strip()
+    return {
+        "ready": False,
+        "blockers": [{
+            "kind": "final_attack_search_sync_failed",
+            "detail": text[:240],
+        }],
+        "omitted_blockers": 0,
+        "checked": {"attack_search": False},
+        "sync": {
+            "action": "sync",
+            "attempted": True,
+            "succeeded": False,
         },
     }
+
+
+async def _sync_campaign_stop_readiness(
+    container: AuditContainer,
+    explored: dict,
+) -> dict:
+    """Run a fresh controller sync, then evaluate only its persisted state.
+
+    Wrap-up paths cannot trust an old ``current.json`` snapshot.  A failed,
+    malformed, or unusable sync therefore fails closed even if a stale file on
+    disk previously said ``campaign_ready``.
+    """
+    arguments = {"action": "sync", "record_result": False}
+    try:
+        result = await execute_tool(
+            "attack_search",
+            arguments,
+            container,
+            [],
+        )
+    except Exception as exc:
+        return _failed_final_readiness_sync(f"attack_search sync raised: {exc}")
+
+    if _tool_result_failed(result):
+        return _failed_final_readiness_sync(result)
+    try:
+        payload = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return _failed_final_readiness_sync(
+            "attack_search sync returned malformed JSON"
+        )
+    if not isinstance(payload, dict) or not isinstance(
+        payload.get("next_action"), dict
+    ):
+        return _failed_final_readiness_sync(
+            "attack_search sync returned no next_action"
+        )
+
+    call_id = "final_readiness_attack_search_sync"
+    _update_explored(
+        [{
+            "id": call_id,
+            "function": {
+                "name": "attack_search",
+                "arguments": json.dumps(arguments),
+            },
+        }],
+        explored,
+        [{
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": result,
+        }],
+    )
+    readiness = await _campaign_stop_readiness(container)
+    readiness["sync"] = {
+        "action": "sync",
+        "attempted": True,
+        "succeeded": True,
+    }
+    return readiness
 
 
 async def _record_final_readiness(
@@ -1971,7 +1933,7 @@ async def _record_final_readiness(
     *,
     reason: str,
 ) -> dict:
-    readiness = await _campaign_stop_readiness(container)
+    readiness = await _sync_campaign_stop_readiness(container, explored)
     explored["final_readiness"] = readiness
     if not readiness["ready"]:
         explored["audit_status"] = "incomplete_no_validated_findings"
@@ -2209,10 +2171,15 @@ async def run_audit(
         })
 
     findings: list[dict] = []
+    initial_requested_toolsets = _specialized_toolsets(
+        initial_toolsets or DEFAULT_TOOLSETS
+    )
     explored: dict = {
         "files_read": set(),
         "tools_run": set(),
-        "active_toolsets": expand_toolsets(initial_toolsets or DEFAULT_TOOLSETS),
+        "requested_toolsets": initial_requested_toolsets,
+        "controller_toolsets": set(),
+        "active_toolsets": expand_toolsets(initial_requested_toolsets),
     }
     reasoning_tokens_used = 0
     start_time = time.time()
@@ -2254,7 +2221,7 @@ async def run_audit(
             if elapsed >= max_time_seconds:
                 if not wrap_up_requested:
                     note = _toolset_activation_note(
-                        _activate_toolsets(explored, {"report"}),
+                        _replace_controller_toolsets(explored, {"report"}),
                         reason="wrap-up",
                     )
                     if note:
@@ -2479,16 +2446,15 @@ async def run_audit(
                     continue
                 final_readiness_complete = (
                     final_readiness_required is not None
-                    and explored.get("attack_search_runs", 0)
-                    > final_readiness_required.get("attack_search_runs", 0)
-                    and explored.get("progress_reviews", 0)
-                    > final_readiness_required.get("progress_reviews", 0)
+                    and explored.get("attack_search_syncs", 0)
+                    > final_readiness_required.get("attack_search_syncs", 0)
                 )
                 if not wrap_up_requested and not final_readiness_complete:
                     if final_readiness_required is None:
                         final_readiness_required = {
-                            "attack_search_runs": explored.get("attack_search_runs", 0),
-                            "progress_reviews": explored.get("progress_reviews", 0),
+                            "attack_search_syncs": explored.get(
+                                "attack_search_syncs", 0
+                            ),
                         }
                     final_readiness_nudges += 1
                     display.error(
@@ -2497,31 +2463,22 @@ async def run_audit(
                     )
                     messages.append({
                         "role": "user",
-                        "content": (
-                            "Before stopping, perform one final campaign readiness "
-                            "check: call attack_search with action=sync, then call "
-                            "review_campaign_progress. If either tool reports active "
-                            "branches, process gaps, ready reviews, or economically "
-                            "significant live/deployed targets that still need "
-                            "inventory, harnessing, objective evidence, mutation, or "
-                            "submission, follow that next action instead of stopping. "
-                            "Stop only after that readiness check supports no viable "
-                            "high/critical live economic finding path, or after "
-                            "submitting any ready findings."
-                        ),
+                        "content": _FINAL_READINESS_NUDGE,
                     })
                     continue
-                readiness = await _campaign_stop_readiness(container)
                 if wrap_up_requested:
-                    explored["final_readiness"] = readiness
+                    readiness = await _record_final_readiness(
+                        container,
+                        explored,
+                        reason="wrap_up_requested",
+                    )
                     if not readiness["ready"]:
-                        explored["audit_status"] = "incomplete_no_validated_findings"
-                        explored["audit_status_reason"] = "wrap_up_requested"
                         display.error(
                             "Stopping during wrap-up with unresolved campaign "
                             "work; marking audit incomplete."
                         )
                 else:
+                    readiness = await _campaign_stop_readiness(container)
                     if not readiness["ready"]:
                         display.error(
                             "Deterministic readiness check found unresolved "
@@ -2531,7 +2488,7 @@ async def run_audit(
                             "role": "user",
                             "content": (
                                 "Do not stop yet. The deterministic campaign "
-                                "readiness check found unresolved high-signal "
+                                "readiness check found unresolved actionable "
                                 "work:\n"
                                 + json.dumps(readiness, indent=2, sort_keys=True)
                                 + "\nFollow the relevant attack_search next action, "
@@ -2833,6 +2790,7 @@ async def run_report(
     # estimates discount exactly those schemas (not the full TOOLS set).
     report_started_at = time.time()
     report_tools = _report_visible_tools()
+    report_assistant_chunks: list[str] = []
     while True:
         if time.time() - report_started_at >= max_time_seconds:
             display.status("Report wall-clock limit reached.")
@@ -2864,6 +2822,9 @@ async def run_report(
             return None
 
         messages.append(response_message)
+        response_content = str(response_message.get("content") or "")
+        if len(response_content) > 500:
+            report_assistant_chunks.append(response_content)
 
         if not response_message.get("tool_calls"):
             if finish_reason == "length":
@@ -2903,13 +2864,8 @@ async def run_report(
     # Fallback: the model may have included the report in response text instead
     # of using write_file. Stitch substantial assistant chunks together so a
     # continued report is not reduced to only the final chunk.
-    report_chunks = [
-        msg.get("content", "")
-        for msg in messages
-        if msg.get("role") == "assistant" and len(msg.get("content", "")) > 500
-    ]
-    if report_chunks:
-        return "\n\n".join(report_chunks)
+    if report_assistant_chunks:
+        return "\n\n".join(report_assistant_chunks)
 
     display.error("Could not read generated report from container")
     return None
@@ -2961,7 +2917,9 @@ async def chat_loop(
                 prior_findings=findings,
                 max_context=max_context,
                 reasoning_config=reasoning_config,
-                initial_toolsets=(_active_toolsets(explored) if explored else None),
+                initial_toolsets=(
+                    _requested_toolsets(explored) if explored else None
+                ),
                 context_window=context_window,
                 max_context_is_user_cap=max_context_is_user_cap,
             )
@@ -2975,12 +2933,15 @@ async def chat_loop(
                 explored.setdefault("campaign_sections", set()).update(
                     new_explored.get("campaign_sections", set())
                 )
-                explored.setdefault("active_toolsets", set(DEFAULT_TOOLSETS)).update(
-                    new_explored.get("active_toolsets", set())
+                durable = _requested_toolsets(explored)
+                durable.update(
+                    _specialized_toolsets(new_explored.get("requested_toolsets"))
                 )
-                explored.setdefault("requested_toolsets", set()).update(
-                    new_explored.get("requested_toolsets", set())
+                explored["requested_toolsets"] = durable
+                explored["controller_toolsets"] = _specialized_toolsets(
+                    new_explored.get("controller_toolsets")
                 )
+                _active_toolsets(explored)
                 merged_failed = explored.setdefault("failed_tool_calls", {})
                 for name, count in new_explored.get("failed_tool_calls", {}).items():
                     merged_failed[name] = merged_failed.get(name, 0) + count
@@ -2994,11 +2955,20 @@ async def chat_loop(
             if time.time() - chat_started_at >= max_time_seconds:
                 display.status("Chat wall-clock limit reached.")
                 break
-            # Size the budget to the tools this chat turn actually sends (the
-            # active toolsets can grow mid-chat via request_toolset).
+            # Chat can emit the model's maximum output, so reserve that full
+            # response capacity rather than reusing the audit-turn (16k output)
+            # history budget. The active toolsets can grow mid-chat via
+            # request_toolset, and an explicit user max-context remains a hard cap.
             visible_tools = _visible_tools(explored)
+            turn_max_context = _turn_history_budget(
+                max_context,
+                context_window=context_window or DEFAULT_CONTEXT_WINDOW,
+                visible_tools=visible_tools,
+                max_context_is_user_cap=max_context_is_user_cap,
+                output_reserve=get_model_max_output_tokens(model),
+            )
             messages = _truncate_messages(
-                messages, findings, explored, max_context, tools=visible_tools
+                messages, findings, explored, turn_max_context, tools=visible_tools
             )
             try:
                 (
@@ -3014,7 +2984,7 @@ async def chat_loop(
                     display,
                     findings=findings,
                     explored=explored,
-                    max_context=max_context,
+                    max_context=turn_max_context,
                     tools=visible_tools,
                     max_output_tokens=None,
                     reasoning_config=reasoning_config,
@@ -3035,7 +3005,7 @@ async def chat_loop(
             )
             messages.extend(tool_results)
             messages = _age_tool_outputs(
-                messages, max_context=max_context, tools=visible_tools
+                messages, max_context=turn_max_context, tools=visible_tools
             )
 
             # Track explored state from chat interactions

@@ -20,6 +20,11 @@ import unittest
 from unittest import mock
 
 from reentbotpro import tools as tools_mod
+from reentbotpro.agent import (
+    _ATTACK_SEARCH_ALWAYS_ALLOWED_TOOLS,
+    _CAMPAIGN_TOOL_TRACKING,
+)
+from reentbotpro.tool_schemas import RETIRED_MODEL_TOOLS
 from reentbotpro.tools import (
     PARALLEL_SAFE,
     TOOL_BY_NAME,
@@ -83,6 +88,43 @@ class ToolRegistryConsistencyTests(unittest.TestCase):
             if isinstance(t, dict) and isinstance(t.get("function"), dict)
         }
         self.assertEqual(set(TOOL_BY_NAME), derived)
+
+    def test_inspect_scope_keeps_legacy_flag_without_scope_exclusion(self):
+        properties = TOOL_BY_NAME["inspect_scope"]["function"]["parameters"][
+            "properties"
+        ]
+
+        self.assertIn("include_low_priority", properties)
+        compatibility_description = properties["include_low_priority"][
+            "description"
+        ].lower()
+        self.assertIn("deprecated compatibility no-op", compatibility_description)
+        self.assertIn("always retained in scope", compatibility_description)
+        self.assertIn(
+            "persisted manifest always retains every parsed profile",
+            properties["max_profiles"]["description"].lower(),
+        )
+
+    def test_scope_mapping_tools_expose_cumulative_batch_lineage(self):
+        action_properties = TOOL_BY_NAME["map_action_space"]["function"][
+            "parameters"
+        ]["properties"]
+        live_properties = TOOL_BY_NAME["map_live_reachability"]["function"][
+            "parameters"
+        ]["properties"]
+        protocol_properties = TOOL_BY_NAME["map_protocol_graph"]["function"][
+            "parameters"
+        ]["properties"]
+
+        self.assertIn("profile_cursor", action_properties)
+        self.assertIn("source_file_cursor", action_properties)
+        self.assertIn("previous_action_space", action_properties)
+        self.assertEqual(action_properties["profile_cursor"]["minimum"], 0)
+        self.assertEqual(action_properties["source_file_cursor"]["minimum"], 0)
+        self.assertIn("profile_cursor", live_properties)
+        self.assertIn("previous_live_reachability", live_properties)
+        self.assertEqual(live_properties["profile_cursor"]["minimum"], 0)
+        self.assertIn("action_space", protocol_properties)
 
     def test_every_tool_routed_by_dispatch(self):
         case_names = _execute_tool_case_names()
@@ -239,16 +281,121 @@ class ToolRegistryConsistencyTests(unittest.TestCase):
         self.assertIn("state_transition_model", params)
         self.assertEqual(params["state_transition_model"]["type"], "string")
 
-    def test_prepare_fork_exploit_workbench_accepts_state_transition_model_param(self):
-        # The fork workbench consumes the same artifact so model-derived invariants
-        # can shape generic objective/observation templates.
-        params = (
-            TOOL_BY_NAME["prepare_fork_exploit_workbench"]["function"]["parameters"][
-                "properties"
-            ]
-        )
-        self.assertIn("state_transition_model", params)
+    def test_build_attack_graph_auto_schema_requires_deployed_live_context(self):
+        mode = TOOL_BY_NAME["build_attack_graph"]["function"]["parameters"][
+            "properties"
+        ]["mode"]
+        description = mode["description"].lower()
+        self.assertIn("contains deployed context", description)
+        self.assertIn("else source-only", description)
+        self.assertIn("require a live-reachability artifact", description)
+
+    def test_sequence_schema_folds_in_retired_workbench_inputs(self):
+        self.assertNotIn("prepare_fork_exploit_workbench", TOOL_BY_NAME)
+        params = TOOL_BY_NAME["compose_sequence_experiment"]["function"][
+            "parameters"
+        ]["properties"]
+        self.assertEqual(params["mechanism"]["type"], "string")
         self.assertEqual(params["state_transition_model"]["type"], "string")
+
+    def test_invariant_harness_is_registered_as_manual_only_escape_hatch(self):
+        self.assertIn("compose_invariant_harness", TOOL_BY_NAME)
+        self.assertIn("compose_invariant_harness", _execute_tool_case_names())
+        self.assertIn(
+            "compose_invariant_harness",
+            TOOLSET_DEFINITIONS["experiment"],
+        )
+        description = TOOL_BY_NAME["compose_invariant_harness"]["function"][
+            "description"
+        ].lower()
+        self.assertIn("advanced manual escape hatch", description)
+        self.assertIn("controller", description)
+        self.assertIn("not recommend or auto-complete", description)
+
+    def test_mutation_schema_exposes_cards_but_not_placeholder_creation(self):
+        properties = TOOL_BY_NAME["mutate_hypothesis"]["function"]["parameters"][
+            "properties"
+        ]
+        self.assertNotIn("create_experiments", properties)
+        mutation_item = properties["mutations"]["items"]
+        card = mutation_item["properties"]["hypothesis_card"]
+        self.assertEqual(
+            set(card["properties"]),
+            {
+                "attacker_control",
+                "state_path",
+                "invariant_at_risk",
+                "impact_sink",
+                "material_preconditions",
+                "falsifier",
+                "objective",
+            },
+        )
+        self.assertIn("experiment", mutation_item["required"])
+
+    def test_attack_search_advance_exposes_complete_graph_admission_card(self):
+        properties = TOOL_BY_NAME["attack_search"]["function"]["parameters"][
+            "properties"
+        ]
+        card = properties["hypothesis_card"]
+        expected = {
+            "attacker_control",
+            "state_path",
+            "invariant_at_risk",
+            "impact_sink",
+            "material_preconditions",
+            "falsifier",
+            "objective",
+        }
+        self.assertEqual(set(card["properties"]), expected)
+        self.assertEqual(set(card["required"]), expected)
+        self.assertIn("status=needs_harness", card["description"])
+        self.assertIn("evidence", card["description"])
+
+    def test_retired_model_tools_are_absent_from_every_runtime_surface(self):
+        retired = set(RETIRED_MODEL_TOOLS)
+        toolset_members = {
+            name
+            for members in TOOLSET_DEFINITIONS.values()
+            for name in members
+        }
+
+        self.assertTrue(retired)
+        self.assertTrue(retired.isdisjoint(TOOL_BY_NAME))
+        self.assertTrue(retired.isdisjoint(toolset_members))
+        self.assertTrue(retired.isdisjoint(_execute_tool_case_names()))
+        self.assertTrue(retired.isdisjoint(_ATTACK_SEARCH_ALWAYS_ALLOWED_TOOLS))
+        self.assertTrue(retired.isdisjoint(_CAMPAIGN_TOOL_TRACKING))
+        self.assertTrue(_ATTACK_SEARCH_ALWAYS_ALLOWED_TOOLS <= set(TOOL_BY_NAME))
+        self.assertTrue(set(_CAMPAIGN_TOOL_TRACKING) <= set(TOOL_BY_NAME))
+
+        # The concrete controller/experiment path remains registered, routed,
+        # visible in the narrow toolsets, and tracked after workflow cleanup.
+        remaining = {
+            "attack_search",
+            "build_campaign_brief",
+            "compose_invariant_harness",
+            "compose_sequence_experiment",
+            "complete_sequence_experiment",
+            "mutate_hypothesis",
+            "run_experiment",
+        }
+        self.assertTrue(remaining.issubset(TOOL_BY_NAME))
+        self.assertTrue(remaining.issubset(_execute_tool_case_names()))
+        self.assertIn("attack_search", TOOLSET_DEFINITIONS["core"])
+        self.assertIn("build_campaign_brief", TOOLSET_DEFINITIONS["core"])
+        for name in remaining - {"attack_search", "build_campaign_brief"}:
+            self.assertIn(name, TOOLSET_DEFINITIONS["experiment"])
+        self.assertIn("mutate_hypothesis", _ATTACK_SEARCH_ALWAYS_ALLOWED_TOOLS)
+        self.assertTrue(
+            {
+                "attack_search",
+                "compose_invariant_harness",
+                "compose_sequence_experiment",
+                "mutate_hypothesis",
+                "run_experiment",
+            }.issubset(_CAMPAIGN_TOOL_TRACKING)
+        )
 
     def test_submission_review_tools_expose_exploitability_checklist(self):
         expected = {

@@ -146,8 +146,13 @@ class PromptCapitalGuidanceTests(unittest.TestCase):
         prompt = build_system_prompt()
         collapsed = " ".join(prompt.split())
         self.assertIn(
-            "use the relevant map, economics, workbench, and sequence tools to "
+            "use the relevant map, economics, and sequence surfaces to "
             "obtain branch-specific setup checks",
+            collapsed,
+        )
+        self.assertIn(
+            "`compose_sequence_experiment` embeds the selected candidate's "
+            "mechanism and state-model guidance directly",
             collapsed,
         )
         self.assertIn(
@@ -175,17 +180,17 @@ class PromptCapitalGuidanceTests(unittest.TestCase):
             "estimate_amm_economics",
             "estimate_flash_loan",
             "estimate_lending_health",
-            "prepare_fork_exploit_workbench",
+            "compose_sequence_experiment",
             "route_composition_plan",
         ):
             self.assertIn(name, prompt, f"prompt should still point at {name}")
 
     def test_prompt_drops_always_on_mechanism_playbooks(self):
         # The spelled-out, always-on mechanism checklists must not be injected
-        # into every audit anymore. They now live in the branch/tool outputs:
-        # plan_attack_campaign's branch checks, compose_sequence_experiment's
-        # route_composition_plan, and prepare_fork_exploit_workbench's mechanism
-        # adapter. Pin their absence so the permanent prompt stays generic.
+        # into every audit anymore. They now live in attack_search's selected
+        # branch and compose_sequence_experiment's integrated mechanism adapter /
+        # route_composition_plan. Pin their absence so the permanent prompt stays
+        # generic.
         prompt = build_system_prompt()
         collapsed = " ".join(prompt.split())
         for banned in (
@@ -284,14 +289,18 @@ class PromptCapitalGuidanceTests(unittest.TestCase):
         #   (a) gap strings carry recovery hints after an em-dash,
         #   (b) Foundry-aware test_output parsing doesn't false-positive on
         #       vm.expectRevert,
-        #   (c) linking objective_evaluation downgrades the test_output
-        #       heuristic from blocker to warning.
+        #   (c) only a passing, linked objective_evaluation may support a
+        #       custom runner with no recognized pass marker; it never masks a
+        #       structured failure or zero-test run.
         prompt = build_system_prompt()
         self.assertIn("recovery hint", prompt)
         self.assertIn("em-dash", prompt)
         self.assertIn("vm.expectRevert", prompt)
         self.assertIn("zero executed tests", prompt)
         self.assertIn("objective_evaluation", prompt)
+        self.assertIn("Arbitrary nonempty prose is not a pass signal", prompt)
+        self.assertIn("It never rescues a structured Foundry failure", prompt)
+        self.assertIn("same successful result/experiment lineage", prompt)
 
     def test_prompt_matches_no_tool_stop_contract(self):
         prompt = build_system_prompt()
@@ -358,6 +367,14 @@ class PromptCapitalGuidanceTests(unittest.TestCase):
         self.assertIn("measured funds at risk", REPORT_INSTRUCTION)
         self.assertIn("You cannot run forge in this report phase", REPORT_INSTRUCTION)
         self.assertIn("do not invent compile or test results", REPORT_INSTRUCTION)
+        self.assertIn(
+            "Findings section and Risk Summary Table must contain only those submitted",
+            REPORT_INSTRUCTION,
+        )
+        self.assertIn(
+            "Do not promote blocked, rejected, parked, or merely suspected",
+            REPORT_INSTRUCTION,
+        )
         self.assertNotIn("Compiles with `forge build`", REPORT_INSTRUCTION)
         self.assertNotIn("paste the forge output", REPORT_INSTRUCTION)
 
@@ -380,11 +397,9 @@ class PromptCapitalGuidanceTests(unittest.TestCase):
         self.assertIn("Record evidence-backed campaign artifacts", prompt)
         self.assertIn("one invariant or open question", prompt)
         self.assertIn("Record a hypothesis only when it is concrete", prompt)
-        self.assertIn(
-            "Record an `experiment` artifact in the first 5 turns only if",
-            prompt,
-        )
-        self.assertIn("actor, target, action/call step", prompt)
+        self.assertIn("Compose an experiment in the first 5 turns only if", prompt)
+        self.assertIn("concrete calls, bindings, setup", prompt)
+        self.assertIn("structured `hypothesis_card`", prompt)
         self.assertNotIn("needed for the first hypothesis", prompt)
         self.assertNotIn("One `experiment` artifact for the most promising hypothesis", prompt)
 
@@ -460,20 +475,95 @@ class PromptCapitalGuidanceTests(unittest.TestCase):
         self.assertNotIn("switch to manual code review with `read_file`", prompt)
 
     def test_prompt_makes_attack_search_the_authoritative_scheduler(self):
-        # One authoritative scheduler: attack_search owns branch scheduling and
-        # the required next_action. Every other planning tool is advisory context
-        # and must not override the controller without an explicit transition.
+        # One authoritative scheduler: attack_search owns branch scheduling,
+        # derived progress/coverage, and the required next_action. The brief is a
+        # mirror for recovery, never another planner.
         prompt = build_system_prompt()
 
-        self.assertIn("authoritative for branch scheduling", prompt)
-        self.assertIn("advisory context", prompt)
-        self.assertIn("must not override", prompt)
+        self.assertIn("sole scheduler and model-facing planner", prompt)
+        self.assertIn("derives campaign progress and attack-surface coverage", prompt)
+        self.assertIn("mirrors the controller's current branches", prompt)
+        self.assertIn("does not schedule work", prompt)
+        self.assertIn("Do not override the controller", prompt)
         self.assertIn("attack_search.next_action", prompt)
-        # The planner is reframed as advisory, not "the main orchestration tool".
-        self.assertIn("advisory planning aid", prompt)
         self.assertNotIn("main orchestration tool", prompt)
         # Known bug classes remain lenses, not rails.
         self.assertIn("lenses, not rails", prompt)
+
+    def test_prompt_removes_duplicate_model_facing_workflows(self):
+        prompt = build_system_prompt()
+
+        for removed in (
+            "plan_attack_campaign",
+            "review_campaign_progress",
+            "create_experiment",
+            "review_attack_surface_coverage",
+            "prepare_fork_exploit_workbench",
+        ):
+            self.assertNotIn(removed, prompt)
+        self.assertIn("call `compose_sequence_experiment` directly", prompt)
+        self.assertIn("integrated mechanism adapter", prompt)
+
+    def test_prompt_requires_structured_hypotheses_before_experiments(self):
+        prompt = build_system_prompt()
+
+        self.assertIn("structured `hypothesis_card`", prompt)
+        for field in (
+            "attacker_control",
+            "state_path",
+            "invariant_at_risk",
+            "impact_sink",
+            "material_preconditions",
+            "falsifier",
+            "objective",
+        ):
+            self.assertIn(field, prompt)
+        self.assertIn("instead of inventing a placeholder experiment", prompt)
+        self.assertIn(
+            "it never creates placeholder or linked experiments",
+            prompt,
+        )
+        self.assertIn("route a later `compose_sequence_experiment` step", prompt)
+
+    def test_prompt_keeps_causal_paths_and_manual_invariants_in_their_lanes(self):
+        prompt = build_system_prompt()
+
+        self.assertIn("bounded causal paths", prompt)
+        self.assertIn("causal paths, and graph candidates are planning context", prompt)
+        self.assertIn("advanced manual-only escape hatch", prompt)
+        self.assertIn("`attack_search` does not recommend it automatically", prompt)
+        self.assertIn("TODO-only harness is not campaign progress or evidence", prompt)
+
+    def test_prompt_scope_ranking_never_excludes_profiles(self):
+        prompt = build_system_prompt()
+
+        self.assertIn("Scope-name and lexical signals rank attention only", prompt)
+        self.assertIn("they never exclude bland, infrastructure, proxy, provider", prompt)
+        self.assertIn("lexical rank never removes a parsed profile", prompt)
+        self.assertIn(
+            "Action-space pages and addressed live-reachability pages accumulate",
+            prompt,
+        )
+        self.assertIn(
+            "consume the latest completed retained action-space snapshot",
+            prompt,
+        )
+
+    def test_prompt_keeps_permanent_fund_locking_in_scope_consistently(self):
+        prompt = build_system_prompt()
+
+        self.assertIn(
+            "loss-of-funds or permanent fund-locking vulnerabilities",
+            prompt,
+        )
+        self.assertIn(
+            "cause loss of funds or permanent fund locking",
+            prompt,
+        )
+        self.assertNotIn(
+            "Focus exclusively on loss-of-funds vulnerabilities",
+            prompt,
+        )
 
     def test_prompt_documents_partial_probe_and_harness_limit_parking(self):
         # Partial probes preserve research momentum but are setup evidence only,

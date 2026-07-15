@@ -8,6 +8,7 @@ both are re-exported here so existing imports keep resolving. See
 
 import asyncio
 import bisect
+import copy
 import dataclasses
 import hashlib
 import json
@@ -93,8 +94,6 @@ async def execute_tool(
                 return await _read_campaign(container, arguments)
             case "update_campaign":
                 return await _update_campaign(container, arguments)
-            case "review_campaign_progress":
-                return await _review_campaign_progress(container, arguments)
             case "build_campaign_brief":
                 return await _build_campaign_brief(container, arguments)
             case "attack_search":
@@ -107,14 +106,6 @@ async def execute_tool(
                 return await _inventory_live_targets(container, arguments)
             case "build_attack_graph":
                 return await _build_attack_graph(container, arguments)
-            case "review_attack_surface_coverage":
-                return await _review_attack_surface_coverage(container, arguments)
-            case "plan_attack_campaign":
-                return await _plan_attack_campaign(container, arguments)
-            case "create_experiment":
-                return await _create_experiment(container, arguments)
-            case "prepare_fork_exploit_workbench":
-                return await _prepare_fork_exploit_workbench(container, arguments)
             case "run_experiment":
                 return await _run_experiment(container, arguments)
             case "run_sequence_minimization":
@@ -267,9 +258,10 @@ from reentbotpro.campaign_state import (  # noqa: F401, E402
     _EXPERIMENT_OBJECTIVE_RUN_KINDS,
     _EXPERIMENT_RUN_KINDS,
     _EXPERIMENT_SETUP_RUN_KINDS,
-    _EXPERIMENT_TEMPLATES,
     _FUZZ_FAILURE_MARKERS,
     _LIVE_INVENTORY_MAX_TARGETS,
+    _LEGACY_CAMPAIGN_ID_PREFIXES,
+    _HYPOTHESIS_CARD_FIELDS,
     _TOP_LEVEL_ARTIFACT_DIRS,
     _TRACE_ALLOWED_PREFIXES,
     _TRACE_MAX_BYTES,
@@ -278,30 +270,25 @@ from reentbotpro.campaign_state import (  # noqa: F401, E402
     _brief_latest_artifacts,
     _brief_markdown,
     _brief_state_entries,
-    _brief_suggest_next,
     _brief_text,
-    _compact_coverage_gap,
-    _coverage_gap_action_key,
-    _coverage_gap_priority_score,
     _empty_campaign_state,
     _entries_referencing,
     _entry_evidence,
     _entry_references_id,
     _entry_related_ids,
     _entry_summary,
+    _finding_review_reference_id,
     _load_campaign_json_if_exists,
     _load_campaign_state,
     _next_campaign_id,
-    _progress_action_spaces_without_coverage,
+    _normalize_hypothesis_card,
     _progress_blocked_results,
     _progress_blocked_reviews,
-    _progress_campaign_plans,
     _progress_candidate_fuzz_runs,
     _progress_evaluations,
     _progress_evidence_paths,
     _progress_hypotheses_without_experiments,
     _progress_missing_foundation,
-    _progress_next_actions,
     _progress_ready_reviews,
     _read_campaign,
     _review_route_blocking_gaps,
@@ -362,93 +349,6 @@ async def _append_campaign_trace(
     lines = lines[-(_CAMPAIGN_TRACE_MAX_EVENTS - 1):]
     lines.append(line)
     await container.write_file(_CAMPAIGN_TRACE_PATH, "\n".join(lines) + "\n")
-
-
-def _coverage_gap_dedupe_key(item: dict) -> str:
-    params = []
-    for param in item.get("parameters") or []:
-        if isinstance(param, dict):
-            params.append(str(param.get("raw") or param.get("type") or param.get("name") or ""))
-        else:
-            params.append(str(param))
-    signature = ",".join(part for part in params if part)
-    return "|".join([
-        _coverage_normalize_text(str(item.get("contract") or "")),
-        _coverage_normalize_text(str(item.get("function") or "")),
-        _coverage_normalize_text(signature),
-        _coverage_normalize_text(_coverage_gap_action_key(item)),
-    ])
-
-
-async def _progress_coverage_gaps(
-    container: AuditContainer,
-    state: dict,
-) -> list[dict]:
-    gaps = []
-    decided_action_keys = _campaign_decided_action_keys(state)
-    for path in _progress_evidence_paths(
-        state,
-        "/workspace/campaign/coverage-reviews/",
-    ):
-        payload = await _load_campaign_json_if_exists(container, path)
-        if not payload:
-            continue
-        summary = payload.get("summary") or {}
-        high_gaps = int(summary.get("high_attention_gaps", 0) or 0)
-        hypothesized = int(summary.get("hypothesized_not_experimented", 0) or 0)
-        if not high_gaps and not hypothesized:
-            continue
-        stale_or_decided = 0
-        duplicate_high_gaps = 0
-        seen_gap_keys = set()
-        filtered_high_gaps = []
-        for item in payload.get("high_attention_gaps", []):
-            if not isinstance(item, dict):
-                continue
-            action_key = _coverage_gap_action_key(item)
-            if action_key and action_key in decided_action_keys:
-                stale_or_decided += 1
-                continue
-            dedupe_key = _coverage_gap_dedupe_key(item)
-            if dedupe_key and dedupe_key in seen_gap_keys:
-                duplicate_high_gaps += 1
-                continue
-            if dedupe_key:
-                seen_gap_keys.add(dedupe_key)
-            filtered_high_gaps.append(item)
-        filtered_high_gaps = sorted(
-            filtered_high_gaps,
-            key=lambda item: (
-                -_coverage_gap_priority_score(item),
-                _coverage_gap_action_key(item),
-            ),
-        )
-        if not filtered_high_gaps and not hypothesized:
-            continue
-        compact_summary = dict(summary)
-        compact_summary.update({
-            "raw_high_attention_gaps": high_gaps,
-            "high_attention_gaps": len(filtered_high_gaps),
-            "stale_or_decided_high_attention_gaps": stale_or_decided,
-            "duplicate_high_attention_gaps": duplicate_high_gaps,
-        })
-        gaps.append({
-            "id": payload.get("id"),
-            "title": payload.get("title"),
-            "path": path,
-            "action_space": payload.get("action_space"),
-            "summary": compact_summary,
-            "top_high_attention_gaps": [
-                _compact_coverage_gap(item)
-                for item in filtered_high_gaps[:5]
-            ],
-            "suggested_action": (
-                "turn the strongest coverage gap into a hypothesis and a sequence "
-                "experiment with explicit actions, use an invariant harness, or "
-                "reject it with a decision"
-            ),
-        })
-    return gaps
 
 
 async def _progress_sequence_minimizations_without_review(
@@ -544,14 +444,16 @@ def _sequence_quality_needs_context(experiment: dict, sequence_quality: dict) ->
         " ",
         json.dumps(sequence_quality, sort_keys=True, default=str),
     ).lower()
-    if not text:
-        return False
-    return any(term in text for term in _SEQUENCE_CONTEXT_BLOCKER_TERMS)
+    return bool(text) and any(
+        term in text for term in _SEQUENCE_CONTEXT_BLOCKER_TERMS
+    )
 
 
 def _progress_unrun_experiments(state: dict) -> list[dict]:
     items = []
     for experiment in state["sections"].get("experiment", []):
+        if experiment.get("manual_only") or _entry_is_fork_workbench(experiment):
+            continue
         if experiment.get("status", "open") not in {"open", "testing"}:
             continue
         experiment_id = str(experiment.get("id") or "")
@@ -674,225 +576,84 @@ def _progress_unrun_experiments(state: dict) -> list[dict]:
     return items
 
 
-# Advisory tools (progress review, resume brief) surface process gaps and
-# suggestions. They are not the scheduler: attack_search stays authoritative for
-# the required next_action and branch transitions, so their model-visible output
-# carries this note to keep planning signals from competing with the controller.
+# A campaign brief is a continuity projection, not a planner. It mirrors the
+# controller so a resumed model does not invent a competing next action.
 _CONTROLLER_AUTHORITY_NOTE = (
-    "Advisory gaps and suggestions only. attack_search is authoritative for the "
-    "required next_action and branch transitions; sync it before acting."
+    "Continuity projection only. attack_search is authoritative for the required "
+    "next_action and branch transitions; sync it before acting."
 )
 
 
-async def _review_campaign_progress(container: AuditContainer, args: dict) -> str:
-    max_items = min(max(int(args.get("max_items", 25)), 1), 100)
-    state = await _load_campaign_state(container)
-
-    missing_foundation = _progress_missing_foundation(state)
-    hypotheses_without_experiments = _progress_hypotheses_without_experiments(state)
-    experiments_without_results = _progress_unrun_experiments(state)
-    blocked_results = await _progress_blocked_results(container, state)
-    failed_evaluations = await _progress_evaluations(container, state)
-    sequence_minimizations_without_review = (
-        await _progress_sequence_minimizations_without_review(container, state)
-    )
-    candidate_fuzz_failures = await _progress_candidate_fuzz_runs(container, state)
-    action_spaces_without_coverage = await _progress_action_spaces_without_coverage(
-        container,
-        state,
-    )
-    coverage_high_attention_gaps = await _progress_coverage_gaps(container, state)
-    latest_campaign_plans = await _progress_campaign_plans(container, state)
-    ready_finding_reviews = await _progress_ready_reviews(
-        container,
-        state,
-        prefix="/workspace/campaign/finding-reviews/",
-        kind="finding_evidence",
-    )
-    ready_report_reviews = await _progress_ready_reviews(
-        container,
-        state,
-        prefix="/workspace/campaign/report-reviews/",
-        kind="report_quality",
-    )
-
-    review_id = _next_campaign_id(state, "progress_review")
-    title = str(args.get("title") or "Campaign progress review").strip()
-    review = {
-        "id": review_id,
-        "title": title,
-        "focus": args.get("focus", ""),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "counts": {
-            section: len(state["sections"].get(section, []))
-            for section in _CAMPAIGN_SECTIONS
-        },
-        "counters": state.get("counters", {}),
-        "missing_foundation": missing_foundation[:max_items],
-        "hypotheses_without_experiments": hypotheses_without_experiments[:max_items],
-        "experiments_without_results": experiments_without_results[:max_items],
-        "blocked_results_without_decisions": blocked_results[:max_items],
-        "failed_evaluations": failed_evaluations[:max_items],
-        "sequence_minimizations_without_review": (
-            sequence_minimizations_without_review[:max_items]
-        ),
-        "candidate_fuzz_failures": candidate_fuzz_failures[:max_items],
-        "action_spaces_without_coverage": action_spaces_without_coverage[:max_items],
-        "coverage_high_attention_gaps": coverage_high_attention_gaps[:max_items],
-        "latest_campaign_plans": latest_campaign_plans[:max_items],
-        "ready_finding_reviews": ready_finding_reviews[:max_items],
-        "ready_report_reviews": ready_report_reviews[:max_items],
-        "open_questions": [
-            _entry_summary(item, section="open_question")
-            for item in state["sections"].get("open_question", [])
-            if item.get("status", "open") in {"open", "blocked", "inconclusive"}
-        ][:max_items],
-    }
-    review["next_actions"] = _progress_next_actions(review)
-    review["summary"] = {
-        "missing_foundation": len(missing_foundation),
-        "hypotheses_without_experiments": len(hypotheses_without_experiments),
-        "experiments_without_results": len(experiments_without_results),
-        "blocked_results_without_decisions": len(blocked_results),
-        "failed_evaluations": len(failed_evaluations),
-        "sequence_minimizations_without_review": len(sequence_minimizations_without_review),
-        "candidate_fuzz_failures": len(candidate_fuzz_failures),
-        "action_spaces_without_coverage": len(action_spaces_without_coverage),
-        "coverage_high_attention_gaps": len(coverage_high_attention_gaps),
-        "latest_campaign_plans": len(latest_campaign_plans),
-        "ready_finding_reviews": len(ready_finding_reviews),
-        "ready_report_reviews": len(ready_report_reviews),
-        "open_questions": len(review["open_questions"]),
-    }
-
-    review_path = f"/workspace/campaign/progress-reviews/{review_id}.json"
-    await container.write_file(
-        review_path,
-        json.dumps(review, indent=2, sort_keys=True) + "\n",
-    )
-    await _save_campaign_state(container, state)
-
-    result_id = ""
-    if args.get("record_result", True):
-        result_id = await _record_result_artifact(
-            container,
-            title=f"Campaign progress review: {title}",
-            content=(
-                f"Progress review: {review_id}\n"
-                f"Path: {review_path}\n"
-                f"Missing foundation: {review['summary']['missing_foundation']}\n"
-                "Hypotheses without experiments: "
-                f"{review['summary']['hypotheses_without_experiments']}\n"
-                f"Experiments without results: {review['summary']['experiments_without_results']}\n"
-                f"Failed evaluations: {review['summary']['failed_evaluations']}\n"
-                f"Candidate fuzz failures: {review['summary']['candidate_fuzz_failures']}\n"
-                "Action spaces without coverage: "
-                f"{review['summary']['action_spaces_without_coverage']}\n"
-                "Coverage high-attention gaps: "
-                f"{review['summary']['coverage_high_attention_gaps']}\n"
-                f"Campaign plans: {review['summary']['latest_campaign_plans']}\n"
-                f"Ready report reviews: {review['summary']['ready_report_reviews']}"
-            ),
-            evidence=[review_path],
-            related_ids=[],
-            status="observed",
-        )
-
-    await _append_campaign_trace(
-        container,
-        {
-            "event": "progress_review",
-            "review_id": review_id,
-            "path": review_path,
-            "result_id": result_id or None,
-            "summary": review["summary"],
-            "next_actions": review["next_actions"][:5],
-        },
-    )
-
-    response = {
-        "review_id": review_id,
-        "path": review_path,
-        "trace_path": _CAMPAIGN_TRACE_PATH,
-        "result_id": result_id or None,
-        "controller_note": _CONTROLLER_AUTHORITY_NOTE,
-        "summary": review["summary"],
-        "next_actions": review["next_actions"],
-        "missing_foundation": review["missing_foundation"],
-        "hypotheses_without_experiments": review["hypotheses_without_experiments"],
-        "experiments_without_results": review["experiments_without_results"],
-        "blocked_results_without_decisions": review["blocked_results_without_decisions"],
-        "failed_evaluations": review["failed_evaluations"],
-        "sequence_minimizations_without_review": review[
-            "sequence_minimizations_without_review"
-        ],
-        "candidate_fuzz_failures": review["candidate_fuzz_failures"],
-        "action_spaces_without_coverage": review["action_spaces_without_coverage"],
-        "coverage_high_attention_gaps": review["coverage_high_attention_gaps"],
-        "latest_campaign_plans": review["latest_campaign_plans"],
-        "ready_finding_reviews": review["ready_finding_reviews"],
-        "ready_report_reviews": review["ready_report_reviews"],
-    }
-    return json.dumps(response, indent=2, sort_keys=True)
 
 
 async def _build_campaign_brief(container: AuditContainer, args: dict) -> str:
+    """Persist a compact projection of campaign state and its controller.
+
+    The brief is continuity context only. It mirrors attack_search.next_action
+    exactly and never computes or selects a competing schedule.
+    """
     max_items = min(max(int(args.get("max_items", 8)), 1), 30)
     state = await _load_campaign_state(container)
-
-    missing_foundation = _progress_missing_foundation(state)
-    hypotheses_without_experiments = _progress_hypotheses_without_experiments(state)
-    experiments_without_results = _progress_unrun_experiments(state)
-    blocked_results = await _progress_blocked_results(container, state)
-    failed_evaluations = await _progress_evaluations(container, state)
-    sequence_minimizations_without_review = (
-        await _progress_sequence_minimizations_without_review(container, state)
-    )
-    candidate_fuzz_failures = await _progress_candidate_fuzz_runs(container, state)
-    action_spaces_without_coverage = await _progress_action_spaces_without_coverage(
+    search = await _load_campaign_json_if_exists(
         container,
-        state,
+        _ATTACK_SEARCH_CURRENT_PATH,
     )
-    coverage_high_attention_gaps = await _progress_coverage_gaps(container, state)
-    latest_campaign_plans = await _progress_campaign_plans(container, state)
-    ready_finding_reviews = await _progress_ready_reviews(
-        container,
-        state,
-        prefix="/workspace/campaign/finding-reviews/",
-        kind="finding_evidence",
+    next_action = (
+        dict(search.get("next_action") or {})
+        if isinstance(search, dict)
+        else {
+            "status": "needs_controller_sync",
+            "tool": "attack_search",
+            "required_args": {"attack_search": {"action": "sync"}},
+            "instructions": (
+                "No authoritative controller state exists yet; call attack_search "
+                "with action=sync before choosing work."
+            ),
+            "must_follow": True,
+        }
     )
-    ready_report_reviews = await _progress_ready_reviews(
-        container,
-        state,
-        prefix="/workspace/campaign/report-reviews/",
-        kind="report_quality",
-    )
-
-    active_work = {
-        "missing_foundation": missing_foundation[:max_items],
-        "hypotheses_without_experiments": hypotheses_without_experiments[:max_items],
-        "experiments_without_results": experiments_without_results[:max_items],
-        "blocked_results_without_decisions": blocked_results[:max_items],
-        "failed_evaluations": failed_evaluations[:max_items],
-        "sequence_minimizations_without_review": (
-            sequence_minimizations_without_review[:max_items]
-        ),
-        "candidate_fuzz_failures": candidate_fuzz_failures[:max_items],
-        "action_spaces_without_coverage": action_spaces_without_coverage[:max_items],
-        "coverage_high_attention_gaps": coverage_high_attention_gaps[:max_items],
-    }
-    progress_like = {
-        **active_work,
-        "latest_campaign_plans": latest_campaign_plans[:max_items],
-        "ready_finding_reviews": ready_finding_reviews[:max_items],
-        "ready_report_reviews": ready_report_reviews[:max_items],
-    }
-    progress_like["next_actions"] = _progress_next_actions(progress_like)
+    active_branches = [
+        branch
+        for branch in (search or {}).get("branches") or []
+        if isinstance(branch, dict) and not _attack_search_branch_terminal(branch)
+    ]
+    active_branches.sort(key=_attack_search_branch_sort_key)
 
     brief_id = _next_campaign_id(state, "campaign_brief")
     title = str(args.get("title") or "Campaign resume brief").strip()
     brief_path = "/workspace/campaign/brief.json"
     markdown_path = "/workspace/campaign/brief.md"
+    latest_directories = {
+        "protocol_graphs": "/workspace/campaign/protocol-graphs/",
+        "action_spaces": "/workspace/campaign/action-spaces/",
+        "state_transition_models": "/workspace/campaign/state-transition-models/",
+        "live_reachability": "/workspace/campaign/live-reachability/",
+        "live_inventory": "/workspace/campaign/live-inventory/",
+        "attack_graphs": "/workspace/campaign/attack-graphs/",
+        "fork_contexts": "/workspace/campaign/fork-contexts/",
+        "economics": "/workspace/campaign/economics/",
+        "fuzz_runs": "/workspace/campaign/fuzz-runs/",
+        "sequence_minimizations": "/workspace/campaign/minimizations/",
+        "finding_reviews": "/workspace/campaign/finding-reviews/",
+        "report_reviews": "/workspace/campaign/report-reviews/",
+    }
+    latest_artifacts = {
+        name: await _brief_latest_artifacts(
+            container,
+            state,
+            directory,
+            max_items=max_items,
+        )
+        for name, directory in latest_directories.items()
+    }
+    compact_branches = [
+        _compact_attack_branch(
+            branch,
+            terminal=_attack_search_branch_terminal(branch),
+        )
+        for branch in active_branches[:max_items]
+    ]
+    controller_summary = dict((search or {}).get("summary") or {})
     brief = {
         "id": brief_id,
         "title": title,
@@ -906,27 +667,18 @@ async def _build_campaign_brief(container: AuditContainer, args: dict) -> str:
             section: len(state["sections"].get(section, []))
             for section in _CAMPAIGN_SECTIONS
         },
-        "counters": state.get("counters", {}),
         "foundations": {
             "protocol_model": _brief_state_entries(
-                state,
-                "protocol_model",
-                max_items=max_items,
+                state, "protocol_model", max_items=max_items
             ),
             "trust_boundary": _brief_state_entries(
-                state,
-                "trust_boundary",
-                max_items=max_items,
+                state, "trust_boundary", max_items=max_items
             ),
             "value_flow": _brief_state_entries(
-                state,
-                "value_flow",
-                max_items=max_items,
+                state, "value_flow", max_items=max_items
             ),
             "invariant": _brief_state_entries(
-                state,
-                "invariant",
-                max_items=max_items,
+                state, "invariant", max_items=max_items
             ),
             "open_questions": _brief_state_entries(
                 state,
@@ -935,65 +687,23 @@ async def _build_campaign_brief(container: AuditContainer, args: dict) -> str:
                 max_items=max_items,
             ),
         },
-        "active_work": active_work,
-        "ready_to_submit": {
-            "finding_reviews": ready_finding_reviews[:max_items],
-            "report_reviews": ready_report_reviews[:max_items],
+        "attack_search": {
+            "path": _ATTACK_SEARCH_CURRENT_PATH if search else None,
+            "search_id": (search or {}).get("id"),
+            "summary": controller_summary,
+            "next_action": next_action,
+            "active_branches": compact_branches,
+            "omitted_active_branches": max(
+                0, len(active_branches) - len(compact_branches)
+            ),
+            "dossier_path": next_action.get("dossier_path"),
         },
-        "latest_artifacts": {
-            "plans": latest_campaign_plans[:max_items],
-            "progress_reviews": await _brief_latest_artifacts(
-                container,
-                state,
-                "/workspace/campaign/progress-reviews/",
-                max_items=max_items,
-            ),
-            "protocol_graphs": await _brief_latest_artifacts(
-                container,
-                state,
-                "/workspace/campaign/protocol-graphs/",
-                max_items=max_items,
-            ),
-            "action_spaces": await _brief_latest_artifacts(
-                container,
-                state,
-                "/workspace/campaign/action-spaces/",
-                max_items=max_items,
-            ),
-            "coverage_reviews": await _brief_latest_artifacts(
-                container,
-                state,
-                "/workspace/campaign/coverage-reviews/",
-                max_items=max_items,
-            ),
-            "fork_contexts": await _brief_latest_artifacts(
-                container,
-                state,
-                "/workspace/campaign/fork-contexts/",
-                max_items=max_items,
-            ),
-            "economics": await _brief_latest_artifacts(
-                container,
-                state,
-                "/workspace/campaign/economics/",
-                max_items=max_items,
-            ),
-            "fuzz_runs": await _brief_latest_artifacts(
-                container,
-                state,
-                "/workspace/campaign/fuzz-runs/",
-                max_items=max_items,
-            ),
-            "sequence_minimizations": await _brief_latest_artifacts(
-                container,
-                state,
-                "/workspace/campaign/minimizations/",
-                max_items=max_items,
-            ),
+        "active_work": {
+            "attack_search_branches": compact_branches,
         },
-        "progress_next_actions": progress_like["next_actions"],
+        "latest_artifacts": latest_artifacts,
+        "suggested_next": dict(next_action),
     }
-    brief["suggested_next"] = _brief_suggest_next(brief)
 
     await container.write_file(
         brief_path,
@@ -1003,7 +713,7 @@ async def _build_campaign_brief(container: AuditContainer, args: dict) -> str:
     await _save_campaign_state(container, state)
 
     result_id = ""
-    if args.get("record_result", True):
+    if args.get("record_result", False):
         result_id = await _record_result_artifact(
             container,
             title=f"Campaign resume brief: {title}",
@@ -1011,8 +721,8 @@ async def _build_campaign_brief(container: AuditContainer, args: dict) -> str:
                 f"Campaign brief: {brief_id}\n"
                 f"JSON: {brief_path}\n"
                 f"Markdown: {markdown_path}\n"
-                f"Suggested next tool: {brief['suggested_next']['tool']}\n"
-                f"Rationale: {brief['suggested_next']['rationale']}"
+                f"Controller status: {next_action.get('status')}\n"
+                f"Controller next tool: {next_action.get('tool')}"
             ),
             evidence=[brief_path, markdown_path],
             related_ids=[brief_id],
@@ -1025,23 +735,14 @@ async def _build_campaign_brief(container: AuditContainer, args: dict) -> str:
         "markdown_path": markdown_path,
         "result_id": result_id or None,
         "controller_note": _CONTROLLER_AUTHORITY_NOTE,
+        "attack_search": brief["attack_search"],
         "suggested_next": brief["suggested_next"],
         "summary": {
-            "missing_foundation": len(missing_foundation),
-            "hypotheses_without_experiments": len(hypotheses_without_experiments),
-            "experiments_without_results": len(experiments_without_results),
-            "failed_evaluations": len(failed_evaluations),
-            "sequence_minimizations_without_review": (
-                len(sequence_minimizations_without_review)
-            ),
-            "candidate_fuzz_failures": len(candidate_fuzz_failures),
-            "coverage_high_attention_gaps": len(coverage_high_attention_gaps),
-            "ready_report_reviews": len(ready_report_reviews),
-            "plans": len(latest_campaign_plans),
+            **controller_summary,
+            "open_questions": len(brief["foundations"]["open_questions"]),
         },
     }
     return json.dumps(response, indent=2, sort_keys=True)
-
 
 # ── Deterministic attack-search controller ─────────────────────────────────
 
@@ -1281,6 +982,22 @@ def _attack_search_branch_terminal(branch: dict) -> bool:
     )
 
 
+def _attack_search_branch_actionable(branch: dict) -> bool:
+    readiness = branch.get("readiness") or {}
+    # Ordinary parked work stays below the active queue and does not prevent a
+    # clean stop. A controller-derived integrity limit may explicitly block
+    # readiness, however: hiding it behind campaign_ready would turn an omitted
+    # source surface into implied coverage. Such a branch remains parked (not
+    # rejected) while surfacing its focused-map/decision path.
+    return (
+        not _attack_search_branch_terminal(branch)
+        and (
+            str(branch.get("status") or "") not in _ATTACK_SEARCH_PARKED_STATUSES
+            or bool(readiness.get("blocks_campaign_ready"))
+        )
+    )
+
+
 def _attack_search_candidate(
     *,
     key: str,
@@ -1299,6 +1016,7 @@ def _attack_search_candidate(
     required_evidence: list[str] | None = None,
     stop_condition: str = "",
     action_keys: list[str] | None = None,
+    coverage_keys: list[str] | None = None,
     action_family_keys: list[str] | None = None,
     clone_family_keys: list[str] | None = None,
     attack_keys: list[str] | None = None,
@@ -1316,6 +1034,7 @@ def _attack_search_candidate(
     recommended_budget: str | None = None,
     required_args: dict | None = None,
     readiness: dict | None = None,
+    hypothesis_card: dict | None = None,
     failure_diagnosis: dict | None = None,
 ) -> dict:
     candidate = {
@@ -1340,6 +1059,10 @@ def _attack_search_candidate(
     if action_keys:
         candidate["action_keys"] = [
             str(item) for item in action_keys if str(item).strip()
+        ]
+    if coverage_keys:
+        candidate["coverage_keys"] = [
+            str(item) for item in coverage_keys if str(item).strip()
         ]
     if action_family_keys:
         candidate["action_family_keys"] = [
@@ -1387,6 +1110,8 @@ def _attack_search_candidate(
         candidate["required_args"] = required_args
     if readiness:
         candidate["readiness"] = readiness
+    if hypothesis_card:
+        candidate["hypothesis_card"] = hypothesis_card
     if failure_diagnosis:
         candidate["failure_diagnosis"] = failure_diagnosis
     return candidate
@@ -1465,11 +1190,12 @@ def _attack_candidate_inventory_targets(candidate: dict, *, limit: int = 20) -> 
 async def _live_inventory_entries_by_address(
     container: AuditContainer,
     paths: list[str],
-    *,
-    limit: int = 12,
 ) -> dict[str, list[dict]]:
     entries: dict[str, list[dict]] = {}
-    for path in paths[-limit:]:
+    # Inventory artifacts are individually bounded. Loading every durable batch
+    # preserves identity coverage so an older satisfied target cannot fall out
+    # of a rolling cache and trigger an endless re-probe loop.
+    for path in paths:
         payload = await _load_campaign_json_if_exists(container, path)
         if not payload:
             continue
@@ -1985,81 +1711,24 @@ def _entry_is_fork_workbench(entry: dict) -> bool:
     )
 
 
-def _attack_graph_candidate_workbenches(
-    state: dict,
-    candidate: dict,
-) -> list[dict]:
-    tokens = [
-        str(candidate.get("candidate_id") or "").strip(),
-        str(candidate.get("attack_key") or "").strip(),
-    ]
-    tokens = [token for token in tokens if token]
-    if not tokens:
-        return []
-    matches = []
-    for experiment in state["sections"].get("experiment", []):
-        if not _entry_is_fork_workbench(experiment):
-            continue
-        haystack = "\n".join([
-            str(experiment.get("title") or ""),
-            str(experiment.get("content") or ""),
-            " ".join(_entry_related_ids(experiment)),
-            " ".join(str(item) for item in experiment.get("attack_keys") or []),
-            " ".join(str(item) for item in experiment.get("action_keys") or []),
-            *(_entry_evidence(experiment)),
-        ])
-        if any(token in haystack for token in tokens):
-            matches.append(experiment)
-    return matches
-
-
 def _attack_candidate_action_keys(candidate: dict) -> list[str]:
     keys = []
-    if candidate.get("action_key"):
-        keys.append(str(candidate.get("action_key")))
+    candidate_key = (
+        candidate.get("action_definition_key") or candidate.get("action_key")
+    )
+    if candidate_key:
+        keys.append(str(candidate_key))
     for action in candidate.get("actions") or []:
         if not isinstance(action, dict):
             continue
-        action_key = str(action.get("action_key") or "").strip()
+        action_key = str(
+            action.get("action_definition_key") or action.get("action_key") or ""
+        ).strip()
         if not action_key:
-            contract = str(action.get("contract") or "").strip()
-            function = str(action.get("function") or "").strip()
-            if contract and function:
-                action_key = f"{contract}::{function}"
+            action_key = _coverage_action_key(action)
         if action_key:
             keys.append(action_key)
     return sorted(dict.fromkeys(keys))
-
-
-async def _workbench_compose_args_from_entry(
-    container: AuditContainer,
-    entry: dict | None,
-) -> dict:
-    if not entry:
-        return {}
-    candidate_paths = [
-        path for path in _entry_evidence(entry)
-        if (
-            path.startswith("/workspace/campaign/fork-workbenches/")
-            and path.endswith("/workbench.json")
-        )
-    ]
-    if not candidate_paths:
-        match = re.search(
-            r"^Workbench:\s*(/workspace/campaign/fork-workbenches/[^\s]+/workbench\.json)\s*$",
-            str(entry.get("content") or ""),
-            flags=re.MULTILINE,
-        )
-        if match:
-            candidate_paths.append(match.group(1))
-    for path in candidate_paths:
-        payload = await _load_campaign_json_if_exists(container, path)
-        if not isinstance(payload, dict):
-            continue
-        compose_args = payload.get("compose_sequence_experiment_args") or {}
-        if isinstance(compose_args, dict):
-            return compose_args
-    return {}
 
 
 def _attack_search_has_objective_evidence(state: dict, result: dict) -> bool:
@@ -2127,6 +1796,66 @@ def _action_space_invalid_for_attack_search(action_space: dict | None) -> bool:
     return requested > 0 and scanned == 0
 
 
+async def _collapse_scope_batch_series_paths(
+    container: AuditContainer,
+    paths: list[str],
+) -> list[str]:
+    """Keep only the newest cumulative snapshot for each batch series.
+
+    Independent/legacy maps remain available. This prevents attack-search
+    coverage derivation from walking every cumulative ancestor (quadratic work
+    and repeated actions) while preserving deliberately separate focused maps.
+    """
+    selected: dict[str, tuple[int, str]] = {}
+    independent: list[tuple[int, str]] = []
+    for index, path in enumerate(paths):
+        payload = await _load_campaign_json_if_exists(container, path)
+        batch = (payload or {}).get("scope_batch") or {}
+        series_id = str(batch.get("series_id") or "").strip()
+        if series_id:
+            selected[series_id] = (index, path)
+        else:
+            independent.append((index, path))
+    return [
+        path
+        for _index, path in sorted(
+            [*independent, *selected.values()],
+            key=lambda item: item[0],
+        )
+    ]
+
+
+async def _latest_full_scope_action_space(
+    container: AuditContainer,
+    paths: list[str],
+) -> tuple[str, dict | None]:
+    for path in reversed(paths):
+        payload = await _load_campaign_json_if_exists(container, path)
+        if not isinstance(payload, dict):
+            continue
+        if "scope_batch" in payload:
+            batch = payload.get("scope_batch") or {}
+            if batch.get("kind") == "source_roots":
+                return path, payload
+            source = payload.get("source") or {}
+            if (
+                payload.get("scope_batch") is None
+                and source.get("path") in {"/audit", "/audit/src"}
+                and source.get("profile_roots_limit") is not None
+            ):
+                # Ordinary repositories without a ranked scope manifest still
+                # produce a complete one-shot broad map. ``scope_batch=None``
+                # means batching was inapplicable, not that mapping is missing.
+                return path, payload
+            # New one-shot explicit/narrow maps are independent context, not a
+            # replacement for the retained manifest-backed scope series.
+            continue
+        # Legacy artifacts predate explicit batching. Preserve migration and
+        # test-fixture behavior by treating the newest one as the active map.
+        return path, payload
+    return "", None
+
+
 # Cap on curiosity/diversity frontier branches surfaced per attack_search run.
 # Kept small (1-3) so the queue is nudged, never flooded: the frontier preserves
 # many low-label branches in the artifact, but only a handful are promoted to
@@ -2145,14 +1874,17 @@ def _attack_search_frontier_branch_from_entry(
     frontier entry.
 
     Frontier branches are curiosity leads, not findings: their status routes the
-    agent to gather the missing context (live reachability, inspection, or a
-    workbench) and then either form a concrete hypothesis or record a decision.
+    agent to gather the missing context (live reachability or focused source
+    inspection) and then either form a concrete hypothesis or record a decision.
     The downstream submission gates still require a runnable fork PoC plus live
     exposure before any high/critical claim, so a frontier branch can never
     short-circuit into a finding.
     """
     attack_key = str(entry.get("attack_key") or "").strip()
     action_key = str(entry.get("action_key") or "").strip()
+    action_definition_key = str(
+        entry.get("action_definition_key") or action_key
+    ).strip()
     contract = entry.get("contract")
     function = entry.get("function")
     affordances = [str(item) for item in entry.get("affordances") or []]
@@ -2185,11 +1917,11 @@ def _attack_search_frontier_branch_from_entry(
         gather = "Map live reachability for it and bind a deployed target, then "
     elif structural:
         status, next_tool, toolsets = (
-            "needs_harness",
-            "prepare_fork_exploit_workbench",
-            ["experiment"],
+            "needs_context",
+            "source_slice or read_file then update_campaign",
+            ["core"],
         )
-        gather = "Prepare a fork workbench against the bound target, then "
+        gather = "Inspect its exact state/value/authority path, then "
     else:
         status, next_tool, toolsets = (
             "needs_context",
@@ -2207,6 +1939,7 @@ def _attack_search_frontier_branch_from_entry(
                 f"{contract}::{function}" if contract and function else None
             ),
             "action_key": action_key or None,
+            "action_definition_key": action_definition_key or None,
             "contract": contract,
             "function": function,
             "affordances": affordances,
@@ -2251,7 +1984,7 @@ def _attack_search_frontier_branch_from_entry(
             "from it without live exposure and objective replay evidence. Convert it "
             "into a concrete hypothesis or record a decision."
         ),
-        action_keys=[action_key] if action_key else [],
+        action_keys=[action_definition_key] if action_definition_key else [],
         attack_keys=[attack_key] if attack_key else [],
         target_actions=[target_action] if target_action else [],
         root_mechanism=str(entry.get("mechanism") or ""),
@@ -2413,6 +2146,31 @@ def _live_reachability_has_deployed_context(live_reachability: dict | None) -> b
     return False
 
 
+async def _latest_full_scope_live_reachability(
+    container: AuditContainer,
+    paths: list[str],
+) -> tuple[str, dict | None]:
+    """Return the newest reachability artifact covering the unfiltered scope.
+
+    Legacy artifacts without batch metadata remain readable and count as full
+    scope when they did not record focus filters. New artifacts state the
+    contract explicitly through ``scope_batch.full_scope``.
+    """
+    for path in reversed(paths):
+        payload = await _load_campaign_json_if_exists(container, path)
+        if not isinstance(payload, dict):
+            continue
+        batch = payload.get("scope_batch") or {}
+        if batch.get("kind") == "addressed_profiles":
+            if batch.get("full_scope"):
+                return path, payload
+            continue
+        filters = payload.get("filters") or {}
+        if not (filters.get("focus_contracts") or []):
+            return path, payload
+    return "", None
+
+
 def _attack_graph_candidate_needs_live_context(candidate: dict, actions: list) -> bool:
     """True when a candidate still lacks target/live binding and must not be
     materialized as a fork sequence yet."""
@@ -2445,6 +2203,154 @@ def _attack_graph_candidate_needs_live_context(candidate: dict, actions: list) -
     return False
 
 
+def _attack_graph_candidate_hypothesis_readiness(candidate: dict) -> dict:
+    """Return the shared seven-field experiment-admission card for a graph lead.
+
+    An explicit ``hypothesis_card`` is authoritative, including when it is
+    partial: filling its omissions from generic graph prose would defeat the
+    admission gate.  Older/generated graph candidates without a card may be
+    upgraded deterministically from their concrete action path, objective,
+    bindings, blockers, and falsification guidance.  This is normalization at
+    the authoritative controller boundary, not a second planning workflow.
+    """
+    explicit = "hypothesis_card" in candidate
+    invalid_card = ""
+    if explicit:
+        try:
+            card = _normalize_hypothesis_card(candidate.get("hypothesis_card"))
+        except ValueError as exc:
+            card = {}
+            invalid_card = str(exc)
+    else:
+        actions = [
+            item for item in candidate.get("actions") or []
+            if isinstance(item, dict)
+        ]
+        first = actions[0] if actions else {}
+        last = actions[-1] if actions else {}
+
+        def action_label(action: dict) -> str:
+            contract = str(action.get("contract") or "").strip()
+            signature = str(action.get("signature") or "").strip()
+            function = str(action.get("function") or "").strip()
+            call = signature or function
+            if contract and call:
+                return f"{contract}::{call}"
+            return call or str(
+                action.get("action_definition_key")
+                or action.get("action_key")
+                or action.get("target")
+                or ""
+            ).strip()
+
+        state_path = []
+        for index, action in enumerate(actions[:12], start=1):
+            label = action_label(action)
+            if not label:
+                continue
+            actor = str(action.get("actor") or "actor").strip()
+            effect = str(action.get("expected_effect") or "").strip()
+            step = f"{index}. {actor} invokes {label}"
+            if effect:
+                step += f" -> {effect}"
+            state_path.append(step)
+
+        invariant = (
+            candidate.get("invariant")
+            if isinstance(candidate.get("invariant"), dict)
+            else {}
+        )
+        objective = str(candidate.get("objective") or "").strip()
+        first_label = action_label(first)
+        first_actor = str(first.get("actor") or "").strip()
+        attacker_control = ""
+        if first_actor and first_label:
+            attacker_control = (
+                f"The proposed {first_actor} controls the {first_label} entry "
+                "step subject to its recorded live reachability and gate blockers."
+            )
+
+        preconditions = []
+        raw_preconditions = candidate.get("material_preconditions") or []
+        if isinstance(raw_preconditions, list):
+            preconditions.extend(
+                str(item).strip() for item in raw_preconditions
+                if str(item).strip()
+            )
+        target = str(candidate.get("target_address") or "").strip()
+        if target:
+            preconditions.append(
+                f"The recorded deployed target binding remains {target}."
+            )
+        for action in actions:
+            bound = str(action.get("bounds") or "").strip()
+            if bound:
+                preconditions.append(bound)
+            preconditions.extend(
+                str(item).strip() for item in action.get("live_blockers") or []
+                if str(item).strip()
+            )
+        preconditions.extend(
+            str(item).strip() for item in candidate.get("blockers") or []
+            if str(item).strip()
+        )
+
+        falsifier = str(candidate.get("falsifier") or "").strip()
+        if not falsifier:
+            falsifier = next(
+                (
+                    str(item).strip()
+                    for item in candidate.get("falsification_ideas") or []
+                    if str(item).strip()
+                ),
+                "",
+            )
+        if not falsifier:
+            falsifier = next(
+                (
+                    str(item).strip()
+                    for item in candidate.get("blockers") or []
+                    if str(item).strip().lower().startswith("reject if")
+                ),
+                "",
+            )
+
+        card = _normalize_hypothesis_card({
+            "attacker_control": attacker_control,
+            "state_path": state_path,
+            "invariant_at_risk": (
+                candidate.get("invariant_at_risk")
+                or invariant.get("statement")
+                or objective
+            ),
+            "impact_sink": candidate.get("impact_sink")
+            or last.get("expected_effect"),
+            "material_preconditions": _dedupe_text(preconditions),
+            "falsifier": falsifier,
+            "objective": objective,
+        })
+
+    labels = {
+        "attacker_control": "hypothesis_card.attacker_control",
+        "state_path": "hypothesis_card.state_path",
+        "invariant_at_risk": "hypothesis_card.invariant_at_risk",
+        "impact_sink": "hypothesis_card.impact_sink",
+        "material_preconditions": "hypothesis_card.material_preconditions",
+        "falsifier": "hypothesis_card.falsifier",
+        "objective": "hypothesis_card.objective",
+    }
+    missing = [labels[field] for field in _HYPOTHESIS_CARD_FIELDS if not card.get(field)]
+    if invalid_card:
+        missing.insert(0, invalid_card)
+    return {
+        "ready": not missing,
+        "missing": missing,
+        "hypothesis_card": card,
+        "invalid_card": invalid_card or None,
+        "source": "explicit" if explicit else "derived_from_attack_graph",
+    }
+
+
 async def _attack_search_candidates(
     container: AuditContainer,
     state: dict,
@@ -2452,6 +2358,45 @@ async def _attack_search_candidates(
     focus: str,
 ) -> list[dict]:
     candidates: dict[str, dict] = {}
+
+    # A graph lead whose generated card was incomplete can be concretized on
+    # the same durable controller branch with action=advance.  Keep that
+    # evidence-backed override keyed by the branch identity so later syncs
+    # regenerate the exact graph/STM/economic materialization arguments without
+    # losing target actions or creating a parallel hypothesis/planner branch.
+    admission_overrides = {
+        str(branch.get("key") or ""): override
+        for branch in (
+            ((state.get("attack_search") or {}).get("current") or {}).get(
+                "branches"
+            )
+            or []
+        )
+        if isinstance(branch, dict)
+        and isinstance((override := branch.get("admission_override")), dict)
+        and str(branch.get("key") or "").strip()
+    }
+
+    def apply_admission_override(branch_key: str, admission: dict) -> dict:
+        override = admission_overrides.get(branch_key) or {}
+        card = override.get("hypothesis_card")
+        override_evidence = [
+            str(item)
+            for item in override.get("evidence") or []
+            if str(item).strip()
+        ]
+        if not isinstance(card, dict) or not override_evidence:
+            return admission
+        overridden = _attack_graph_candidate_hypothesis_readiness({
+            "hypothesis_card": card,
+        })
+        if not overridden.get("ready"):
+            # Invalid legacy/current-state overrides cannot unlock a harness;
+            # fall back to the freshly derived candidate readiness.
+            return admission
+        overridden["source"] = "attack_search_advance"
+        overridden["evidence"] = override_evidence
+        return overridden
 
     def add(candidate: dict) -> None:
         candidates.setdefault(candidate["key"], candidate)
@@ -2482,18 +2427,103 @@ async def _attack_search_candidates(
         ))
         return list(candidates.values())
 
+    blocked_reviews = [
+        *await _progress_blocked_reviews(
+            container,
+            state,
+            prefix="/workspace/campaign/finding-reviews/",
+            kind="finding_evidence",
+        ),
+        *await _progress_blocked_reviews(
+            container,
+            state,
+            prefix="/workspace/campaign/report-reviews/",
+            kind="report_quality",
+        ),
+    ]
+    for review in blocked_reviews:
+        for summary in review.get("route_compositions") or []:
+            if not isinstance(summary, dict):
+                continue
+            for route in summary.get("routes") or []:
+                if not isinstance(route, dict):
+                    continue
+                route_branch = _plan_branch_from_route_review(
+                    review,
+                    summary,
+                    route,
+                    focus=focus,
+                )
+                if not route_branch:
+                    continue
+                next_tool = str(route_branch.get("recommended_next_tool") or "")
+                expected_names = {
+                    name
+                    for name in TOOL_BY_NAME
+                    if re.search(rf"\b{re.escape(name)}\b", next_tool)
+                }
+                toolsets = sorted(toolsets_for_tool_names(expected_names)) or ["evidence"]
+                setup = "; ".join(route_branch.get("required_setup") or [])
+                blockers = "; ".join(route_branch.get("blockers") or [])
+                add(_attack_search_candidate(
+                    key=str(route_branch.get("_dedupe_key") or route_branch.get("title")),
+                    source=str(route_branch.get("source") or "blocked_route_review"),
+                    title=str(route_branch.get("title") or "Close route evidence gap"),
+                    status=(
+                        "needs_report_review"
+                        if review.get("kind") == "report_quality"
+                        else "needs_evidence"
+                    ),
+                    next_tool=next_tool,
+                    required_toolsets=toolsets,
+                    priority=_plan_priority(
+                        int(route_branch.get("priority_score", 0) or 0)
+                    ),
+                    priority_score=int(route_branch.get("priority_score", 0) or 0),
+                    source_ids=route_branch.get("source_ids") or [],
+                    source_artifacts=route_branch.get("source_artifacts") or [],
+                    related_ids=route_branch.get("source_ids") or [],
+                    instructions=(
+                        "A finding/report gate is blocked on composed-route proof. "
+                        f"Resolve only the missing route context. Setup: {setup}. "
+                        f"Blocking gaps: {blockers}. Then rerun the same review gate."
+                    ),
+                    required_evidence=route_branch.get("evidence_to_capture") or [],
+                    stop_condition=str(
+                        route_branch.get("stop_or_mutate_condition") or ""
+                    ),
+                    readiness=route_branch.get("route_review_context") or {},
+                ))
+
     protocol_graph_paths = _progress_evidence_paths(
         state,
         "/workspace/campaign/protocol-graphs/",
     )
-    action_space_paths = _progress_evidence_paths(
+    all_action_space_paths = _progress_evidence_paths(
         state,
         "/workspace/campaign/action-spaces/",
     )
-    latest_action_space = (
-        await _load_campaign_json_if_exists(container, action_space_paths[-1])
-        if action_space_paths else None
+    action_space_paths = await _collapse_scope_batch_series_paths(
+        container,
+        all_action_space_paths,
     )
+    (
+        full_scope_action_space_path,
+        latest_action_space,
+    ) = await _latest_full_scope_action_space(container, action_space_paths)
+    if full_scope_action_space_path:
+        # The full cumulative grammar is the primary/latest input. Independent
+        # focused maps remain in the list for coverage context but cannot mask
+        # an incomplete retained-scope series.
+        action_space_paths = [
+            path for path in action_space_paths
+            if path != full_scope_action_space_path
+        ] + [full_scope_action_space_path]
+    elif action_space_paths:
+        latest_action_space = await _load_campaign_json_if_exists(
+            container,
+            action_space_paths[-1],
+        )
     if _action_space_invalid_for_attack_search(latest_action_space):
         source = latest_action_space.get("source") or {}
         add(_attack_search_candidate(
@@ -2525,11 +2555,214 @@ async def _attack_search_candidates(
             },
         ))
         return list(candidates.values())
-    if not protocol_graph_paths:
+    action_scope_batch = (
+        (latest_action_space or {}).get("scope_batch") or {}
+        if isinstance(latest_action_space, dict) else {}
+    )
+    if (
+        action_scope_batch.get("kind") == "source_roots"
+        and action_scope_batch.get("has_more")
+    ):
+        continuation_args = dict(
+            action_scope_batch.get("continuation_args") or {}
+        )
+        continuation_args.update({
+            "profile_cursor": action_scope_batch.get("next_cursor"),
+            "source_file_cursor": int(
+                action_scope_batch.get("next_file_cursor") or 0
+            ),
+            "previous_action_space": action_space_paths[-1],
+        })
+        add(_attack_search_candidate(
+            key="map:action_space:scope_continuation",
+            source="incomplete_scope_batch",
+            title="Continue action-space mapping across retained scope roots",
+            status="needs_mapping",
+            next_tool="map_action_space",
+            required_toolsets=["map"],
+            priority="high",
+            priority_score=22,
+            source_ids=[latest_action_space.get("id")],
+            source_artifacts=[action_space_paths[-1]],
+            instructions=(
+                "The latest action-space artifact is a cumulative scope batch, "
+                f"but {action_scope_batch.get('remaining_items')} retained "
+                "profile root(s) and "
+                f"{action_scope_batch.get('remaining_files_in_selected_roots', 0)} "
+                "file(s) in the current root page remain. Continue from its "
+                "exact profile/file cursors and parent artifact before deriving "
+                "state models, reachability, "
+                "attack graphs, or experiments. The next artifact remains a "
+                "cumulative snapshot; do not replace this with a second planner."
+            ),
+            required_evidence=[
+                "a cumulative /workspace/campaign/action-spaces/*.json whose "
+                "scope_batch.has_more is false",
+            ],
+            stop_condition=(
+                "Repeat the controller-provided batch call until every retained "
+                "profile root has been processed or an explicit mapping blocker "
+                "is recorded."
+            ),
+            required_args={"map_action_space": continuation_args},
+        ))
+        return list(candidates.values())
+    action_retention = (
+        (latest_action_space or {}).get("section_retention") or {}
+        if full_scope_action_space_path else {}
+    )
+    action_retention_omissions = {
+        key: int((entry or {}).get("omitted_by_item_limit") or 0)
+        for key, entry in action_retention.items()
+        if isinstance(entry, dict)
+        and int((entry or {}).get("omitted_by_item_limit") or 0) > 0
+    }
+    if action_retention_omissions:
+        action_source = (latest_action_space or {}).get("source") or {}
+        continuation_config = action_scope_batch.get("continuation_args") or {}
+        current_max_items = int(
+            continuation_config.get("max_items")
+            or action_source.get("max_items")
+            or 2000
+        )
+        omitted_summary = ", ".join(
+            f"{key}={count}"
+            for key, count in sorted(action_retention_omissions.items())
+        )
+        if current_max_items < 10_000:
+            cumulative_totals = (
+                (latest_action_space or {}).get("cumulative_totals") or {}
+            )
+            required_capacity = max(
+                [
+                    int(cumulative_totals.get(key) or 0)
+                    for key in action_retention_omissions
+                ]
+                or [current_max_items + 1]
+            )
+            next_max_items = min(
+                10_000,
+                max(current_max_items * 2, required_capacity),
+            )
+            remap_args = {
+                "path": action_source.get("path") or "/audit",
+                "include_tests": bool(action_source.get("include_tests", False)),
+                "max_files": int(
+                    continuation_config.get("max_files")
+                    or action_source.get("max_files")
+                    or 160
+                ),
+                "max_roots": int(
+                    continuation_config.get("max_roots")
+                    or action_source.get("profile_roots_limit")
+                    or 12
+                ),
+                "max_items": next_max_items,
+            }
+            add(_attack_search_candidate(
+                key="map:action_space:retention_remap",
+                source="action_space_retention_limit",
+                title="Remap callable scope at a larger retention limit",
+                status="needs_mapping",
+                next_tool="map_action_space",
+                required_toolsets=["map"],
+                priority="high",
+                priority_score=23,
+                source_ids=[(latest_action_space or {}).get("id")],
+                source_artifacts=[full_scope_action_space_path],
+                instructions=(
+                    "The completed cumulative action space explicitly omitted "
+                    f"retained definitions ({omitted_summary}). Start a fresh "
+                    f"cumulative series with max_items={next_max_items}; then "
+                    "follow its normal controller-provided root/file cursors. "
+                    "Do not derive downstream coverage or claim readiness from "
+                    "the truncated grammar."
+                ),
+                required_evidence=[
+                    "a completed cumulative action-space artifact whose "
+                    "section_retention has no omitted_by_item_limit entries",
+                ],
+                stop_condition=(
+                    "If the hard 10,000-item bound still omits definitions, "
+                    "preserve the harness limit explicitly and use focused maps "
+                    "rather than treating omitted branches as rejected."
+                ),
+                required_args={"map_action_space": remap_args},
+            ))
+        else:
+            add(_attack_search_candidate(
+                key="map:action_space:retention_harness_limit",
+                source="action_space_retention_limit",
+                title="Preserve action-space retention as a harness limit",
+                status="parked_harness_limit",
+                next_tool=(
+                    "map_action_space files=[focused source subset] or "
+                    "attack_search action=decision"
+                ),
+                required_toolsets=["core"],
+                priority="medium",
+                priority_score=13,
+                source_ids=[(latest_action_space or {}).get("id")],
+                source_artifacts=[full_scope_action_space_path],
+                instructions=(
+                    "The full-scope artifact reached the 10,000-item hard bound "
+                    f"and still omitted definitions ({omitted_summary}). Keep this "
+                    "as an explicit non-rejection harness limit. Map focused file "
+                    "subsets for the omitted surface or record a controller "
+                    "decision; never claim complete action coverage."
+                ),
+                required_evidence=[
+                    "focused action-space maps covering the omitted source subset, "
+                    "or an explicit parked/decision record naming the harness limit",
+                ],
+                stop_condition=(
+                    "Do not convert omitted definitions into rejected or covered "
+                    "branches without a focused map."
+                ),
+                parking_reason=(
+                    "full-scope action grammar exceeds the 10,000-item retained "
+                    "artifact bound"
+                ),
+                recommended_budget=(
+                    "split by explicit source files or contract families"
+                ),
+                readiness={
+                    "ready": False,
+                    "blocks_campaign_ready": True,
+                    "missing": [
+                        "focused action-space coverage for definitions omitted "
+                        "at the hard retention limit"
+                    ],
+                },
+            ))
+        return list(candidates.values())
+    latest_protocol_graph = (
+        await _load_campaign_json_if_exists(container, protocol_graph_paths[-1])
+        if protocol_graph_paths else None
+    )
+    protocol_graph_action_space = str(
+        ((latest_protocol_graph or {}).get("source") or {}).get("action_space")
+        or ""
+    )
+    protocol_graph_scope_stale = bool(
+        full_scope_action_space_path
+        and (
+            not protocol_graph_action_space
+            or posixpath.normpath(protocol_graph_action_space)
+            != posixpath.normpath(full_scope_action_space_path)
+        )
+    )
+    if not protocol_graph_paths or protocol_graph_scope_stale:
         add(_attack_search_candidate(
             key="map:protocol_graph",
-            source="missing_map",
-            title="Build protocol graph before branch selection",
+            source=(
+                "stale_scope_map" if protocol_graph_scope_stale else "missing_map"
+            ),
+            title=(
+                "Refresh protocol graph from cumulative scope"
+                if protocol_graph_scope_stale
+                else "Build protocol graph before branch selection"
+            ),
             status="needs_mapping",
             next_tool="map_protocol_graph",
             required_toolsets=["map"],
@@ -2537,40 +2770,110 @@ async def _attack_search_candidates(
             priority_score=18,
             instructions=(
                 "Map value-flow, trust-boundary, oracle, router, callback, and "
-                "external-dependency edges for the active source root."
+                "external-dependency edges for the active source root. Consume "
+                "the completed cumulative action space when available so a "
+                "separate bounded root scan cannot hide later profiles."
             ),
             required_evidence=["/workspace/campaign/protocol-graphs/*.json"],
             stop_condition="Do not choose a complex route before protocol graph context exists.",
+            source_artifacts=(
+                [full_scope_action_space_path]
+                if full_scope_action_space_path else []
+            ),
+            required_args={
+                "map_protocol_graph": {
+                    "action_space": full_scope_action_space_path,
+                }
+            } if full_scope_action_space_path else {},
         ))
-    if not action_space_paths:
+    if not full_scope_action_space_path:
         add(_attack_search_candidate(
             key="map:action_space",
             source="missing_map",
-            title="Map callable action space before experiment design",
+            title="Map the retained-scope callable action space",
             status="needs_mapping",
             next_tool="map_action_space",
             required_toolsets=["map"],
             priority="high",
-            priority_score=17,
+            priority_score=22,
             instructions=(
                 "Extract public/external actions, observations, role gates, "
-                "state mutation hints, and value-moving affordances."
+                "state mutation hints, and value-moving affordances across the "
+                "manifest-backed scope. Independent focused maps do not replace "
+                "this cumulative scope map."
             ),
             required_evidence=["/workspace/campaign/action-spaces/*.json"],
             stop_condition="Do not write a harness until the callable action grammar is known.",
         ))
 
-    live_reachability_paths = _progress_evidence_paths(
+    all_live_reachability_paths = _progress_evidence_paths(
         state,
         "/workspace/campaign/live-reachability/",
     )
-    latest_live_reachability = (
-        await _load_campaign_json_if_exists(container, live_reachability_paths[-1])
-        if live_reachability_paths else None
+    all_live_reachability_paths = await _collapse_scope_batch_series_paths(
+        container,
+        all_live_reachability_paths,
+    )
+    (
+        full_scope_live_reachability_path,
+        latest_live_reachability,
+    ) = await _latest_full_scope_live_reachability(
+        container,
+        all_live_reachability_paths,
+    )
+    # Downstream campaign branches must bind to the cumulative unfiltered map,
+    # not a newer targeted/focus-only probe that covers only part of scope.
+    live_reachability_paths = (
+        [full_scope_live_reachability_path]
+        if full_scope_live_reachability_path else []
     )
     live_reachability_has_deployed_context = _live_reachability_has_deployed_context(
         latest_live_reachability
     )
+    live_scope_batch = (
+        (latest_live_reachability or {}).get("scope_batch") or {}
+        if isinstance(latest_live_reachability, dict) else {}
+    )
+    if (
+        live_scope_batch.get("kind") == "addressed_profiles"
+        and live_scope_batch.get("has_more")
+    ):
+        continuation_args = dict(live_scope_batch.get("continuation_args") or {})
+        continuation_args.update({
+            "profile_cursor": live_scope_batch.get("next_cursor"),
+            "previous_live_reachability": full_scope_live_reachability_path,
+        })
+        add(_attack_search_candidate(
+            key="map:live_reachability:scope_continuation",
+            source="incomplete_scope_batch",
+            title="Continue live reachability across addressed scope profiles",
+            status="needs_mapping",
+            next_tool="map_live_reachability",
+            required_toolsets=["map"],
+            priority="high",
+            priority_score=21,
+            source_ids=[latest_live_reachability.get("id")],
+            source_artifacts=[full_scope_live_reachability_path],
+            instructions=(
+                "The latest unfiltered live-reachability artifact is cumulative, "
+                f"but {live_scope_batch.get('remaining_items')} addressed "
+                "profiles remain. Continue from its exact cursor and parent "
+                "artifact. Offline or unavailable RPC results are explicit "
+                "reachability limitations and still complete the batch; never "
+                "silently remove the remaining profiles."
+            ),
+            required_evidence=[
+                "a cumulative /workspace/campaign/live-reachability/*.json whose "
+                "scope_batch.has_more is false",
+            ],
+            stop_condition=(
+                "Repeat the controller-provided batch call until every addressed "
+                "profile is recorded as probed, unprobed, ambiguous, or RPC-"
+                "unavailable."
+            ),
+            required_args={"map_live_reachability": continuation_args},
+        ))
+        return list(candidates.values())
     live_inventory_paths = _progress_evidence_paths(
         state,
         "/workspace/campaign/live-inventory/",
@@ -2608,10 +2911,243 @@ async def _attack_search_candidates(
         await _load_campaign_json_if_exists(container, attack_graph_paths[-1])
         if attack_graph_paths else None
     )
+    desired_attack_graph_mode = (
+        "reachability_aware"
+        if live_reachability_has_deployed_context
+        else "source_only"
+    )
+    attack_graph_stale_reasons = []
+    if attack_graph_paths:
+        if not isinstance(latest_attack_graph, dict):
+            attack_graph_stale_reasons.append("latest attack graph is unreadable")
+        else:
+            latest_action_space_path = action_space_paths[-1] if action_space_paths else ""
+            latest_protocol_graph_path = (
+                protocol_graph_paths[-1] if protocol_graph_paths else ""
+            )
+            latest_live_path = (
+                live_reachability_paths[-1] if live_reachability_paths else ""
+            )
+            recorded_action_space_path = str(
+                latest_attack_graph.get("action_space_path") or ""
+            )
+            recorded_protocol_graph_path = str(
+                latest_attack_graph.get("protocol_graph_path") or ""
+            )
+            recorded_live_path = str(
+                latest_attack_graph.get("live_reachability_path") or ""
+            )
+            recorded_mode = str(latest_attack_graph.get("mode") or "")
+            if (
+                latest_action_space_path
+                and recorded_action_space_path
+                and posixpath.normpath(recorded_action_space_path)
+                != posixpath.normpath(latest_action_space_path)
+            ):
+                attack_graph_stale_reasons.append("a newer action space is available")
+            if (
+                latest_protocol_graph_path
+                and recorded_protocol_graph_path
+                and posixpath.normpath(recorded_protocol_graph_path)
+                != posixpath.normpath(latest_protocol_graph_path)
+            ):
+                attack_graph_stale_reasons.append("a newer protocol graph is available")
+            if recorded_mode and recorded_mode != desired_attack_graph_mode:
+                attack_graph_stale_reasons.append(
+                    f"graph mode must change to {desired_attack_graph_mode}"
+                )
+            elif (
+                desired_attack_graph_mode == "reachability_aware"
+                and latest_attack_graph.get("needs_live_context") is True
+            ):
+                attack_graph_stale_reasons.append(
+                    "source-only graph now has deployed live context"
+                )
+            if (
+                desired_attack_graph_mode == "reachability_aware"
+                and latest_live_path
+                and recorded_live_path
+                and posixpath.normpath(recorded_live_path)
+                != posixpath.normpath(latest_live_path)
+            ):
+                attack_graph_stale_reasons.append(
+                    "a newer deployed live-reachability map is available"
+                )
+    attack_graph_inputs_stale = bool(attack_graph_stale_reasons)
     latest_state_transition_model_obj = (
         await _load_campaign_json_if_exists(container, latest_state_transition_model)
         if latest_state_transition_model else None
     )
+    model_section_retention = (
+        (latest_state_transition_model_obj or {}).get("section_retention") or {}
+    )
+    model_retention_omissions = {
+        section: int((retention or {}).get("omitted_by_item_limit") or 0)
+        for section, retention in model_section_retention.items()
+        if isinstance(retention, dict)
+        and int(retention.get("omitted_by_item_limit") or 0) > 0
+    }
+    if model_retention_omissions:
+        model_scope = (latest_state_transition_model_obj or {}).get("scope") or {}
+        source_inventory = (
+            (latest_state_transition_model_obj or {}).get("source_inventory") or {}
+        )
+        source_files = [
+            str(path)
+            for path in source_inventory.get("files") or []
+            if str(path).strip()
+        ]
+        current_max_items = max(
+            [
+                int((model_section_retention.get(section) or {}).get("max_items") or 50)
+                for section in model_retention_omissions
+            ]
+            or [50]
+        )
+        remap_args = {
+            "path": model_scope.get("path") or "/audit",
+            "focus": model_scope.get("focus") or "auto",
+            **({"files": source_files} if source_files else {}),
+            **(
+                {"contract": model_scope.get("contract")}
+                if model_scope.get("contract") else {}
+            ),
+            **(
+                {"action_space": model_scope.get("action_space")}
+                if model_scope.get("action_space") else {}
+            ),
+            **(
+                {"protocol_graph": model_scope.get("protocol_graph")}
+                if model_scope.get("protocol_graph") else {}
+            ),
+            **(
+                {"source_slice": model_scope.get("source_slice")}
+                if model_scope.get("source_slice") else {}
+            ),
+        }
+        omitted_summary = ", ".join(
+            f"{section}={count}"
+            for section, count in sorted(model_retention_omissions.items())
+        )
+        if current_max_items < 200:
+            next_max_items = min(
+                200,
+                max(
+                    current_max_items * 2,
+                    *[
+                        int(
+                            (model_section_retention.get(section) or {}).get(
+                                "total"
+                            ) or 0
+                        )
+                        for section in model_retention_omissions
+                    ],
+                ),
+            )
+            remap_args["max_items"] = next_max_items
+            add(_attack_search_candidate(
+                key="map:state_transition_model:retention_remap",
+                source="state_transition_model_retention_limit",
+                title="Re-extract the state model at a larger retention limit",
+                status="needs_mapping",
+                next_tool="extract_state_transition_model",
+                required_toolsets=["map"],
+                priority="high",
+                priority_score=24,
+                source_ids=[
+                    (latest_state_transition_model_obj or {}).get("id")
+                ],
+                source_artifacts=[latest_state_transition_model],
+                instructions=(
+                    "The latest state-transition model omitted modeled items "
+                    f"({omitted_summary}). Re-extract the same exact "
+                    f"source inventory with max_items={next_max_items} before "
+                    "building an attack graph. Omitted state, entrypoints, and "
+                    "invariant families are an unresolved frontier, not covered "
+                    "or rejected branches."
+                ),
+                required_evidence=[
+                    "a state-transition-model artifact whose section_retention "
+                    "records no omitted_by_item_limit entries",
+                ],
+                stop_condition=(
+                    "At the hard 200-item bound, preserve any remaining omitted "
+                    "frontier as an explicit harness limit instead of claiming "
+                    "complete invariant coverage."
+                ),
+                required_args={"extract_state_transition_model": remap_args},
+            ))
+        else:
+            focused_sources = list(dict.fromkeys(
+                str(entry.get("file"))
+                for section in model_retention_omissions
+                for entry in (
+                    (model_section_retention.get(section) or {}).get(
+                        "omitted_sources"
+                    ) or []
+                )
+                if isinstance(entry, dict)
+                and str(entry.get("file") or "").strip()
+                and str(entry.get("file")) != "<unknown>"
+            ))[:16]
+            focused_args = {
+                **remap_args,
+                **({"files": focused_sources} if focused_sources else {}),
+                "max_items": 200,
+            }
+            add(_attack_search_candidate(
+                key="map:state_transition_model:retention_harness_limit",
+                source="state_transition_model_retention_limit",
+                title="Preserve omitted state-model surfaces as a harness limit",
+                status="parked_harness_limit",
+                next_tool=(
+                    "extract_state_transition_model files=[focused omitted "
+                    "source subset] or attack_search action=decision"
+                ),
+                required_toolsets=["map", "core"],
+                priority="medium",
+                priority_score=14,
+                source_ids=[
+                    (latest_state_transition_model_obj or {}).get("id")
+                ],
+                source_artifacts=[latest_state_transition_model],
+                instructions=(
+                    "The state-transition model reached its 200-item hard bound "
+                    f"with modeled items still omitted ({omitted_summary}). Use "
+                    "the artifact's bounded omitted "
+                    "frontier to model focused source/contract subsets, or record "
+                    "an explicit harness-limit decision. Never convert the "
+                    "omitted frontier into rejected or covered branches."
+                ),
+                required_evidence=[
+                    "focused state-transition models for every omitted section "
+                    "frontier, "
+                    "or an explicit parked/decision record naming the limit",
+                ],
+                stop_condition=(
+                    "Do not claim complete state or invariant coverage while the "
+                    "model's retention metadata records omissions."
+                ),
+                parking_reason=(
+                    "state-transition model sections exceed the 200-item retained "
+                    "artifact bound"
+                ),
+                recommended_budget=(
+                    "split by the recorded omitted source/contract frontier"
+                ),
+                required_args={
+                    "extract_state_transition_model": focused_args,
+                },
+                readiness={
+                    "ready": False,
+                    "blocks_campaign_ready": True,
+                    "missing": [
+                        "focused state-transition coverage for modeled surfaces "
+                        "omitted at the hard retention limit"
+                    ],
+                },
+            ))
+        return list(candidates.values())
     state_transition_model_has_invariants = bool(
         (latest_state_transition_model_obj or {}).get("candidate_invariants")
     )
@@ -2704,8 +3240,8 @@ async def _attack_search_candidates(
     ):
         # A source-only attack graph is a valid planning artifact before live
         # reachability exists, and after live reachability was attempted but did
-        # not bind deployed context. It preserves the full source-derived branch
-        # frontier for novelty discovery; it does not replace live mapping, which
+        # not bind deployed context. It preserves a bounded, explicitly retained
+        # source-derived frontier for novelty discovery; it does not replace live mapping, which
         # stays the higher-priority next action when deployment/RPC context is
         # available, and it never relaxes the live-evidence submission gates.
         live_context_note = (
@@ -2730,8 +3266,8 @@ async def _attack_search_candidates(
             instructions=(
                 live_context_note
                 + "Build a source-only attack "
-                "graph (mode=source_only) so the full source-derived branch "
-                "frontier is preserved for novelty discovery while live context "
+                "graph (mode=source_only) so a bounded source-derived branch "
+                "frontier is retained for novelty discovery while live context "
                 "is pending. This is a planning artifact only: high/critical "
                 "submission still requires live exposure and objective fork-replay "
                 "evidence, so map live reachability whenever RPC or deployment "
@@ -2776,16 +3312,78 @@ async def _attack_search_candidates(
             ),
             required_evidence=["/workspace/campaign/attack-graphs/*.json"],
             stop_condition="Use the graph candidates as experiment skeletons, not findings.",
-            required_args=(
-                {
-                    "build_attack_graph": {
-                        "action_space": action_space_paths[-1],
-                        "live_reachability": live_reachability_paths[-1],
-                        "state_transition_model": latest_state_transition_model,
-                    },
-                }
-                if latest_state_transition_model else None
+            required_args={
+                "build_attack_graph": {
+                    "mode": "reachability_aware",
+                    "action_space": action_space_paths[-1],
+                    "live_reachability": live_reachability_paths[-1],
+                    **(
+                        {"state_transition_model": latest_state_transition_model}
+                        if latest_state_transition_model else {}
+                    ),
+                },
+            },
+        ))
+    if attack_graph_paths and attack_graph_inputs_stale and action_space_paths:
+        rebuild_args = {
+            "mode": desired_attack_graph_mode,
+            "action_space": action_space_paths[-1],
+            "preserve_frontier": True,
+            **(
+                {"protocol_graph": protocol_graph_paths[-1]}
+                if protocol_graph_paths else {}
             ),
+            **(
+                {"live_reachability": live_reachability_paths[-1]}
+                if (
+                    desired_attack_graph_mode == "reachability_aware"
+                    and live_reachability_paths
+                ) else {}
+            ),
+            **(
+                {"state_transition_model": latest_state_transition_model}
+                if latest_state_transition_model else {}
+            ),
+        }
+        add(_attack_search_candidate(
+            key="map:attack_graph:refresh_inputs",
+            source="stale_attack_graph",
+            title="Rebuild the attack graph from current maps",
+            status="needs_mapping",
+            next_tool="build_attack_graph",
+            required_toolsets=["map"],
+            priority=(
+                "high"
+                if desired_attack_graph_mode == "reachability_aware"
+                else "medium"
+            ),
+            priority_score=(
+                19
+                if desired_attack_graph_mode == "reachability_aware"
+                else 14
+            ),
+            source_artifacts=[
+                attack_graph_paths[-1],
+                action_space_paths[-1],
+                *(protocol_graph_paths[-1:] if protocol_graph_paths else []),
+                *(live_reachability_paths[-1:] if live_reachability_paths else []),
+            ],
+            instructions=(
+                "The latest attack graph no longer matches the authoritative "
+                "action/protocol/live maps: "
+                + "; ".join(attack_graph_stale_reasons)
+                + ". Rebuild it before scheduling graph candidates so stale "
+                "source-only or address bindings cannot loop or create false "
+                "experiment branches."
+            ),
+            required_evidence=[
+                "/workspace/campaign/attack-graphs/*.json bound to the current maps",
+            ],
+            stop_condition=(
+                "Graph candidates remain planning context; deployed impact still "
+                "requires objective live/fork evidence."
+            ),
+            required_args={"build_attack_graph": rebuild_args},
         ))
     # Condition B: a state-transition model with invariants exists, an attack
     # graph exists, but the latest graph did not consume the model -- so its
@@ -2799,6 +3397,7 @@ async def _attack_search_candidates(
         and latest_state_transition_model
         and state_transition_model_has_invariants
         and not latest_attack_graph_uses_model
+        and not attack_graph_inputs_stale
     ):
         rebuild_mode = (
             "auto"
@@ -2864,7 +3463,11 @@ async def _attack_search_candidates(
     decided_clone_family_keys = set(
         (state.get("attack_search") or {}).get("decided_clone_family_keys") or []
     )
-    if attack_graph_paths:
+    latest_attack_graph_is_current = bool(
+        attack_graph_paths
+        and not attack_graph_inputs_stale
+    )
+    if latest_attack_graph_is_current:
         for candidate in (latest_attack_graph or {}).get("candidate_chains") or []:
             if not isinstance(candidate, dict):
                 continue
@@ -2872,6 +3475,14 @@ async def _attack_search_candidates(
             if attack_key and attack_key in decided_attack_keys:
                 continue
             actions = candidate.get("actions") or []
+            candidate_branch_key = (
+                f"attack_graph:{attack_key or candidate.get('action_key')}"
+            )
+            admission = apply_admission_override(
+                candidate_branch_key,
+                _attack_graph_candidate_hypothesis_readiness(candidate),
+            )
+            admission_ready = bool(admission.get("ready"))
             action_keys = _attack_candidate_action_keys(candidate)
             action_family_keys = sorted(_attack_candidate_action_family_key_set(candidate))
             clone_family_keys = sorted(_attack_candidate_clone_family_key_set(candidate))
@@ -2896,6 +3507,9 @@ async def _attack_search_candidates(
                 if isinstance(candidate.get("source"), dict)
                 else {}
             )
+            candidate_live_mapping_attempted = bool(
+                candidate_source.get("live_reachability")
+            )
             candidate_invariant = (
                 candidate.get("invariant")
                 if isinstance(candidate.get("invariant"), dict)
@@ -2915,19 +3529,13 @@ async def _attack_search_candidates(
             state_transition_model_ref = str(
                 candidate_source.get("state_transition_model") or ""
             ).strip()
-            workbench_mechanism_hint = _candidate_explicit_fork_workbench_mechanism(candidate)
+            mechanism_hint = _candidate_explicit_fork_workbench_mechanism(candidate)
             materialized_experiments = _attack_graph_candidate_experiments(
                 state,
                 candidate,
             )
             materialized_experiment = (
                 materialized_experiments[-1] if materialized_experiments else None
-            )
-            workbenches = _attack_graph_candidate_workbenches(state, candidate)
-            workbench = workbenches[-1] if workbenches else None
-            workbench_compose_args = (
-                await _workbench_compose_args_from_entry(container, workbench)
-                if workbench else {}
             )
             inventory_targets = _attack_candidate_inventory_targets(candidate)
             inventory_context = _candidate_inventory_context(
@@ -2981,9 +3589,6 @@ async def _attack_search_candidates(
                 else:
                     branch_status = "needs_run"
                     branch_next_tool = "run_experiment"
-            elif workbench:
-                branch_status = "needs_harness"
-                branch_next_tool = "compose_sequence_experiment"
             elif inventory_targets and not inventory_satisfied:
                 branch_status = "needs_inventory"
                 branch_next_tool = "inventory_live_targets"
@@ -2993,7 +3598,10 @@ async def _attack_search_candidates(
                 # An empty live-reachability artifact must not unlock harness work;
                 # preserve the branch below active work until deployment/fork
                 # context is available.
-                if live_reachability_paths and not live_reachability_has_deployed_context:
+                if candidate_live_mapping_attempted or (
+                    live_reachability_paths
+                    and not live_reachability_has_deployed_context
+                ):
                     branch_status = "parked_needs_live_context"
                     branch_next_tool = "record_fork_context or update_campaign"
                 else:
@@ -3001,10 +3609,17 @@ async def _attack_search_candidates(
                     branch_next_tool = "map_live_reachability"
             else:
                 branch_status = "needs_harness"
-                branch_next_tool = "prepare_fork_exploit_workbench"
+                branch_next_tool = "compose_sequence_experiment"
+            if (
+                not materialized_experiment
+                and branch_status == "needs_harness"
+                and not admission_ready
+            ):
+                branch_status = "needs_context"
+                branch_next_tool = "source_slice or update_campaign"
             if inventory_blocks_target:
                 branch_next_tool = "attack_search action=decision or mutate_hypothesis"
-            linked_context = materialized_experiment or workbench
+            linked_context = materialized_experiment
             branch_evidence = (
                 linked_context.get("evidence") or []
                 if linked_context
@@ -3026,13 +3641,6 @@ async def _attack_search_candidates(
                 )
                 if match:
                     materialized_workspace = match.group(1).strip()
-            prepare_workbench_args = {
-                "title": f"Fork workbench for {candidate.get('title')}",
-                "attack_graph": attack_graph_paths[-1],
-                "candidate_id": candidate_id or attack_key or candidate.get("action_key"),
-            }
-            if workbench_mechanism_hint:
-                prepare_workbench_args["mechanism"] = workbench_mechanism_hint
             # Once the scaffold exists, completion is the deterministic next step:
             # bind targets, apply synthesized args, and add objective probes via
             # complete_sequence_experiment instead of hand-writing the file.
@@ -3097,6 +3705,19 @@ async def _attack_search_candidates(
                 )
                 if branch_status == "needs_context" and materialized_experiment
                 else (
+                    "This attack-graph candidate is not experiment-ready. "
+                    "Resolve the missing structured admission fields first: "
+                    + ", ".join(
+                        str(item) for item in admission.get("missing") or []
+                    )
+                    + ". Inspect focused source/deployment context, then record "
+                    "the complete evidence-backed card on this same branch with "
+                    "attack_search action=advance, status=needs_harness, and "
+                    "evidence; or reject/park it. Do not compose a placeholder "
+                    "sequence."
+                )
+                if branch_status == "needs_context" and not admission_ready
+                else (
                     "Complete the already materialized attack-graph sequence at "
                     f"{materialized_workspace or 'the linked experiment workspace'} "
                     "with complete_sequence_experiment: bind targets, apply "
@@ -3108,18 +3729,8 @@ async def _attack_search_candidates(
                 )
                 if materialized_experiment
                 else (
-                    "Use the linked fork workbench to materialize this "
-                    "candidate with compose_sequence_experiment. Carry its "
-                    "mechanism setup, blocker checks, snapshot probes, and "
-                    "objective templates into the sequence scaffold before "
-                    "running. If blockers show the path is gated or dormant "
-                    "and there is no concrete bypass hypothesis, record a "
-                    "decision instead of writing a speculative PoC."
-                )
-                if workbench
-                else (
                     "Run live inventory for the candidate's exact deployed "
-                    "targets before preparing a fork workbench. Use the "
+                    "targets before composing a sequence. Use the "
                     "inventory to bind assets, controllers, authority, "
                     "proxy state, and dormant targets; reject or mutate the "
                     "branch if the live state invalidates the candidate."
@@ -3128,7 +3739,7 @@ async def _attack_search_candidates(
                 else (
                     "This generic state-transition invariant has no live "
                     "context yet. Map live reachability for its entrypoints "
-                    "and bind a deployed target, then prepare a fork workbench "
+                    "and bind a deployed target, then compose a sequence "
                     "to falsify the invariant with an objective experiment. If "
                     "no deployment/RPC context exists, record a decision or "
                     "park the branch as needs_live_context instead of writing a "
@@ -3136,20 +3747,66 @@ async def _attack_search_candidates(
                 )
                 if branch_status == "needs_mapping"
                 else (
-                    "Prepare a mechanism-aware fork workbench for this "
-                    "candidate before writing the sequence scaffold. The "
-                    "workbench should identify live setup, blockers, "
-                    "snapshot probes, and objective templates so the later "
-                    "PoC tests a concrete economic claim rather than a "
-                    "placeholder transaction."
+                    "Compose this candidate directly from attack_graph and "
+                    "candidate_id. The sequence composer embeds mechanism-aware "
+                    "setup, blockers, snapshot templates, and objective templates "
+                    "so the PoC tests a concrete claim rather than a placeholder."
                 )
             )
             instructions = (
                 f"{base_instructions} {inventory_note}"
                 if inventory_note else base_instructions
             )
+            candidate_required_args = {
+                "inventory_live_targets": {
+                    "title": f"Live inventory for {candidate.get('title')}",
+                    "targets": inventory_targets,
+                    "related_ids": [
+                        item for item in (
+                            (latest_attack_graph or {}).get("id"),
+                            candidate_id,
+                            attack_key,
+                            candidate.get("action_key"),
+                        )
+                        if item
+                    ],
+                },
+            }
+            if admission_ready or materialized_experiment:
+                candidate_required_args.update({
+                    "compose_sequence_experiment": {
+                        "title": candidate.get("title"),
+                        "objective": candidate.get("objective"),
+                        "attack_graph": attack_graph_paths[-1],
+                        "candidate_id": (
+                            candidate_id
+                            or attack_key
+                            or candidate.get("action_key")
+                        ),
+                        "action_space": (
+                            candidate.get("source", {}).get("action_space")
+                            if isinstance(candidate.get("source"), dict)
+                            else ""
+                        ),
+                        "protocol_graph": (
+                            candidate.get("source", {}).get("protocol_graph")
+                            if isinstance(candidate.get("source"), dict)
+                            else ""
+                        ),
+                        "actions": actions if isinstance(actions, list) else [],
+                        "observations": [],
+                        "mechanism": mechanism_hint or "auto",
+                        "state_transition_model": state_transition_model_ref,
+                        "target_addresses": {
+                            str(candidate.get("contract") or "target"): candidate.get(
+                                "target_address"
+                            )
+                        } if candidate.get("target_address") else {},
+                    },
+                    **complete_sequence_args,
+                })
             add(_attack_search_candidate(
-                key=f"attack_graph:{attack_key or candidate.get('action_key')}",
+                key=candidate_branch_key,
                 source=(
                     "attack_graph_state_model"
                     if is_generic_invariant_candidate
@@ -3200,12 +3857,17 @@ async def _attack_search_candidates(
                     ]
                     if inventory_blocks_target
                     else [
+                        "a complete seven-field hypothesis_card tied to focused "
+                        "source/deployment/probe evidence",
+                        "a same-branch action=advance carrying the complete card "
+                        "and evidence, or a rejection/parking decision",
+                    ]
+                    if branch_status == "needs_context" and not admission_ready
+                    else [
                         (
                             "completed generated sequence scaffold"
                             if materialized_experiment
-                            else "sequence experiment generated from fork workbench"
-                            if workbench
-                            else "fork workbench generated from attack_graph/candidate_id"
+                            else "sequence experiment generated from attack_graph/candidate_id"
                         ),
                         "objective replay and live exposure evidence",
                     ]
@@ -3236,6 +3898,8 @@ async def _attack_search_candidates(
                     ],
                 ],
                 root_mechanism=str(candidate.get("mechanism") or ""),
+                readiness=admission,
+                hypothesis_card=admission.get("hypothesis_card"),
                 invariant_id=invariant_id,
                 invariant_kind=invariant_kind,
                 invariant_statement=invariant_statement,
@@ -3249,47 +3913,7 @@ async def _attack_search_candidates(
                     "revisit after deployment metadata, chain binding, or fork context"
                     if branch_status == "parked_needs_live_context" else None
                 ),
-                required_args={
-                    "inventory_live_targets": {
-                        "title": f"Live inventory for {candidate.get('title')}",
-                        "targets": inventory_targets,
-                        "related_ids": [
-                            item for item in (
-                                (latest_attack_graph or {}).get("id"),
-                                candidate_id,
-                                attack_key,
-                                candidate.get("action_key"),
-                            )
-                            if item
-                        ],
-                    },
-                    "prepare_fork_exploit_workbench": prepare_workbench_args,
-                    "compose_sequence_experiment": {
-                        **{
-                            "title": candidate.get("title"),
-                            "objective": candidate.get("objective"),
-                            "attack_graph": attack_graph_paths[-1],
-                            "candidate_id": candidate_id or attack_key or candidate.get("action_key"),
-                            "action_space": (
-                                candidate.get("source", {}).get("action_space")
-                                if isinstance(candidate.get("source"), dict)
-                                else ""
-                            ),
-                            "protocol_graph": (
-                                candidate.get("source", {}).get("protocol_graph")
-                                if isinstance(candidate.get("source"), dict)
-                                else ""
-                            ),
-                            "actions": actions if isinstance(actions, list) else [],
-                            "observations": [],
-                            "target_addresses": {
-                                str(candidate.get("contract") or "target"): candidate.get("target_address")
-                            } if candidate.get("target_address") else {},
-                        },
-                        **workbench_compose_args,
-                    },
-                    **complete_sequence_args,
-                },
+                required_args=candidate_required_args,
             ))
             for alias_index, related in enumerate(
                 inventory_context.get("recommended_call_targets") or [],
@@ -3323,22 +3947,37 @@ async def _attack_search_candidates(
                     original_address=original_address,
                     alias_address=alias_address,
                 )
+                alias_branch_key = (
+                    "attack_graph_alias:"
+                    f"{attack_key or candidate.get('action_key')}:"
+                    f"{alias_address.lower()}"
+                )
+                alias_admission = apply_admission_override(
+                    alias_branch_key,
+                    _attack_graph_candidate_hypothesis_readiness({
+                        **candidate,
+                        "actions": alias_actions,
+                        "target_address": alias_address,
+                    }),
+                )
+                alias_admission_ready = bool(alias_admission.get("ready"))
                 if alias_inventory_blocks:
                     alias_status = "needs_inventory"
                     alias_next_tool = "attack_search action=decision or mutate_hypothesis"
                     alias_toolsets = ["core"]
                 elif alias_inventory_satisfied:
-                    alias_status = "needs_harness"
-                    alias_next_tool = "prepare_fork_exploit_workbench"
-                    alias_toolsets = ["experiment"]
+                    if alias_admission_ready:
+                        alias_status = "needs_harness"
+                        alias_next_tool = "compose_sequence_experiment"
+                        alias_toolsets = ["experiment"]
+                    else:
+                        alias_status = "needs_context"
+                        alias_next_tool = "source_slice or update_campaign"
+                        alias_toolsets = ["core"]
                 else:
                     alias_status = "needs_inventory"
                     alias_next_tool = "inventory_live_targets"
                     alias_toolsets = ["map"]
-                alias_prepare_args = dict(prepare_workbench_args)
-                alias_prepare_args["target_addresses"] = {
-                    str(candidate.get("contract") or "target"): alias_address
-                }
                 alias_priority_score = (
                     base_priority_score
                     + 6
@@ -3349,12 +3988,54 @@ async def _attack_search_candidates(
                     if alias_inventory_context.get("matched_targets")
                     else _attack_search_priority(candidate.get("priority"))
                 )
+                alias_required_args = {
+                    "inventory_live_targets": {
+                        "title": (
+                            f"Live inventory for related target "
+                            f"{candidate.get('title')}"
+                        ),
+                        "targets": alias_inventory_targets,
+                        "related_ids": [
+                            item for item in (
+                                (latest_attack_graph or {}).get("id"),
+                                candidate_id,
+                                attack_key,
+                                candidate.get("action_key"),
+                            )
+                            if item
+                        ],
+                    },
+                }
+                if alias_admission_ready:
+                    alias_required_args["compose_sequence_experiment"] = {
+                        "title": candidate.get("title"),
+                        "objective": candidate.get("objective"),
+                        "attack_graph": attack_graph_paths[-1],
+                        "candidate_id": (
+                            candidate_id
+                            or attack_key
+                            or candidate.get("action_key")
+                        ),
+                        "action_space": (
+                            candidate.get("source", {}).get("action_space")
+                            if isinstance(candidate.get("source"), dict)
+                            else ""
+                        ),
+                        "protocol_graph": (
+                            candidate.get("source", {}).get("protocol_graph")
+                            if isinstance(candidate.get("source"), dict)
+                            else ""
+                        ),
+                        "actions": alias_actions,
+                        "observations": [],
+                        "mechanism": mechanism_hint or "auto",
+                        "state_transition_model": state_transition_model_ref,
+                        "target_addresses": {
+                            str(candidate.get("contract") or "target"): alias_address
+                        },
+                    }
                 add(_attack_search_candidate(
-                    key=(
-                        "attack_graph_alias:"
-                        f"{attack_key or candidate.get('action_key')}:"
-                        f"{alias_address.lower()}"
-                    ),
+                    key=alias_branch_key,
                     source="attack_graph_related_live_target",
                     title=(
                         f"Rebind {candidate.get('title') or 'attack graph candidate'} "
@@ -3377,16 +4058,37 @@ async def _attack_search_candidates(
                     instructions=(
                         "A live inventory probe found a related deployed call target "
                         f"for the original address {original_address}: {alias_address}. "
-                        "Treat the related target as an audit target, verify its live "
-                        "inventory, then prepare a fork workbench against this address. "
-                        "If this alias is also dormant, gated, or economically empty, "
+                        "Treat the related target as an audit target and verify its "
+                        "live inventory. "
+                        + (
+                            "Before composing, resolve the missing seven-field "
+                            "hypothesis-card admission context: "
+                            + ", ".join(
+                                str(item)
+                                for item in alias_admission.get("missing") or []
+                            )
+                            + ". Record a concrete linked hypothesis or reject/park "
+                            "this planning lead; use attack_search action=advance "
+                            "with status=needs_harness and evidence to preserve "
+                            "the normalized graph binding."
+                            if not alias_admission_ready
+                            else "Compose a sequence against this normalized target."
+                        )
+                        + " If this alias is dormant, gated, or economically empty, "
                         "record a decision instead of cycling through sibling source actions."
                     ),
                     required_evidence=(
                         ["/workspace/campaign/live-inventory/*.json"]
                         if alias_status == "needs_inventory"
                         else [
-                            "fork workbench generated against the related live target",
+                            "a complete seven-field hypothesis_card tied to the "
+                            "normalized target and focused evidence",
+                            "a same-branch action=advance carrying the complete "
+                            "card and evidence, or a rejection/parking decision",
+                        ]
+                        if not alias_admission_ready
+                        else [
+                            "sequence experiment generated against the related live target",
                             "objective replay and live exposure evidence",
                         ]
                     ),
@@ -3414,46 +4116,9 @@ async def _attack_search_candidates(
                     target_actions=alias_actions,
                     normalized_target_keys=[alias_address.lower()],
                     root_mechanism=str(candidate.get("mechanism") or ""),
-                    required_args={
-                        "inventory_live_targets": {
-                            "title": (
-                                f"Live inventory for related target "
-                                f"{candidate.get('title')}"
-                            ),
-                            "targets": alias_inventory_targets,
-                            "related_ids": [
-                                item for item in (
-                                    (latest_attack_graph or {}).get("id"),
-                                    candidate_id,
-                                    attack_key,
-                                    candidate.get("action_key"),
-                                )
-                                if item
-                            ],
-                        },
-                        "prepare_fork_exploit_workbench": alias_prepare_args,
-                        "compose_sequence_experiment": {
-                            "title": candidate.get("title"),
-                            "objective": candidate.get("objective"),
-                            "attack_graph": attack_graph_paths[-1],
-                            "candidate_id": candidate_id or attack_key or candidate.get("action_key"),
-                            "action_space": (
-                                candidate.get("source", {}).get("action_space")
-                                if isinstance(candidate.get("source"), dict)
-                                else ""
-                            ),
-                            "protocol_graph": (
-                                candidate.get("source", {}).get("protocol_graph")
-                                if isinstance(candidate.get("source"), dict)
-                                else ""
-                            ),
-                            "actions": alias_actions,
-                            "observations": [],
-                            "target_addresses": {
-                                str(candidate.get("contract") or "target"): alias_address
-                            },
-                        },
-                    },
+                    readiness=alias_admission,
+                    hypothesis_card=alias_admission.get("hypothesis_card"),
+                    required_args=alias_required_args,
                 ))
 
         # Curiosity/diversity frontier branches. The attack-graph artifact
@@ -3478,31 +4143,95 @@ async def _attack_search_candidates(
         ):
             add(frontier_candidate)
 
-    action_spaces_without_coverage = await _progress_action_spaces_without_coverage(
-        container,
-        state,
-    )
-    for item in action_spaces_without_coverage:
-        add(_attack_search_candidate(
-            key=f"coverage:missing:{item.get('id') or item.get('path')}",
-            source="action_space_without_coverage",
-            title=f"Review attack-surface coverage for {item.get('id') or item.get('path')}",
-            status="needs_coverage",
-            next_tool="review_attack_surface_coverage",
-            required_toolsets=["map"],
-            priority="medium",
-            priority_score=12,
-            source_ids=[item.get("id")] if item.get("id") else [],
-            source_artifacts=[item.get("path")],
-            instructions=(
-                "Compare mapped actions against current hypotheses, experiments, "
-                "results, and decisions to find untested high-value levers."
-            ),
-            required_evidence=["/workspace/campaign/coverage-reviews/*.json"],
-            stop_condition="Turn meaningful gaps into hypotheses or reject them explicitly.",
-        ))
+    # Coverage is controller state, not a separate model-facing workflow. Derive
+    # it fresh across every valid action-space artifact and current campaign
+    # lineage on every sync; legacy coverage-review artifacts are intentionally
+    # not authoritative. Each action space contributes a bounded deterministic
+    # batch. If more gaps exist, the active batch prevents campaign_ready and the
+    # next sync exposes the following batch as earlier gaps are decided/tested.
+    coverage_records = await _coverage_campaign_records(container, state)
+    coverage_record_index = _coverage_record_index(coverage_records)
+    parked_coverage_keys: set[str] = set()
+    current_search = (state.get("attack_search") or {}).get("current") or {}
+    for branch in current_search.get("branches") or []:
+        if not isinstance(branch, dict):
+            continue
+        if branch.get("source") != "coverage_high_attention_gap":
+            continue
+        if str(branch.get("status") or "") not in _ATTACK_SEARCH_PARKED_STATUSES:
+            continue
+        parked_coverage_keys.update(
+            str(value).strip()
+            for value in branch.get("coverage_keys") or []
+            if str(value).strip()
+        )
+        # Compatibility for coverage branches created before definition-scoped
+        # identities were persisted.
+        for action in branch.get("target_actions") or []:
+            if isinstance(action, dict):
+                key = _coverage_definition_key(action)
+                if key:
+                    parked_coverage_keys.add(key)
+    coverage_action_spaces = []
+    for action_space_path in reversed(action_space_paths):
+        action_space = (
+            latest_action_space
+            if action_space_path == action_space_paths[-1]
+            else await _load_campaign_json_if_exists(container, action_space_path)
+        )
+        if not isinstance(action_space, dict) or _action_space_invalid_for_attack_search(
+            action_space
+        ):
+            continue
+        coverage_action_spaces.append((action_space_path, action_space))
 
-    coverage_gaps = await _progress_coverage_gaps(container, state)
+    # A bare Contract::function prose mention is ambiguous across distinct
+    # source definitions even when those definitions came from separate
+    # cumulative or legacy action-space artifacts.
+    text_identity_definitions = _coverage_text_identity_definitions([
+        action_space for _, action_space in coverage_action_spaces
+    ])
+    coverage_gaps = []
+    seen_coverage_keys: set[tuple[str, str, str]] = set()
+    for action_space_path, action_space in coverage_action_spaces:
+        all_gaps = await _derive_attack_surface_gaps(
+            container,
+            state,
+            action_space,
+            records=coverage_records,
+            record_index=coverage_record_index,
+            text_identity_definitions=text_identity_definitions,
+        )
+        unique_gaps = []
+        for gap in all_gaps:
+            coverage_key = str(
+                gap.get("coverage_key") or _coverage_definition_key(gap)
+            ).strip()
+            if coverage_key in parked_coverage_keys:
+                continue
+            identity = (
+                str(gap.get("key") or ""),
+                str(gap.get("file") or ""),
+                str(gap.get("signature") or gap.get("function") or ""),
+            )
+            if identity in seen_coverage_keys:
+                continue
+            seen_coverage_keys.add(identity)
+            unique_gaps.append(gap)
+        if not unique_gaps:
+            continue
+        batch = unique_gaps[:25]
+        coverage_gaps.append({
+            "id": f"derived:{action_space.get('id') or action_space_path}",
+            "path": action_space_path,
+            "action_space": action_space_path,
+            "summary": {
+                "high_attention_gaps": len(unique_gaps),
+                "batched": len(batch),
+                "remaining_after_batch": max(0, len(unique_gaps) - len(batch)),
+            },
+            "top_high_attention_gaps": batch,
+        })
     coverage_live_context_unbound = bool(
         live_reachability_paths and not live_reachability_has_deployed_context
     )
@@ -3511,6 +4240,9 @@ async def _attack_search_candidates(
         for gap in top_gaps:
             affordances = ", ".join(gap.get("affordances") or []) or "no affordance labels"
             action_key = str(gap.get("key") or "").strip()
+            coverage_key = str(
+                gap.get("coverage_key") or _coverage_definition_key(gap)
+            ).strip()
             source_slice_args = {
                 key: value
                 for key, value in {
@@ -3541,7 +4273,14 @@ async def _attack_search_candidates(
                 "attacker-controlled lever, value/right/invariant at risk, "
                 "setup precondition, measurable objective, and any needed "
                 "deployment/fork binding. "
-                f"Selected gap: {action_key or 'unknown'} ({affordances})."
+                f"Selected gap: {action_key or 'unknown'} ({affordances}). "
+                + (
+                    f"When recording the outcome, set action_keys to "
+                    f"[{action_key!r}] and coverage_keys to "
+                    f"[{coverage_key!r}] so this exact source definition "
+                    "transfers ownership without lexical matching."
+                    if action_key else ""
+                )
             )
             branch_required_evidence = [
                 "source_slice or equivalent source-review artifact",
@@ -3553,14 +4292,23 @@ async def _attack_search_candidates(
                 if source_slice_args else None
             )
             add(_attack_search_candidate(
-                key=f"coverage:action:{action_key or item.get('id')}",
+                key=f"coverage:action:{coverage_key or action_key or item.get('id')}",
                 source="coverage_high_attention_gap",
                 title=f"Source-review coverage gap: {action_key or item.get('id')}",
                 status=branch_status,
                 next_tool=branch_next_tool,
                 required_toolsets=branch_toolsets,
                 priority="high",
-                priority_score=14 + int(gap.get("priority_score", 0) or 0),
+                priority_score=(
+                    14
+                    + min(int(gap.get("attention_score", 0) or 0), 12)
+                    + _plan_focus_bonus(
+                        focus,
+                        gap.get("contract"),
+                        gap.get("function"),
+                        " ".join(gap.get("affordances") or []),
+                    )
+                ),
                 source_ids=[item.get("id")] if item.get("id") else [],
                 source_artifacts=[
                     item.get("path"),
@@ -3570,6 +4318,8 @@ async def _attack_search_candidates(
                 required_evidence=branch_required_evidence,
                 stop_condition="If the gap is expected, gated, or dormant behavior, record a rejection decision.",
                 action_keys=[action_key] if action_key else [],
+                coverage_keys=[coverage_key] if coverage_key else [],
+                action_family_keys=[_coverage_action_family_key(gap)],
                 target_actions=[{
                     "key": action_key,
                     "contract": gap.get("contract"),
@@ -3580,53 +4330,6 @@ async def _attack_search_candidates(
                 }],
                 required_args=branch_required_args,
             ))
-        if top_gaps:
-            continue
-        coarse_status = "needs_context"
-        coarse_next_tool = "source_slice then update_campaign or attack_search decision"
-        coarse_toolsets = ["core"]
-        if coverage_live_context_unbound:
-            coarse_prefix = (
-                "Live reachability was attempted but did not bind a deployed "
-                "target, so pick the strongest remaining high-attention gap for "
-                "source review only. "
-            )
-        else:
-            coarse_prefix = (
-                "Pick the strongest high-attention gap and source-review it "
-                "before creating a hypothesis. "
-            )
-        coarse_instructions = (
-            coarse_prefix
-            + "Record a concrete hypothesis, open question, rejection, or "
-            "parking decision; do not compose a sequence or invariant harness "
-            "until source review and needed deployment context make the branch "
-            "experiment-ready."
-        )
-        coarse_required_evidence = [
-            "source-review artifact for a selected gap",
-            "concrete hypothesis, open_question, rejection, or parking decision",
-            "deployment/chain/fork context before harness work when live binding matters",
-        ]
-        add(_attack_search_candidate(
-            key=f"coverage:gaps:{item.get('action_space') or item.get('id') or item.get('path')}",
-            source="coverage_high_attention_gap",
-            title=f"Source-review coverage gaps for {item.get('action_space') or item.get('id')}",
-            status=coarse_status,
-            next_tool=coarse_next_tool,
-            required_toolsets=coarse_toolsets,
-            priority="high" if item.get("summary", {}).get("high_attention_gaps") else "medium",
-            priority_score=14,
-            source_ids=[item.get("id")] if item.get("id") else [],
-            source_artifacts=[
-                item.get("path"),
-                item.get("action_space"),
-            ],
-            instructions=coarse_instructions,
-            required_evidence=coarse_required_evidence,
-            stop_condition="If the gap is expected behavior, record a rejection decision.",
-        ))
-
     for entry in _progress_hypotheses_without_experiments(state):
         readiness = entry.get("readiness") or {}
         missing_readiness = [
@@ -3685,22 +4388,18 @@ async def _attack_search_candidates(
             hypothesis_recommended_budget = None
         else:
             hypothesis_status = "needs_harness"
-            hypothesis_next_tool = (
-                "compose_sequence_experiment with explicit actions or "
-                "compose_invariant_harness with handler actions"
-            )
+            hypothesis_next_tool = "compose_sequence_experiment with explicit actions"
             hypothesis_toolsets = ["experiment"]
             hypothesis_instructions = (
-                "Convert the hypothesis into a Foundry/fork sequence or "
-                "property harness with concrete setup, actions, observations, "
+                "Convert the hypothesis into a Foundry/fork sequence "
+                "with concrete setup, actions, observations, "
                 "and success condition. Do not call compose_sequence_experiment "
                 "until you have selected at least one concrete action from the "
-                "action-space or source review. Do not call "
-                "compose_invariant_harness until you have selected at least one "
-                "concrete handler action with bounds/args and expected_effect."
+                "action-space or source review. compose_invariant_harness remains "
+                "an explicit advanced/manual option and is not controller-routed."
             )
             hypothesis_required_evidence = [
-                "/workspace/experiments/*/sequence.json or invariant harness"
+                "/workspace/experiments/*/sequence.json"
             ]
             hypothesis_required_args = None
             hypothesis_parking_reason = None
@@ -3731,6 +4430,7 @@ async def _attack_search_candidates(
             recommended_budget=hypothesis_recommended_budget,
             required_args=hypothesis_required_args,
             readiness=readiness,
+            hypothesis_card=readiness.get("hypothesis_card"),
         ))
 
     for entry in _progress_unrun_experiments(state):
@@ -4038,7 +4738,23 @@ async def _attack_search_candidates(
         prefix="/workspace/campaign/finding-reviews/",
         kind="finding_evidence",
     )
+    ready_report_reviews = await _progress_ready_reviews(
+        container,
+        state,
+        prefix="/workspace/campaign/report-reviews/",
+        kind="report_quality",
+    )
+    # A report review consumes only the finding review it explicitly links.
+    # Generic campaign lineage may contain other fr-* ids and must not hide
+    # their still-unreviewed findings from the controller.
+    reported_finding_review_ids = {
+        str(item.get("evidence_review_id") or "")
+        for item in ready_report_reviews
+        if item.get("evidence_review_id")
+    }
     for item in ready_finding_reviews:
+        if str(item.get("id") or "") in reported_finding_review_ids:
+            continue
         add(_attack_search_candidate(
             key=f"finding_review:{item.get('id')}:report",
             source="ready_finding_review",
@@ -4059,12 +4775,6 @@ async def _attack_search_candidates(
             stop_condition="Do not submit until report_quality is ready.",
         ))
 
-    ready_report_reviews = await _progress_ready_reviews(
-        container,
-        state,
-        prefix="/workspace/campaign/report-reviews/",
-        kind="report_quality",
-    )
     for item in ready_report_reviews:
         add(_attack_search_candidate(
             key=f"report_review:{item.get('id')}:submit",
@@ -4086,47 +4796,6 @@ async def _attack_search_candidates(
             required_evidence=["structured submitted finding"],
             stop_condition="If evidence changed, rerun review_report_quality first.",
         ))
-
-    if not candidates:
-        latest_plans = await _progress_campaign_plans(container, state)
-        if latest_plans:
-            top = latest_plans[0].get("top_branch") or {}
-            add(_attack_search_candidate(
-                key=f"plan:{latest_plans[0].get('id')}:top",
-                source="latest_campaign_plan",
-                title=f"Execute top campaign plan branch: {top.get('title') or latest_plans[0].get('title')}",
-                status="needs_hypothesis",
-                next_tool=top.get("recommended_next_tool") or "plan_attack_campaign",
-                required_toolsets=["map", "experiment", "evidence"],
-                priority=_attack_search_priority(top.get("priority")),
-                priority_score=5,
-                source_ids=[latest_plans[0].get("id"), top.get("id")],
-                source_artifacts=[latest_plans[0].get("path")],
-                instructions=(
-                    "Execute the latest planner branch, then resync attack_search "
-                    "so the deterministic state machine can advance."
-                ),
-                required_evidence=["artifact produced by the recommended next tool"],
-                stop_condition="Refresh plan_attack_campaign if campaign state changed materially.",
-            ))
-        else:
-            add(_attack_search_candidate(
-                key="plan:refresh",
-                source="needs_plan",
-                title="Refresh campaign plan or map another subsystem",
-                status="needs_hypothesis",
-                next_tool="plan_attack_campaign",
-                required_toolsets=["core"],
-                priority="medium",
-                priority_score=1,
-                instructions=(
-                    "No active process gaps were detected. Refresh the campaign "
-                    "plan, deepen parameter/order exploration, or map another "
-                    "high-value subsystem."
-                ),
-                required_evidence=["/workspace/campaign/plans/*.json or explicit decision"],
-                stop_condition="Stop only after coverage and evidence show no viable branches remain.",
-            ))
 
     return list(candidates.values())
 
@@ -4870,6 +5539,13 @@ def _attack_search_merge_candidates(search: dict, candidates: list[dict]) -> Non
         if _attack_search_branch_terminal(branch):
             merged.append(branch)
             continue
+        if str(branch.get("status") or "") in _ATTACK_SEARCH_PARKED_STATUSES:
+            # A parked coverage definition is intentionally omitted from the
+            # next derived batch so later gaps can surface. Keep the durable
+            # parked branch instead of mislabeling it as superseded merely
+            # because it is outside the current batch.
+            merged.append(branch)
+            continue
         previous_status = branch.get("status")
         branch["status"] = "superseded"
         branch["updated_at"] = now
@@ -4911,12 +5587,14 @@ def _attack_search_branch_action_key_set(branch: dict) -> set[str]:
     for action in branch.get("target_actions") or []:
         if not isinstance(action, dict):
             continue
-        action_key = str(action.get("key") or action.get("action_key") or "").strip()
+        action_key = str(
+            action.get("action_definition_key")
+            or action.get("key")
+            or action.get("action_key")
+            or ""
+        ).strip()
         if not action_key:
-            contract = str(action.get("contract") or "").strip()
-            function = str(action.get("function") or "").strip()
-            if contract and function:
-                action_key = f"{contract}::{function}"
+            action_key = _coverage_action_key(action)
         if action_key:
             keys.add(action_key)
     required_args = branch.get("required_args") or {}
@@ -4926,12 +5604,13 @@ def _attack_search_branch_action_key_set(branch: dict) -> set[str]:
         for action in tool_args.get("actions") or []:
             if not isinstance(action, dict):
                 continue
-            action_key = str(action.get("action_key") or "").strip()
+            action_key = str(
+                action.get("action_definition_key")
+                or action.get("action_key")
+                or ""
+            ).strip()
             if not action_key:
-                contract = str(action.get("contract") or "").strip()
-                function = str(action.get("function") or "").strip()
-                if contract and function:
-                    action_key = f"{contract}::{function}"
+                action_key = _coverage_action_key(action)
             if action_key:
                 keys.add(action_key)
     return keys
@@ -5116,42 +5795,25 @@ def _attack_candidate_clone_family_key_set(candidate: dict) -> set[str]:
     }
 
 
-_TARGET_LEVEL_INVALIDITY_TERMS = (
-    "no code",
-    "no deployed bytecode",
-    "dormant",
-    "wrong address",
-    "wrong target",
-    "wrong proxy",
-    "implementation",
-    "template",
-    "empty reserve",
-    "empty reserves",
-    "no economic state",
-    "uninitialized",
-    "not initialized",
-    "zero supply",
-    "zero total supply",
-    "total supply 0",
-    "no collateral",
-    "collateral 0",
-    "zero reserve",
-    "zero reserves",
-    "not live",
-    "not the live",
-    "target binding",
-)
-
-
 def _attack_search_target_level_invalidity(
     branch: dict,
     *,
-    decision_text: str,
-    failed_assumption: str,
-) -> bool:
+    decision_scope: str,
+) -> set[str]:
+    if decision_scope != "target":
+        return set()
+    invalidated_targets: set[str] = set()
+
+    def add(value: object) -> None:
+        address = _solidity_address_literal(value)
+        if address:
+            invalidated_targets.add(address.lower())
+
     inventory_context = branch.get("inventory_context") or {}
-    if isinstance(inventory_context, dict) and inventory_context.get("hard_blockers"):
-        return True
+    if isinstance(inventory_context, dict):
+        for blocker in inventory_context.get("hard_blockers") or []:
+            if isinstance(blocker, dict):
+                add(blocker.get("address"))
     target_binding = branch.get("target_binding") or {}
     if isinstance(target_binding, dict):
         kind = str(
@@ -5160,97 +5822,19 @@ def _attack_search_target_level_invalidity(
             or ""
         )
         if kind in {"no_code", "deployed_implementation_or_template"}:
-            return True
-    text = _coverage_normalize_text(f"{decision_text} {failed_assumption}")
-    if not text:
-        return False
-    return any(term in text for term in _TARGET_LEVEL_INVALIDITY_TERMS)
-
-
-_MECHANISM_LEVEL_DECISION_TERMS = (
-    "same authorization",
-    "authorization gate",
-    "same gate",
-    "same modifier",
-    "same mechanism",
-    "same blocker",
-    "same role check",
-    "role check",
-    "msg sender",
-    "self claim",
-    "self only",
-    "only caller",
-    "no unauthorized",
-    "no attacker profit",
-    "no profit",
-    "no balance delta",
-    "claimer unauthorized",
-    "only emission manager",
-)
-
-
-_COVERAGE_FAMILY_DECISION_TERMS = (
-    "same helper",
-    "helper family",
-    "library helper",
-    "governance library",
-    "same test",
-    "test wrapper",
-    "mock",
-    "fixture",
-    "interface-only",
-    "interface only",
-    "certora",
-    "spec harness",
-    "deploy script",
-    "deployment helper",
-    "generated wrapper",
-    "same coverage family",
-)
-
-
-def _attack_search_mechanism_level_decision(
-    *,
-    decision_text: str,
-    failed_assumption: str,
-    impact_assessment: str,
-) -> bool:
-    text = _coverage_normalize_text(
-        f"{decision_text} {failed_assumption} {impact_assessment}"
-    )
-    if not text:
-        return False
-    return any(term in text for term in _MECHANISM_LEVEL_DECISION_TERMS)
-
-
-def _attack_search_coverage_family_decision(
-    *,
-    decision_text: str,
-    failed_assumption: str,
-    impact_assessment: str,
-) -> bool:
-    text = _coverage_normalize_text(
-        f"{decision_text} {failed_assumption} {impact_assessment}"
-    )
-    if not text:
-        return False
-    return any(term in text for term in _COVERAGE_FAMILY_DECISION_TERMS)
-
-
-def _attack_search_branch_action_contracts(branch: dict) -> set[str]:
-    return {
-        _coverage_normalize_text(str(action.get("contract") or ""))
-        for action in branch.get("target_actions") or []
-        if isinstance(action, dict) and str(action.get("contract") or "").strip()
-    }
-
-
-def _attack_search_branch_action_files(branch: dict) -> set[str]:
-    return {
-        posixpath.normpath(str(action.get("file") or ""))
-        for action in branch.get("target_actions") or []
-        if isinstance(action, dict) and str(action.get("file") or "").strip()
-    }
+            add(target_binding.get("original_address"))
+            add(target_binding.get("target_address"))
+            # Legacy single-target branches did not always persist the address
+            # on target_binding.  Preserve their exact behavior without letting
+            # one invalid binding poison every target in a multi-target branch.
+            if not invalidated_targets:
+                branch_targets = _attack_search_branch_target_set(
+                    branch,
+                    include_related=False,
+                )
+                if len(branch_targets) == 1:
+                    invalidated_targets.update(branch_targets)
+    return invalidated_targets
 
 
 def _attack_search_supersede_subsumed_siblings(
@@ -5258,9 +5842,10 @@ def _attack_search_supersede_subsumed_siblings(
     decided_branch: dict,
     *,
     action_keys: set[str],
+    coverage_keys: set[str],
     action_family_keys: set[str],
     clone_family_keys: set[str],
-    target_level_invalidity: bool,
+    target_level_invalidity: set[str],
     mechanism_level_decision: bool,
     coverage_family_decision: bool,
     decision_id: str,
@@ -5269,10 +5854,8 @@ def _attack_search_supersede_subsumed_siblings(
     now: str,
 ) -> None:
     if decided_branch.get("source") == "coverage_high_attention_gap":
-        if not action_keys and not coverage_family_decision:
+        if not action_keys and not coverage_keys and not coverage_family_decision:
             return
-        decided_contracts = _attack_search_branch_action_contracts(decided_branch)
-        decided_files = _attack_search_branch_action_files(decided_branch)
         for branch in search.get("branches", []):
             if branch is decided_branch or _attack_search_branch_terminal(branch):
                 continue
@@ -5284,16 +5867,24 @@ def _attack_search_supersede_subsumed_siblings(
             }:
                 continue
             branch_action_keys = _attack_search_branch_action_key_set(branch)
+            branch_coverage_keys = {
+                str(item).strip()
+                for item in branch.get("coverage_keys") or []
+                if str(item).strip()
+            }
             branch_family_keys = _attack_search_branch_action_family_key_set(branch)
-            branch_contracts = _attack_search_branch_action_contracts(branch)
-            branch_files = _attack_search_branch_action_files(branch)
             supersede_reason = ""
-            if branch_action_keys and branch_action_keys.issubset(action_keys):
+            if coverage_keys:
+                if branch_coverage_keys and branch_coverage_keys.issubset(
+                    coverage_keys
+                ):
+                    supersede_reason = "same_coverage_definition"
+            elif branch_action_keys and branch_action_keys.issubset(action_keys):
                 supersede_reason = "same_coverage_action"
-            elif coverage_family_decision and (
-                branch_contracts.intersection(decided_contracts)
-                or branch_files.intersection(decided_files)
-                or branch_family_keys.intersection(action_family_keys)
+            if (
+                not supersede_reason
+                and coverage_family_decision
+                and branch_family_keys.intersection(action_family_keys)
             ):
                 supersede_reason = "same_coverage_family"
             if not supersede_reason:
@@ -5304,12 +5895,11 @@ def _attack_search_supersede_subsumed_siblings(
             branch["decision_id"] = decision_id
             if supersede_reason == "same_coverage_family":
                 reason_text = (
-                    "the same helper/mock/interface or repeated coverage family "
-                    "was already decided."
+                    "the same explicit semantic action family was already decided."
                 )
             else:
                 reason_text = (
-                    "the same coverage action path was already decided."
+                    "the same coverage source definition was already decided."
                 )
             branch["decision"] = f"Superseded by {decision_id}: {reason_text}"
             branch["updated_at"] = now
@@ -5377,9 +5967,11 @@ def _attack_search_supersede_subsumed_siblings(
         )
         same_target = bool(branch_targets and branch_targets.intersection(decided_targets))
         branch_action_keys = _attack_search_branch_action_key_set(branch)
-        supersede_reason = "target_invalidated" if target_level_invalidity else ""
-        if supersede_reason and not same_target:
-            supersede_reason = ""
+        supersede_reason = (
+            "target_invalidated"
+            if branch_targets.intersection(target_level_invalidity)
+            else ""
+        )
         if not supersede_reason and same_target:
             if branch_action_keys and branch_action_keys.issubset(action_keys):
                 supersede_reason = "same_target_action_path"
@@ -5439,6 +6031,13 @@ def _attack_search_supersede_subsumed_siblings(
         })
 
 
+_ATTACK_SEARCH_GRAPH_ADMISSION_SOURCES = frozenset({
+    "attack_graph_candidate",
+    "attack_graph_related_live_target",
+    "attack_graph_state_model",
+})
+
+
 def _attack_search_advance(search: dict, args: dict) -> str | None:
     branch_id = str(args.get("branch_id") or "").strip()
     if not branch_id:
@@ -5449,6 +6048,65 @@ def _attack_search_advance(search: dict, args: dict) -> str | None:
     status = _attack_search_status(args.get("status"), "")
     if not status:
         return "status is required for action=advance"
+    previous = str(branch.get("status") or "")
+    evidence = [
+        item.strip()
+        for item in (args.get("evidence") or [])
+        if isinstance(item, str) and item.strip()
+    ]
+    related_ids = [str(item) for item in (args.get("related_ids") or []) if item]
+    graph_admission_branch = (
+        str(branch.get("source") or "") in _ATTACK_SEARCH_GRAPH_ADMISSION_SOURCES
+    )
+    supplied_hypothesis_card = "hypothesis_card" in args
+    admission_review = None
+    if supplied_hypothesis_card:
+        if not graph_admission_branch:
+            return (
+                "hypothesis_card on action=advance is only supported for an "
+                "attack-graph, state-model, or economic candidate branch"
+            )
+        if status != "needs_harness":
+            return (
+                "hypothesis_card on action=advance requires status=needs_harness"
+            )
+        if not evidence:
+            return (
+                "evidence is required when a hypothesis_card advances an "
+                "attack-graph branch"
+            )
+        if previous != "needs_context" or str(branch.get("next_tool") or "") != (
+            "source_slice or update_campaign"
+        ):
+            return (
+                "this attack-graph branch is not blocked only on structured "
+                "hypothesis admission; resolve its current mapping, inventory, "
+                "deployment, or experiment blocker instead"
+            )
+        admission_review = _attack_graph_candidate_hypothesis_readiness({
+            "hypothesis_card": args.get("hypothesis_card"),
+        })
+        if not admission_review.get("ready"):
+            return (
+                "hypothesis_card is incomplete or invalid: "
+                + ", ".join(
+                    str(item) for item in admission_review.get("missing") or []
+                )
+            )
+    elif graph_admission_branch and status == "needs_harness":
+        admission_review = _attack_graph_candidate_hypothesis_readiness({
+            "hypothesis_card": branch.get("hypothesis_card"),
+        })
+        if not admission_review.get("ready"):
+            return (
+                "a complete hypothesis_card is required before an attack-graph "
+                "branch can advance to needs_harness"
+            )
+        if previous != "needs_harness":
+            return (
+                "action=advance cannot bypass this attack-graph branch's current "
+                "controller step; resolve it and sync the controller"
+            )
     notes = str(args.get("notes") or "").strip()
     is_parking = status in _ATTACK_SEARCH_PARKED_STATUSES
     if is_parking and not notes:
@@ -5460,9 +6118,6 @@ def _attack_search_advance(search: dict, args: dict) -> str | None:
             "the blocker and what evidence or tool would un-park it"
         )
     now = datetime.now(timezone.utc).isoformat()
-    previous = branch.get("status")
-    evidence = [str(item) for item in (args.get("evidence") or []) if item]
-    related_ids = [str(item) for item in (args.get("related_ids") or []) if item]
     branch["status"] = status
     branch["updated_at"] = now
     branch["evidence"] = sorted(dict.fromkeys([*(branch.get("evidence") or []), *evidence]))
@@ -5479,6 +6134,19 @@ def _attack_search_advance(search: dict, args: dict) -> str | None:
         # Un-parking (or any non-parking advance) clears the stale park metadata.
         branch.pop("parking_reason", None)
         branch.pop("recommended_budget", None)
+    if supplied_hypothesis_card and admission_review is not None:
+        card = admission_review["hypothesis_card"]
+        branch["hypothesis_card"] = card
+        branch["readiness"] = {
+            **admission_review,
+            "source": "attack_search_advance",
+            "evidence": evidence,
+        }
+        branch["admission_override"] = {
+            "hypothesis_card": card,
+            "evidence": evidence,
+            "updated_at": now,
+        }
     branch.setdefault("history", []).append({
         "at": now,
         "event": "advanced",
@@ -5487,6 +6155,7 @@ def _attack_search_advance(search: dict, args: dict) -> str | None:
         "notes": notes,
         "evidence": evidence,
         "related_ids": related_ids,
+        "hypothesis_card_updated": supplied_hypothesis_card,
     })
     return None
 
@@ -5525,6 +6194,11 @@ async def _attack_search_decision(
     failed_assumption = str(args.get("failed_assumption") or "").strip()
     impact_assessment = str(args.get("impact_assessment") or "").strip()
     next_focus = str(args.get("next_focus") or "").strip()
+    decision_scope = str(args.get("decision_scope") or "branch").strip().lower()
+    if decision_scope not in {"branch", "action_family", "clone_family", "target"}:
+        return (
+            "decision_scope must be branch, action_family, clone_family, or target"
+        )
     evidence = [str(item) for item in (args.get("evidence") or []) if item]
     related_ids = [str(item) for item in (args.get("related_ids") or []) if item]
     branch_related = [
@@ -5541,22 +6215,19 @@ async def _attack_search_decision(
             if isinstance(item, dict) and (item.get("key") or item.get("action_key"))
         ],
     ]))
+    coverage_keys = sorted(dict.fromkeys(
+        str(item).strip()
+        for item in branch.get("coverage_keys") or []
+        if str(item).strip()
+    ))
     action_family_keys = sorted(_attack_search_branch_action_family_key_set(branch))
     clone_family_keys = sorted(_attack_search_branch_clone_family_key_set(branch))
     attack_keys = sorted(dict.fromkeys([
         *[str(item) for item in branch.get("attack_keys") or [] if item],
         *([str(branch.get("attack_key"))] if branch.get("attack_key") else []),
     ]))
-    mechanism_level_decision = _attack_search_mechanism_level_decision(
-        decision_text=decision,
-        failed_assumption=failed_assumption,
-        impact_assessment=impact_assessment,
-    )
-    coverage_family_decision = _attack_search_coverage_family_decision(
-        decision_text=decision,
-        failed_assumption=failed_assumption,
-        impact_assessment=impact_assessment,
-    )
+    mechanism_level_decision = decision_scope in {"action_family", "clone_family"}
+    coverage_family_decision = decision_scope == "action_family"
 
     now = datetime.now(timezone.utc).isoformat()
     decision_id = _next_campaign_id(state, "decision")
@@ -5587,22 +6258,32 @@ async def _attack_search_decision(
         "evidence": decision_evidence,
         "related_ids": sorted(dict.fromkeys([search["id"], branch_id, *branch_related])),
         "action_keys": action_keys,
+        "coverage_keys": coverage_keys,
         "action_family_keys": action_family_keys,
         "clone_family_keys": clone_family_keys,
         "attack_keys": attack_keys,
+        "decision_scope": decision_scope,
     })
-    if action_keys:
+    # A definition-scoped coverage decision must not suppress same-named
+    # definitions elsewhere. Legacy/non-coverage branches still use action keys.
+    if action_keys and not coverage_keys:
         decided = set(state.setdefault("attack_search", {}).get("decided_action_keys") or [])
         decided.update(action_keys)
         state["attack_search"]["decided_action_keys"] = sorted(decided)
-    if mechanism_level_decision and action_family_keys:
+    if coverage_keys:
+        decided = set(
+            state.setdefault("attack_search", {}).get("decided_coverage_keys") or []
+        )
+        decided.update(coverage_keys)
+        state["attack_search"]["decided_coverage_keys"] = sorted(decided)
+    if decision_scope == "action_family" and action_family_keys:
         decided = set(
             state.setdefault("attack_search", {}).get("decided_action_family_keys")
             or []
         )
         decided.update(action_family_keys)
         state["attack_search"]["decided_action_family_keys"] = sorted(decided)
-    if mechanism_level_decision and clone_family_keys:
+    if decision_scope == "clone_family" and clone_family_keys:
         decided = set(
             state.setdefault("attack_search", {}).get("decided_clone_family_keys")
             or []
@@ -5654,7 +6335,9 @@ async def _attack_search_decision(
     branch["failed_assumption"] = failed_assumption or None
     branch["impact_assessment"] = impact_assessment or None
     branch["next_focus"] = next_focus or None
+    branch["decision_scope"] = decision_scope
     branch["action_keys"] = action_keys
+    branch["coverage_keys"] = coverage_keys
     branch["action_family_keys"] = action_family_keys
     branch["clone_family_keys"] = clone_family_keys
     branch["attack_keys"] = attack_keys
@@ -5698,12 +6381,18 @@ async def _attack_search_decision(
             search,
             branch,
             action_keys=set(action_keys),
-            action_family_keys=set(action_family_keys),
-            clone_family_keys=set(clone_family_keys),
+            coverage_keys=set(coverage_keys),
+            action_family_keys=(
+                set(action_family_keys)
+                if decision_scope == "action_family" else set()
+            ),
+            clone_family_keys=(
+                set(clone_family_keys)
+                if decision_scope == "clone_family" else set()
+            ),
             target_level_invalidity=_attack_search_target_level_invalidity(
                 branch,
-                decision_text=decision,
-                failed_assumption=failed_assumption,
+                decision_scope=decision_scope,
             ),
             mechanism_level_decision=mechanism_level_decision,
             coverage_family_decision=coverage_family_decision,
@@ -5722,32 +6411,51 @@ async def _attack_search_decision(
 def _attack_search_next_action(search: dict) -> dict:
     branches = [
         branch for branch in search.get("branches", [])
-        if not _attack_search_branch_terminal(branch)
+        if _attack_search_branch_actionable(branch)
     ]
+    ranked = sorted(branches, key=_attack_search_branch_sort_key)
     selected = _attack_search_find_branch(
         search,
         str(search.get("selected_branch_id") or ""),
     )
-    if selected and selected in branches:
+    strict_leader = (
+        ranked[0]
+        if ranked and _attack_search_branch_tier(ranked[0]) == _ATTACK_SEARCH_TIER_STRICT
+        else None
+    )
+    if strict_leader is not None and selected is not strict_leader:
+        # A newly derived evidence/submission obligation preempts pinned
+        # exploratory work. This is the one deliberate exception to selection
+        # stickiness: evidence gates and ready submissions are time-sensitive
+        # controller work, while the interrupted branch remains durable.
+        branch = strict_leader
+        search["selected_branch_id"] = branch.get("id", "")
+        for item in search.get("branches", []):
+            item["selected"] = item is branch
+    elif selected and selected in branches:
         branch = selected
     elif branches:
-        branch = sorted(branches, key=_attack_search_branch_sort_key)[0]
+        branch = ranked[0]
         search["selected_branch_id"] = branch.get("id", "")
         for item in search.get("branches", []):
             item["selected"] = item is branch
     else:
+        search["selected_branch_id"] = ""
+        for item in search.get("branches", []):
+            item["selected"] = False
         return {
             "branch_id": None,
-            "status": "complete",
-            "tool": "attack_search",
+            "status": "campaign_ready",
+            "tool": None,
             "required_toolsets": [],
             "instructions": (
-                "No active attack-search branches remain. Start a fresh focus, "
-                "map another subsystem, or end only after coverage and evidence "
-                "support that decision."
+                "Fresh controller derivation found no active process, coverage, "
+                "experiment, evidence, or reporting branches. The campaign is "
+                "ready to conclude unless the user expands scope or names a new focus."
             ),
             "required_evidence": [],
-            "must_follow": True,
+            "campaign_ready": True,
+            "must_follow": False,
         }
     next_action = {
         "branch_id": branch.get("id"),
@@ -5763,12 +6471,14 @@ def _attack_search_next_action(search: dict) -> dict:
         "source_artifacts": branch.get("source_artifacts") or [],
         "related_ids": branch.get("related_ids") or [],
         "action_keys": branch.get("action_keys") or [],
+        "coverage_keys": branch.get("coverage_keys") or [],
         "clone_family_keys": branch.get("clone_family_keys") or [],
         "attack_keys": branch.get("attack_keys") or [],
         "target_binding": branch.get("target_binding"),
         "inventory_context": branch.get("inventory_context"),
         "target_actions": branch.get("target_actions") or [],
         "required_args": branch.get("required_args") or {},
+        "hypothesis_card": branch.get("hypothesis_card"),
         "must_follow": True,
     }
     # Pass through structured next-tool hints when a branch carries them. The
@@ -5819,18 +6529,28 @@ def _attack_search_summary(search: dict) -> dict:
         source = str(branch.get("source") or "unknown")
         by_status[status] = by_status.get(status, 0) + 1
         by_source[source] = by_source.get(source, 0) + 1
+    active = sum(
+        1 for branch in branches
+        if not _attack_search_branch_terminal(branch)
+    )
+    parked = sum(
+        1 for branch in branches
+        if not _attack_search_branch_terminal(branch)
+        and str(branch.get("status") or "") in _ATTACK_SEARCH_PARKED_STATUSES
+    )
+    actionable = sum(1 for branch in branches if _attack_search_branch_actionable(branch))
     return {
         "branches": len(branches),
-        "active": sum(
-            1 for branch in branches
-            if not _attack_search_branch_terminal(branch)
-        ),
+        "active": active,
+        "actionable": actionable,
+        "parked": parked,
         "terminal": sum(
             1 for branch in branches
             if _attack_search_branch_terminal(branch)
         ),
         "by_status": by_status,
         "by_source": by_source,
+        "campaign_ready": actionable == 0,
     }
 
 
@@ -5998,11 +6718,13 @@ def _compact_attack_branch(branch: dict, *, terminal: bool = False) -> dict:
         "related_ids": (branch.get("related_ids") or [])[:8],
         "evidence": (branch.get("evidence") or [])[:12],
         "action_keys": (branch.get("action_keys") or [])[:12],
+        "coverage_keys": (branch.get("coverage_keys") or [])[:12],
         "clone_family_keys": (branch.get("clone_family_keys") or [])[:12],
         "attack_keys": (branch.get("attack_keys") or [])[:8],
         "target_binding": branch.get("target_binding"),
         "inventory_context": branch.get("inventory_context"),
         "readiness": branch.get("readiness"),
+        "hypothesis_card": branch.get("hypothesis_card"),
         "failure_diagnosis": _compact_failure_diagnosis(
             branch.get("failure_diagnosis")
         ),
@@ -6065,6 +6787,7 @@ def _compact_attack_next_action(next_action: dict) -> dict:
     compact["source_artifacts"] = (compact.get("source_artifacts") or [])[:5]
     compact["source_ids"] = (compact.get("source_ids") or [])[:8]
     compact["action_keys"] = (compact.get("action_keys") or [])[:12]
+    compact["coverage_keys"] = (compact.get("coverage_keys") or [])[:12]
     compact["clone_family_keys"] = (compact.get("clone_family_keys") or [])[:12]
     compact["attack_keys"] = (compact.get("attack_keys") or [])[:8]
     # dossier_path is attached by _write_attack_search_branch_dossier and points
@@ -6078,9 +6801,9 @@ def _compact_attack_next_action(next_action: dict) -> dict:
 # Branch dossiers are durable, self-contained snapshots of the selected
 # attack_search branch. The compact next_action / active_branches lists in the
 # response are aggressively truncated to keep the model-visible payload small;
-# the dossier is the full-fidelity copy on disk so a compacted context can
-# recover the current branch (hypothesis, target actions, evidence, required
-# args, last blocker, next tool) with a single artifact read.
+# the dossier is the durable bounded recovery copy on disk so a compacted
+# context can recover the current branch (hypothesis, target actions, evidence,
+# required args, last blocker, next tool) with a single artifact read.
 _BRANCH_DOSSIER_DIR = "/workspace/campaign/branch-dossiers"
 
 # Branch statuses that signal a stall the agent must clear before progressing;
@@ -6206,11 +6929,13 @@ def _attack_search_branch_dossier(search: dict, branch: dict) -> dict:
         "related_ids": branch.get("related_ids") or [],
         "evidence": branch.get("evidence") or [],
         "action_keys": branch.get("action_keys") or [],
+        "coverage_keys": branch.get("coverage_keys") or [],
         "attack_keys": branch.get("attack_keys") or [],
         "clone_family_keys": branch.get("clone_family_keys") or [],
         "target_binding": branch.get("target_binding"),
         "inventory_context": branch.get("inventory_context"),
         "required_args": branch.get("required_args") or {},
+        "hypothesis_card": branch.get("hypothesis_card"),
         "failure_diagnosis": _compact_failure_diagnosis(
             branch.get("failure_diagnosis")
         ),
@@ -6283,9 +7008,9 @@ async def _save_attack_search(
         _attack_search_score_branch(branch)
     search["summary"] = _attack_search_summary(search)
     search["next_action"] = _attack_search_next_action(search)
-    # Persist the selected branch's full-fidelity dossier and stamp its path onto
-    # next_action before the search is written, so current.json/history.json and
-    # the response all carry dossier_path.
+    # Persist the selected branch's durable bounded dossier and stamp its path
+    # onto next_action before the search is written, so current.json,
+    # history.json, and the response all carry dossier_path.
     await _write_attack_search_branch_dossier(container, search)
     history_path = search.setdefault("paths", {}).setdefault(
         "history",
@@ -6340,6 +7065,17 @@ async def _attack_search(container: AuditContainer, args: dict) -> str:
             error = _attack_search_select(search, branch_id)
     elif action == "advance":
         error = _attack_search_advance(search, args)
+        if error is None and "hypothesis_card" in args:
+            # Re-derive the branch immediately so the persisted admission
+            # override unlocks the original candidate's exact compose args and
+            # target actions on this response. This is the normal controller
+            # sync path, not a second scheduler.
+            candidates = await _attack_search_candidates(
+                container,
+                state,
+                focus=focus,
+            )
+            _attack_search_merge_candidates(search, candidates)
     elif action == "decision":
         error = await _attack_search_decision(container, state, search, args)
 
@@ -6350,7 +7086,7 @@ async def _attack_search(container: AuditContainer, args: dict) -> str:
     await _save_attack_search(container, state, search)
 
     result_id = ""
-    if args.get("record_result", True):
+    if args.get("record_result", False):
         result_id = await _record_result_artifact(
             container,
             title=f"Attack search: {search['title']}",
@@ -6382,6 +7118,9 @@ async def _attack_search(container: AuditContainer, args: dict) -> str:
                 "tool": search.get("next_action", {}).get("tool"),
                 "source": search.get("next_action", {}).get("source"),
                 "action_keys": search.get("next_action", {}).get("action_keys") or [],
+                "coverage_keys": (
+                    search.get("next_action", {}).get("coverage_keys") or []
+                ),
                 "clone_family_keys": (
                     search.get("next_action", {}).get("clone_family_keys") or []
                 ),
@@ -6413,6 +7152,7 @@ async def _attack_search(container: AuditContainer, args: dict) -> str:
         "mode": search.get("mode"),
         "focus": search.get("focus"),
         "summary": search["summary"],
+        "campaign_ready": bool(search["summary"].get("campaign_ready")),
         "next_action": _compact_attack_next_action(search["next_action"]),
         "active_branches": [
             _compact_attack_branch(branch)
@@ -6434,7 +7174,11 @@ async def _attack_search(container: AuditContainer, args: dict) -> str:
             "note": "Open history_path for full branch history and decisions.",
         },
         "controller_instructions": [
-            "Execute next_action.tool before pursuing another branch.",
+            (
+                "No controller action is pending; conclude or wait for an explicit scope change."
+                if search["summary"].get("campaign_ready")
+                else "Execute next_action.tool before pursuing another branch."
+            ),
             "After each material tool result, call attack_search with action=sync.",
             "Use action=decision for explicit rejection/blocking/objective-failed conclusions; sync infers state from campaign artifacts.",
             "Use action=advance only for exceptional manual status transitions that are not campaign decisions.",
@@ -6475,317 +7219,6 @@ def _normalize_experiment_target_dir(path: str) -> str:
     )
 
 
-def _experiment_readme(
-    *,
-    artifact_id: str,
-    title: str,
-    template: str,
-    notes: str,
-    related_ids: list[str],
-    write_scaffold_contract: bool = True,
-) -> str:
-    related = ", ".join(related_ids) if related_ids else "none"
-    notes = notes.strip() or "TODO: define setup, sequence, and success condition."
-    scaffold_note = (
-        "Starter Solidity scaffold written; replace TODOs before running it as evidence."
-        if write_scaffold_contract and template != "blank"
-        else "No starter Solidity scaffold was written; create a custom test before running objective evidence."
-    )
-    return f"""# {title}
-
-Experiment id: `{artifact_id}`
-Template: `{template}`
-Related campaign artifacts: {related}
-Scaffold: {scaffold_note}
-
-## Objective
-
-TODO: State the invariant or assumption this experiment tries to falsify.
-
-## Setup
-
-TODO: List actors, balances, mocks, fork block, protocol state, and deployment steps.
-
-## Transaction Sequence
-
-TODO: List every attacker/victim/protocol action in order.
-
-## Success Condition
-
-TODO: Define the observable result: profit, bad debt, excess redemption,
-unauthorized mint/release, permanent lock, or invariant violation.
-
-## Notes
-
-{notes}
-
-## Evidence Log
-
-Record command outputs with `run_experiment` so results are linked back to this id.
-
-## Fork RPC endpoints
-
-You do not export `ETH_RPC_URL` by hand. `run_experiment` (and
-`run_sequence_minimization`) derive chain-specific endpoints from this
-experiment's fork context / chain binding (or an explicit `rpc_url`,
-`network`/`chain_id`, or `fork_context` arg) and inject them per run:
-
-- `ETH_RPC_URL` — the primary fork chain, for `vm.envString("ETH_RPC_URL")`.
-- `RPC_URL_<chain_id>` / `RPC_URL_<NETWORK>` — one per chain, e.g.
-  `RPC_URL_8453` / `RPC_URL_BASE_MAINNET`. Read these in multi-chain tests, e.g.
-  `vm.createSelectFork(vm.envString("RPC_URL_8453"))`.
-
-For a multi-chain experiment, declare `primary_chain` and `required_chains` (and
-per-target `network`/`chain_id`) in `sequence.json` so every chain is injected
-and the primary one backs `ETH_RPC_URL`.
-
-## Runbook
-
-1. Use build/static commands only for setup triage; classify those runs with `run_kind=build`, `run_kind=static_analysis`, or `run_kind=setup_probe`.
-2. Write or fill a Foundry test/invariant that emits or asserts the objective marker: attacker profit, protocol loss, bad debt, unauthorized state transition, or permanent lock.
-3. Run the objective-capable command with `run_experiment` using `run_kind=harness_run`, `run_kind=poc_run`, or `run_kind=fuzz_run`.
-4. If compilation/setup fails, repair the earliest blocker and rerun the same objective command before mutating the hypothesis.
-5. If the objective does not move, record an `attack_search` decision or mutate to a concrete adjacent assumption.
-"""
-
-
-def _foundry_template_contract(
-    template: str,
-    title: str,
-    *,
-    solidity_pragma: str = _DEFAULT_SOLIDITY_PRAGMA,
-) -> str:
-    contract_name = "ReentbotProExperiment"
-    title_comment = title.replace("\n", " ").strip()
-    helper = ""
-    test_body = """        // TODO: deploy or bind target contracts.
-        // TODO: execute the hypothesized transaction sequence.
-        // TODO: assert the invariant violation or attacker profit.
-"""
-
-    if template == "multi_actor":
-        test_body = """        address attacker = makeAddr("attacker");
-        address victim = makeAddr("victim");
-        address liquidator = makeAddr("liquidator");
-
-        vm.startPrank(attacker);
-        // TODO: attacker setup and first action.
-        vm.stopPrank();
-
-        vm.startPrank(victim);
-        // TODO: victim or honest-user state, if needed.
-        vm.stopPrank();
-
-        vm.startPrank(liquidator);
-        // TODO: third-party action, liquidation, keeper step, or callback.
-        vm.stopPrank();
-
-        // TODO: assert final balance/accounting deltas.
-"""
-    elif template == "fork_test":
-        test_body = """        // ETH_RPC_URL is injected by run_experiment from the experiment fork
-        // context, chain binding, or explicit override (no manual export needed).
-        // For a multi-chain scenario read a chain-specific endpoint instead, e.g.
-        // vm.envString("RPC_URL_8453") / vm.envString("RPC_URL_42161").
-        string memory rpcUrl = vm.envString("ETH_RPC_URL");
-        uint256 forkId = vm.createFork(rpcUrl);
-        vm.selectFork(forkId);
-
-        address attacker = makeAddr("attacker");
-        vm.deal(attacker, 10 ether);
-
-        vm.startPrank(attacker);
-        // TODO: bind deployed contracts and execute fork scenario.
-        vm.stopPrank();
-
-        // TODO: assert fork-state impact and attacker PnL.
-"""
-    elif template == "malicious_token":
-        helper = """
-contract AdversarialToken {
-    string public name = "Adversarial Token";
-    string public symbol = "ADV";
-    uint8 public decimals = 18;
-    uint256 public totalSupply;
-    uint256 public transferFeeBps;
-    mapping(address => uint256) public balanceOf;
-    mapping(address => mapping(address => uint256)) public allowance;
-
-    function mint(address to, uint256 amount) external {
-        balanceOf[to] += amount;
-        totalSupply += amount;
-    }
-
-    function approve(address spender, uint256 amount) external returns (bool) {
-        allowance[msg.sender][spender] = amount;
-        return true;
-    }
-
-    function transfer(address to, uint256 amount) external returns (bool) {
-        _transfer(msg.sender, to, amount);
-        return true;
-    }
-
-    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
-        uint256 allowed = allowance[from][msg.sender];
-        require(allowed >= amount, "allowance");
-        allowance[from][msg.sender] = allowed - amount;
-        _transfer(from, to, amount);
-        return true;
-    }
-
-    function setTransferFeeBps(uint256 feeBps) external {
-        require(feeBps <= 10_000, "fee too high");
-        transferFeeBps = feeBps;
-    }
-
-    function _transfer(address from, address to, uint256 amount) internal {
-        require(balanceOf[from] >= amount, "balance");
-        uint256 fee = amount * transferFeeBps / 10_000;
-        balanceOf[from] -= amount;
-        balanceOf[to] += amount - fee;
-        totalSupply -= fee;
-    }
-}
-"""
-        test_body = """        address attacker = makeAddr("attacker");
-        AdversarialToken token = new AdversarialToken();
-        token.mint(attacker, 1_000_000 ether);
-        token.setTransferFeeBps(100);
-
-        vm.startPrank(attacker);
-        // TODO: route the adversarial token through target accounting.
-        vm.stopPrank();
-
-        // TODO: assert whether target accounting diverges from actual balances.
-"""
-    elif template == "fake_oracle":
-        helper = """
-contract FakeOracle {
-    int256 public answer;
-    uint8 public decimals = 8;
-    uint256 public updatedAt;
-
-    function setAnswer(int256 newAnswer) external {
-        answer = newAnswer;
-        updatedAt = block.timestamp;
-    }
-
-    function latestRoundData()
-        external
-        view
-        returns (uint80, int256, uint256, uint256, uint80)
-    {
-        return (1, answer, updatedAt, updatedAt, 1);
-    }
-}
-"""
-        test_body = """        FakeOracle oracle = new FakeOracle();
-        oracle.setAnswer(2_000e8);
-
-        // TODO: connect oracle to target or mock integration point.
-        // TODO: vary answer, staleness, decimals, and sign.
-        // TODO: assert whether target valuation can be manipulated.
-"""
-    elif template == "callback_reentrancy":
-        helper = """
-interface ICallbackTarget {
-    function enter(bytes calldata data) external;
-}
-
-contract CallbackProbe {
-    ICallbackTarget public target;
-    bytes public reentryData;
-    bool public reentered;
-
-    constructor(ICallbackTarget target_) {
-        target = target_;
-    }
-
-    function setReentryData(bytes calldata data) external {
-        reentryData = data;
-    }
-
-    receive() external payable {
-        if (!reentered && reentryData.length != 0) {
-            reentered = true;
-            target.enter(reentryData);
-        }
-    }
-}
-"""
-        test_body = """        // TODO: adapt ICallbackTarget to the protocol callback surface.
-        // TODO: deploy CallbackProbe and trigger the external call path.
-        // TODO: assert whether state is observed before it is finalized.
-"""
-    elif template == "accounting_probe":
-        test_body = """        uint256 assetsBefore;
-        uint256 sharesBefore;
-        uint256 attackerBefore;
-
-        // TODO: snapshot assets, shares, debts, collateral, and attacker balances.
-        // TODO: perform deposit/donate/borrow/withdraw/redeem sequence.
-
-        uint256 assetsAfter;
-        uint256 sharesAfter;
-        uint256 attackerAfter;
-
-        assetsBefore;
-        sharesBefore;
-        attackerBefore;
-        assetsAfter;
-        sharesAfter;
-        attackerAfter;
-
-        // TODO: assert accounting invariant and attacker PnL.
-"""
-
-    return f"""// SPDX-License-Identifier: MIT
-pragma solidity {solidity_pragma};
-
-import "forge-std/Test.sol";
-
-{helper}
-contract {contract_name} is Test {{
-    // {title_comment}
-
-    function setUp() public {{
-        // TODO: initialize target state.
-    }}
-
-    function test_experiment() public {{
-{test_body}    }}
-}}
-"""
-
-
-def _experiment_files(
-    *,
-    artifact_id: str,
-    title: str,
-    template: str,
-    notes: str,
-    related_ids: list[str],
-    write_scaffold_contract: bool = True,
-    solidity_pragma: str = _DEFAULT_SOLIDITY_PRAGMA,
-) -> dict[str, str]:
-    files = {
-        "README.md": _experiment_readme(
-            artifact_id=artifact_id,
-            title=title,
-            template=template,
-            notes=notes,
-            related_ids=related_ids,
-            write_scaffold_contract=write_scaffold_contract,
-        )
-    }
-    if template != "blank" and write_scaffold_contract:
-        files["ReentbotProExperiment.t.sol"] = _foundry_template_contract(
-            template,
-            title,
-            solidity_pragma=solidity_pragma,
-        )
-    return files
 
 
 _REPLAY_INLINE_LOG_RE = re.compile(
@@ -7436,82 +7869,6 @@ def _replay_followup_from_run(
     }
 
 
-async def _create_experiment(container: AuditContainer, args: dict) -> str:
-    title = args.get("title", "").strip()
-    if not title:
-        return "Error: 'title' is required"
-
-    template = args.get("template", "blank")
-    if template not in _EXPERIMENT_TEMPLATES:
-        return f"Error: unknown experiment template '{template}'"
-    priority = args.get("priority")
-    if priority is not None and priority not in _CAMPAIGN_PRIORITIES:
-        return f"Error: unknown campaign priority '{priority}'"
-
-    try:
-        target_dir = _normalize_experiment_target_dir(
-            args.get("target_dir", "/workspace/experiments")
-        )
-    except ValueError as exc:
-        return f"Error: {exc}"
-
-    state = await _load_campaign_state(container)
-    artifact_id = _next_campaign_id(state, "experiment")
-    experiment_dir = posixpath.join(
-        target_dir,
-        f"{artifact_id}-{_slugify(title)}",
-    )
-    related_ids = [
-        item for item in (
-            args.get("hypothesis_id", "").strip(),
-            args.get("invariant_id", "").strip(),
-        )
-        if item
-    ]
-    notes = args.get("notes", "")
-    write_scaffold_contract = bool(args.get("write_scaffold_contract", True))
-    solidity_pragma = _normalize_solidity_pragma(args.get("solidity_pragma"))
-    files = _experiment_files(
-        artifact_id=artifact_id,
-        title=title,
-        template=template,
-        notes=notes,
-        related_ids=related_ids,
-        write_scaffold_contract=write_scaffold_contract,
-        solidity_pragma=solidity_pragma,
-    )
-
-    written_paths = []
-    for filename, content in files.items():
-        path = posixpath.join(experiment_dir, filename)
-        await container.write_file(path, content)
-        written_paths.append(path)
-
-    now = datetime.now(timezone.utc).isoformat()
-    state["sections"]["experiment"].append({
-        "id": artifact_id,
-        "created_at": now,
-        "updated_at": now,
-        "title": title,
-        "content": (
-            f"Template: {template}\n"
-            f"Workspace: {experiment_dir}\n\n"
-            f"Scaffold contract: {str(write_scaffold_contract and template != 'blank').lower()}\n"
-            f"Solidity pragma: {solidity_pragma}\n\n"
-            f"{notes.strip() or 'Experiment scaffold created; fill in target-specific logic.'}"
-        ),
-        "status": "open",
-        "priority": priority,
-        "evidence": written_paths,
-        "related_ids": related_ids,
-    })
-    await _save_campaign_state(container, state)
-
-    return (
-        f"Created experiment {artifact_id}: {title}\n"
-        f"Workspace: {experiment_dir}\n"
-        "Files:\n- " + "\n- ".join(written_paths)
-    )
 
 
 def _experiment_timeout(command: str, requested_timeout: object | None) -> int:
@@ -7961,11 +8318,311 @@ async def _run_experiment(
 #
 # diagnose_build runs or parses a build/test-list command and turns raw solc/
 # Foundry/Hardhat output into a small, structured list of blockers so the agent
-# acts on a classified failure instead of re-reading a noisy log. It writes only
-# a campaign artifact (never mutates an experiment's source or sequence.json);
-# the submission gates still require a runnable PoC for high/critical findings.
+# acts on a classified failure instead of re-reading a noisy log. Besides the
+# build system's ordinary compiler artifacts, it writes a campaign diagnostic;
+# it never edits experiment source or sequence.json. The submission gates still
+# require a runnable PoC for high/critical findings.
 
 _DIAGNOSE_LOG_ALLOWED_PREFIXES = ("/workspace/", "/audit/", "/output/")
+
+# ``diagnose_build`` is part of the controller's always-available cognitive
+# surface.  An explicit command therefore needs the same conservative grammar
+# as the diagnostic ``run_command`` exception: compile/inspect/list/static
+# analysis only, with no shell composition or arbitrary write target.
+_DIAGNOSTIC_ENV_ASSIGNMENT_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*=[^\s]*$"
+)
+_DIAGNOSTIC_FORGE_PREFIXES = {
+    ("forge", "build"),
+    ("forge", "config"),
+    ("forge", "inspect"),
+}
+_DIAGNOSTIC_SHELL_MARKERS = (
+    "#",
+    ";",
+    "|",
+    "&",
+    "`",
+    "$",
+    ">>",
+    "<",
+    "(",
+    ")",
+    "\n",
+    "\r",
+)
+# Controller-bypassing diagnostics may write only into dedicated scratch
+# subtrees.  The broader /workspace/campaign and /output roots also contain the
+# authoritative controller, campaign state, evidence reviews, and final report;
+# treating either whole root as scratch lets a shell redirect truncate those
+# artifacts before the diagnostic command even starts.
+_DIAGNOSTIC_ARTIFACT_ROOTS = (
+    "/workspace/campaign/build-diagnostics/scratch/",
+    "/workspace/campaign/static-analysis/",
+    "/workspace/experiments/diagnostics/",
+    "/output/diagnostics/",
+)
+_DIAGNOSTIC_PROTECTED_PATHS = {
+    _CAMPAIGN_STATE_PATH,
+    _CAMPAIGN_TRACE_PATH,
+    _ATTACK_SEARCH_CURRENT_PATH,
+    "/workspace/campaign/brief.json",
+    "/workspace/campaign/brief.md",
+    "/output/report.md",
+    "/output/findings.json",
+}
+_DIAGNOSTIC_PROTECTED_PREFIXES = (
+    "/workspace/campaign/attack-search/",
+    "/workspace/campaign/branch-dossiers/",
+    "/workspace/campaign/results/",
+    "/workspace/campaign/fuzz-runs/",
+    "/workspace/campaign/minimizations/",
+    "/workspace/campaign/snapshots/",
+    "/workspace/campaign/comparisons/",
+    "/workspace/campaign/evaluations/",
+    "/workspace/campaign/finding-reviews/",
+    "/workspace/campaign/report-reviews/",
+)
+_COMMAND_PATH_OVERRIDE_FLAGS = {
+    "--broadcast",
+    "--broadcast-path",
+    "--broadcasts",
+    "--broadcasts-path",
+    "--build-info-path",
+    "--cache-path",
+    "--config-path",
+    "--contracts",
+    "--contracts-path",
+    "--dump",
+    "--out",
+    "--out-path",
+    "--report-file",
+    "--root",
+    "--snapshots",
+    "--snapshots-path",
+    "-o",
+}
+_FOUNDRY_FORBIDDEN_OVERRIDE_FLAGS = {
+    # These select a compiler executable/version (and may download or execute a
+    # caller-selected binary), so they are not a read-only diagnostic override.
+    "--compiler",
+    "--solc",
+    "--solc-path",
+    "--use",
+    # An alternate config can re-enable FFI or redirect compiler/output paths
+    # without those controls appearing in the command line we validate.
+    "--config-path",
+}
+
+# Slither normally behaves like a read-only analyzer, but a handful of CLI
+# options can execute an arbitrary build command, select an arbitrary compiler,
+# modify the target tree, persist triage state, or expose API keys in the
+# recorded command.  Keep those out of the controller-bypass diagnostic grammar.
+_SLITHER_FORBIDDEN_FLAGS = {
+    "--avax-apikey",
+    "--compile-custom-build",
+    "--config-file",
+    "--embark-overwrite-config",
+    "--etherlime-compile-arguments",
+    "--etherscan-apikey",
+    "--generate-patches",
+    "--solc",
+    "--solc-args",
+    "--solc-solcs-bin",
+    "--solc-solcs-select",
+    "--triage-mode",
+    "--truffle-overwrite-config",
+    "--truffle-version",
+    "--waffle-config-file",
+}
+_SLITHER_OUTPUT_PATH_FLAGS = {
+    "--buidler-cache-directory",
+    "--etherscan-export-directory",
+    "--foundry-out-directory",
+    "--hardhat-artifacts-directory",
+    "--hardhat-cache-directory",
+    "--json",
+    "--sarif",
+    "--solc-working-dir",
+    "--triage-database",
+    "--truffle-build-directory",
+    "--zip",
+}
+_SLITHER_STDOUT_PATH_FLAGS = {"--json", "--sarif"}
+
+
+def _command_path_target_allowed(
+    target: object,
+    allowed_roots: tuple[str, ...],
+) -> bool:
+    if not isinstance(target, str) or not target.startswith("/"):
+        return False
+    if "\x00" in target:
+        return False
+    normalized = posixpath.normpath(target)
+    return normalized.startswith(allowed_roots)
+
+
+def _command_path_overrides_are_safe(
+    tokens: list[str],
+    *,
+    allowed_roots: tuple[str, ...],
+) -> bool:
+    """Validate Foundry path overrides and reject executable/config overrides."""
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        option = token.partition("=")[0]
+        if option in _FOUNDRY_FORBIDDEN_OVERRIDE_FLAGS:
+            return False
+        target = ""
+        if token in _COMMAND_PATH_OVERRIDE_FLAGS:
+            index += 1
+            if index >= len(tokens):
+                return False
+            target = tokens[index]
+        elif token.startswith("-o") and not token.startswith("--"):
+            # clap accepts an attached value for Foundry's short `-o` option
+            # (`-o/path` as well as `-o=/path`). Do not let that spelling bypass
+            # the explicit output-root check.
+            target = token[2:].removeprefix("=")
+            if not target:
+                return False
+        else:
+            for flag in _COMMAND_PATH_OVERRIDE_FLAGS:
+                prefix = flag + "="
+                if token.startswith(prefix):
+                    target = token[len(prefix):]
+                    break
+        if target and not _command_path_target_allowed(target, allowed_roots):
+            return False
+        index += 1
+    return True
+
+
+def _diagnostic_artifact_target_allowed(target: object) -> bool:
+    """Allow diagnostic writes only in scratch roots, never protected artifacts."""
+    if not isinstance(target, str) or not target.startswith("/") or "\x00" in target:
+        return False
+    normalized = posixpath.normpath(target)
+    if normalized in _DIAGNOSTIC_PROTECTED_PATHS:
+        return False
+    if normalized.startswith(_DIAGNOSTIC_PROTECTED_PREFIXES):
+        return False
+    return normalized.startswith(_DIAGNOSTIC_ARTIFACT_ROOTS)
+
+
+def _diagnostic_redirect_target_allowed(target: object) -> bool:
+    return _diagnostic_artifact_target_allowed(target)
+
+
+def _slither_options_are_safe(tokens: list[str]) -> bool:
+    """Reject Slither options that can escape a read-only diagnostic run."""
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        option = token.partition("=")[0]
+        if any(
+            option == flag or (option.startswith("--") and flag.startswith(option))
+            for flag in _SLITHER_FORBIDDEN_FLAGS
+        ):
+            return False
+
+        output_flag = next(
+            (
+                flag for flag in _SLITHER_OUTPUT_PATH_FLAGS
+                if option == flag
+                or (option.startswith("--") and flag.startswith(option))
+            ),
+            None,
+        )
+        if output_flag is not None:
+            if "=" not in token:
+                index += 1
+                if index >= len(tokens):
+                    return False
+                target = tokens[index]
+            else:
+                target = token.partition("=")[2]
+            if not (
+                target == "-" and output_flag in _SLITHER_STDOUT_PATH_FLAGS
+            ) and not _diagnostic_artifact_target_allowed(target):
+                return False
+        index += 1
+    return True
+
+
+def _diagnostic_command_core(tokens: list[str]) -> list[str] | None:
+    """Remove one validated stdout/stderr redirect from diagnostic tokens."""
+    base: list[str] = []
+    redirects = 0
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        target = ""
+        if token in {">", "1>", "2>"}:
+            index += 1
+            if index >= len(tokens):
+                return None
+            target = tokens[index]
+        else:
+            match = re.fullmatch(r"(?:[12]?>)(.+)", token)
+            if match:
+                target = match.group(1)
+            elif ">" in token:
+                return None
+
+        if target:
+            redirects += 1
+            if redirects > 1 or not _diagnostic_redirect_target_allowed(target):
+                return None
+        else:
+            base.append(token)
+        index += 1
+    return base
+
+
+def _diagnostic_command_is_safe(command: object) -> bool:
+    """Return whether *command* is a single conservative diagnostic command.
+
+    This intentionally recognizes only Foundry build/config/inspect, Foundry
+    test discovery (``forge test --list``), and Slither.  Shell chaining,
+    expansion, input/append redirection, and writes outside dedicated diagnostic
+    scratch roots are rejected even if the command begins with an allowed
+    executable.
+    """
+    if not isinstance(command, str):
+        return False
+    command = command.strip()
+    if not command or "\x00" in command:
+        return False
+    if any(marker in command for marker in _DIAGNOSTIC_SHELL_MARKERS):
+        return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    base = _diagnostic_command_core(tokens)
+    if base is None:
+        return False
+    while base and _DIAGNOSTIC_ENV_ASSIGNMENT_RE.fullmatch(base[0]):
+        if base[0].partition("=")[0] != "FOUNDRY_PROFILE":
+            return False
+        base = base[1:]
+    if not base:
+        return False
+    if "--ffi" in base:
+        return False
+    if not _command_path_overrides_are_safe(
+        base,
+        allowed_roots=_DIAGNOSTIC_ARTIFACT_ROOTS,
+    ):
+        return False
+    if tuple(base[:2]) in _DIAGNOSTIC_FORGE_PREFIXES:
+        return True
+    if base[:2] == ["forge", "test"] and "--list" in base:
+        return True
+    return base[0] == "slither" and _slither_options_are_safe(base)
 
 # External-package markers in an unresolved import → a missing *dependency*
 # (install/remapping problem) rather than a local missing_import (path/typo).
@@ -8364,6 +9021,20 @@ async def _diagnose_build(container: AuditContainer, args: dict) -> str:
         source = "log_path"
     else:
         if command_arg:
+            if not _diagnostic_command_is_safe(command_arg):
+                return json.dumps(
+                    {
+                        "error": "command_not_allowed",
+                        "message": (
+                            "command must be a single diagnostic invocation: "
+                            "forge build/config/inspect, forge test --list, or "
+                            "slither; shell chaining and arbitrary write targets "
+                            "are not allowed"
+                        ),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
             command = command_arg
             source = "command"
         elif experiment_arg:
@@ -9315,7 +9986,7 @@ def _fuzz_next_actions(outcome: str) -> list[str]:
     if outcome == "no_counterexample":
         return [
             "Record what invariant was not falsified and mutate the hypothesis or broaden the handler action space.",
-            "Refresh plan_attack_campaign if this was the active top branch.",
+            "Sync attack_search so the controller can select the next unresolved branch.",
         ]
     if outcome == "timed_out":
         return [
@@ -11259,6 +11930,100 @@ def _chain_group_key(network: str | None, chain_id: int | None) -> str | None:
     return None
 
 
+def _chain_qualified_target_identity(item: dict | None) -> tuple[str, str]:
+    """Return the canonical ``(chain, lowercase address)`` target identity.
+
+    Chain id wins when it can be resolved; otherwise the normalized network is
+    used.  The empty chain component is intentional compatibility for older
+    artifacts that predate per-target chain metadata.  Callers joining several
+    live actions must pass that legacy identity through
+    :func:`_coherent_target_identity` so an address deployed on multiple chains
+    is never treated as one target merely because its 20-byte value matches.
+    """
+    item = item if isinstance(item, dict) else {}
+    address = str(
+        item.get("target_address")
+        or item.get("address")
+        or item.get("target")
+        or ""
+    ).strip().lower()
+    network, chain_id = _canonical_chain(
+        item.get("network"), item.get("chain_id")
+    )
+    return _chain_group_key(network, chain_id) or "", address
+
+
+def _chain_qualified_target_key(item: dict | None) -> str:
+    """Stable target token for ids/keys, preserving address-only legacy keys."""
+    chain_key, address = _chain_qualified_target_identity(item)
+    if not address:
+        return ""
+    return f"{chain_key}:{address}" if chain_key else address
+
+
+def _chain_qualified_target_metadata(
+    item: dict | None,
+    *,
+    identity: tuple[str, str] | None = None,
+) -> dict:
+    """Model-visible chain-qualified target metadata for candidates/actions."""
+    item = item if isinstance(item, dict) else {}
+    chain_key, address = identity or _chain_qualified_target_identity(item)
+    network, chain_id = _canonical_chain(
+        item.get("network"), item.get("chain_id")
+    )
+    metadata = {
+        "address": address or None,
+        "network": network,
+        "chain_id": chain_id,
+        "chain_key": chain_key or None,
+    }
+    return {
+        key: value
+        for key, value in metadata.items()
+        if value not in (None, "", [], {})
+    }
+
+
+def _concrete_target_chains_by_address(
+    exposures: list[dict],
+) -> dict[str, set[str]]:
+    """Index explicit chain identities seen for each target address."""
+    chains: dict[str, set[str]] = {}
+    for exposure in exposures:
+        if not isinstance(exposure, dict):
+            continue
+        chain_key, address = _chain_qualified_target_identity(exposure)
+        if chain_key and address:
+            chains.setdefault(address, set()).add(chain_key)
+    return chains
+
+
+def _coherent_target_identity(
+    item: dict | None,
+    concrete_chains_by_address: dict[str, set[str]],
+) -> tuple[str, str] | None:
+    """Resolve one join identity without guessing across chains.
+
+    A chain-qualified item always keeps its concrete identity.  A legacy
+    chainless item may inherit one chain only when exactly one concrete chain is
+    known for that address.  It remains address-only when no chain is known and
+    is excluded when two or more concrete chains make the old artifact
+    ambiguous.
+    """
+    chain_key, address = _chain_qualified_target_identity(item)
+    if not address:
+        return None
+    if chain_key:
+        return chain_key, address
+    known_chains = concrete_chains_by_address.get(address) or set()
+    if len(known_chains) == 1:
+        return next(iter(known_chains)), address
+    if len(known_chains) > 1:
+        return None
+    return "", address
+
+
 def _chain_matches(
     candidates: list[tuple[str | None, int | None]],
     network: str | None,
@@ -11735,8 +12500,9 @@ async def _plan_live_probe_chains(
 ) -> dict:
     """Assign live-probe items to per-chain groups for multi-chain probing.
 
-    Each item is ``{"address": str|None, "names": [str, ...]}`` and is matched
-    positionally to the returned ``assignments`` list. Resolution mirrors
+    Each item is ``{"address": str|None, "names": [str, ...], "network":
+    str|None, "chain_id": int|None}`` and is matched positionally to the
+    returned ``assignments`` list. Per-item chain fields are optional. Resolution mirrors
     :func:`_resolve_tool_rpc_endpoint` precedence but *groups* targets by chain
     instead of collapsing them, and never relies on a chain-agnostic global
     ``ETH_RPC_URL``:
@@ -11746,6 +12512,8 @@ async def _plan_live_probe_chains(
       chain for every item, except items the registry binds to a *different*
       single chain, which are reported ``chain_mismatch`` (filtered, not probed
       on the wrong chain);
+    * otherwise an explicit per-item chain wins when it agrees with any registry
+      binding for that item;
     * otherwise each item's chain comes from its registry deployment binding — a
       binding to several chains is ``ambiguous`` (never chosen arbitrarily);
     * an unbound item falls back to the latest fork context, then the run-level
@@ -11838,10 +12606,25 @@ async def _plan_live_probe_chains(
 
     for item in items:
         candidates = _item_registry_candidates(registry, item or {})
+        item_has_chain = _has_chain_signal(
+            (item or {}).get("network"), (item or {}).get("chain_id")
+        )
+        item_net, item_cid = (
+            _canonical_chain(
+                (item or {}).get("network"), (item or {}).get("chain_id")
+            )
+            if item_has_chain else (None, None)
+        )
         if has_explicit:
-            if candidates and not _chain_matches(
+            item_mismatch = (
+                item_has_chain
+                and _chain_group_key(item_net, item_cid)
+                != _chain_group_key(explicit_net, explicit_cid)
+            )
+            registry_mismatch = candidates and not _chain_matches(
                 candidates, explicit_net, explicit_cid
-            ):
+            )
+            if item_mismatch or registry_mismatch:
                 assignments.append({
                     "status": "chain_mismatch",
                     "requested_chain": {
@@ -11857,6 +12640,24 @@ async def _plan_live_probe_chains(
                 "chain_key": key,
                 "network": explicit_net,
                 "chain_id": explicit_cid,
+            })
+        elif item_has_chain:
+            if candidates and not _chain_matches(candidates, item_net, item_cid):
+                assignments.append({
+                    "status": "chain_mismatch",
+                    "requested_chain": {
+                        "network": item_net,
+                        "chain_id": item_cid,
+                    },
+                    "candidates": _candidate_chain_dicts(candidates),
+                })
+                continue
+            key = _register(item_net, item_cid, "item")
+            assignments.append({
+                "status": "grouped",
+                "chain_key": key,
+                "network": item_net,
+                "chain_id": item_cid,
             })
         elif len(candidates) == 1:
             net, cid = candidates[0]
@@ -12361,6 +13162,7 @@ async def _compare_snapshots(container: AuditContainer, args: dict) -> str:
         "missing_after": missing_after,
         "added_after": added_after,
         "suggested_objectives": suggested_objectives,
+        "related_ids": [str(item) for item in related_ids],
         "summary": {
             "changed": len(changed),
             "missing_after": len(missing_after),
@@ -12638,12 +13440,22 @@ async def _evaluate_objective(container: AuditContainer, args: dict) -> str:
     passed = sum(1 for item in evaluated if item["passed"])
     unmatched = sum(1 for item in evaluated if item["matched"] == 0)
     failed = len(evaluated) - passed
+    objective_achieved = bool(evaluated) and failed == 0 and unmatched == 0
     suggested_objectives = _objective_examples_for_comparison(comparison, limit=6)
     state = await _load_campaign_state(container)
     evaluation_id = _next_campaign_id(state, "evaluation")
     title = args.get("title", "").strip() or (
         f"Objective evaluation for {comparison.get('id', comparison_ref)}"
     )
+    comparison_id = str(comparison.get("id") or "").strip()
+    inherited_related_ids = comparison.get("related_ids") or []
+    if not isinstance(inherited_related_ids, list):
+        inherited_related_ids = []
+    evaluation_related_ids = _unique_strings([
+        [str(item) for item in related_ids],
+        [str(item) for item in inherited_related_ids],
+        [comparison_id] if comparison_id else [],
+    ])
     evaluation = {
         "id": evaluation_id,
         "title": title,
@@ -12659,9 +13471,10 @@ async def _evaluate_objective(container: AuditContainer, args: dict) -> str:
             "failed": failed,
             "unmatched": unmatched,
         },
+        "objective_achieved": objective_achieved,
         "objectives": evaluated,
         "suggested_objectives": suggested_objectives if unmatched else [],
-        "related_ids": [str(item) for item in related_ids],
+        "related_ids": evaluation_related_ids,
     }
     evaluation_path = f"/workspace/campaign/evaluations/{evaluation_id}.json"
     await container.write_file(
@@ -12685,7 +13498,7 @@ async def _evaluate_objective(container: AuditContainer, args: dict) -> str:
                 f"Unmatched: {unmatched}"
             ),
             evidence=[evaluation_path, comparison_path],
-            related_ids=[str(item) for item in related_ids],
+            related_ids=evaluation_related_ids,
             status="observed",
         )
 
@@ -12694,6 +13507,7 @@ async def _evaluate_objective(container: AuditContainer, args: dict) -> str:
         "path": evaluation_path,
         "result_id": result_id or None,
         "summary": evaluation["summary"],
+        "objective_achieved": objective_achieved,
         "objectives": evaluated,
         "suggested_objectives": suggested_objectives if unmatched else [],
     }
@@ -14111,20 +14925,31 @@ def _is_third_party_action_source(path: str) -> bool:
     )
 
 
-async def _manifest_source_scan_roots(
+def _scope_batch_fingerprint(values: list[object]) -> str:
+    encoded = json.dumps(
+        values,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()[:20]
+
+
+async def _manifest_source_root_batch(
     container: AuditContainer,
     root: str,
     *,
+    cursor: int,
     max_roots: int,
-) -> list[str]:
+) -> dict | None:
     normalized = _normalize_action_source_path(root)
     if normalized not in {"/audit", "/audit/src"}:
-        return []
+        return None
     try:
         manifest_raw = await container.read_file(_SCOPE_MANIFEST_PATH)
         manifest = json.loads(manifest_raw)
     except (FileNotFoundError, json.JSONDecodeError):
-        return []
+        return None
     roots = []
     seen = set()
     for profile in manifest.get("ranked_profiles") or []:
@@ -14141,9 +14966,43 @@ async def _manifest_source_scan_roots(
             continue
         seen.add(normalized_src)
         roots.append(normalized_src)
-        if len(roots) >= max_roots:
-            break
-    return roots
+    if not roots:
+        return None
+    if cursor < 0 or cursor > len(roots):
+        raise ValueError(
+            f"profile_cursor must be between 0 and {len(roots)} for this scope"
+        )
+    end = min(cursor + max(max_roots, 1), len(roots))
+    selected = roots[cursor:end]
+    return {
+        "kind": "source_roots",
+        "scope_manifest_path": _SCOPE_MANIFEST_PATH,
+        "scope_fingerprint": _scope_batch_fingerprint(roots),
+        "cursor": cursor,
+        "limit": max(max_roots, 1),
+        "selected_roots": selected,
+        "selected_count": len(selected),
+        "total_items": len(roots),
+        "processed_through": end,
+        "remaining_items": max(0, len(roots) - end),
+        "has_more": end < len(roots),
+        "next_cursor": end if end < len(roots) else None,
+    }
+
+
+async def _manifest_source_scan_roots(
+    container: AuditContainer,
+    root: str,
+    *,
+    max_roots: int,
+) -> list[str]:
+    batch = await _manifest_source_root_batch(
+        container,
+        root,
+        cursor=0,
+        max_roots=max_roots,
+    )
+    return list((batch or {}).get("selected_roots") or [])
 
 
 async def _discover_action_source_files(
@@ -14154,7 +15013,9 @@ async def _discover_action_source_files(
     include_tests: bool,
     max_files: int,
     max_roots: int = 12,
-) -> tuple[list[str], int]:
+    scan_roots_override: list[str] | None = None,
+    file_cursor: int = 0,
+) -> tuple[list[str], int, dict]:
     nested_profile_lib_roots: set[str] = set()
     if files:
         candidates = []
@@ -14175,10 +15036,14 @@ async def _discover_action_source_files(
                 if _is_scoped_profile_source_root(profile_root):
                     nested_profile_lib_roots.add(profile_root)
     else:
-        manifest_roots = await _manifest_source_scan_roots(
-            container,
-            root,
-            max_roots=max(max_roots, 1),
+        manifest_roots = (
+            list(scan_roots_override)
+            if scan_roots_override is not None
+            else await _manifest_source_scan_roots(
+                container,
+                root,
+                max_roots=max(max_roots, 1),
+            )
         )
         scan_roots = manifest_roots
         if not scan_roots:
@@ -14221,7 +15086,22 @@ async def _discover_action_source_files(
             continue
         filtered.append(candidate)
 
-    return filtered[:max_files], max(0, len(filtered) - max_files)
+    if file_cursor < 0 or file_cursor > len(filtered):
+        raise ValueError(
+            f"source_file_cursor must be between 0 and {len(filtered)} for "
+            "the selected profile roots"
+        )
+    page_end = min(file_cursor + max_files, len(filtered))
+    return (
+        filtered[file_cursor:page_end],
+        max(0, len(filtered) - page_end),
+        {
+            "source_file_cursor": file_cursor,
+            "source_files_total": len(filtered),
+            "source_file_fingerprint": _scope_batch_fingerprint(filtered),
+            "source_files_processed_through": page_end,
+        },
+    )
 
 
 def _requested_action_source_path_candidates(*, root: str, raw: str) -> list[str]:
@@ -15262,6 +16142,701 @@ def _structural_action_affordances(
     return sorted(labels)
 
 
+# ── Bounded causal source facts ────────────────────────────────────────────
+#
+# These facts enrich the existing action-space entries with just enough
+# source structure to compose short, state-dependent transaction sequences:
+# which declared storage names a function reads/writes, which calls it makes,
+# and whether a call occurs before or after a write.  They deliberately remain
+# bounded, same-contract planning hints.  They are never consulted by finding
+# or evidence gates and are not a substitute for compiler/runtime evidence.
+
+_CAUSAL_FACT_MAX_ITEMS = 24
+_CAUSAL_STATE_FACT_MAX_ITEMS = 128
+_CAUSAL_INTERNAL_EFFECT_MAX_DEPTH = 2
+_CAUSAL_STATE_DECL_SKIP = frozenset({
+    "constructor",
+    "enum",
+    "error",
+    "event",
+    "fallback",
+    "function",
+    "import",
+    "modifier",
+    "pragma",
+    "receive",
+    "struct",
+    "type",
+    "using",
+})
+_CAUSAL_CAST_MEMBER_CALL_RE = re.compile(
+    r"\b(?P<cast>[A-Za-z_]\w*)\s*\((?P<target>[^();\n]+)\)\s*\.\s*"
+    r"(?P<method>[A-Za-z_]\w*)\s*(?:\{[^}]*\})?\s*\("
+)
+_CAUSAL_MEMBER_CALL_SKIP = _STRUCT_MEMBER_CALL_SKIP - {"this"}
+_CAUSAL_LOCAL_DECL_SKIP = frozenset({
+    "assert", "delete", "else", "emit", "for", "if", "new", "require",
+    "return", "revert", "throw", "unchecked", "while",
+})
+
+
+def _contract_top_level_text(source: str, contract: dict) -> str:
+    """Return a layout-preserving view of a contract with nested bodies blanked.
+
+    Regex fallback parsing must not mistake function-local declarations for
+    contract storage.  Contract headers/statements remain in place; text inside
+    a function/struct/modifier body is replaced with spaces while newlines are
+    preserved so source line references stay stable.
+    """
+    block = _strip_comments_preserve_layout(source)[
+        int(contract["start"]):int(contract["end"])
+    ]
+    chars = list(block)
+    depth = 0
+    for index, ch in enumerate(chars):
+        if ch == "{":
+            chars[index] = " "
+            depth += 1
+            continue
+        if ch == "}":
+            depth = max(0, depth - 1)
+            # A function/modifier/struct body has no trailing semicolon.  Add
+            # a synthetic statement boundary when its top-level body closes
+            # so a state declaration that follows it is not folded into (and
+            # skipped with) the preceding declaration header.
+            chars[index] = ";" if depth == 0 else " "
+            continue
+        if depth > 0 and ch not in "\r\n":
+            chars[index] = " "
+    return "".join(chars)
+
+
+def _regex_contract_state_variables(
+    source: str,
+    contract: dict,
+    line_starts: list[int],
+) -> list[dict]:
+    """Best-effort top-level storage declarations for the regex parser.
+
+    Statements are split only after nested bodies have been blanked.  The last
+    identifier before an initializer is the declared name for ordinary Solidity
+    storage declarations, including mappings and custom contract/interface
+    types.  Unsupported multi-declarations are intentionally left conservative.
+    """
+    top_level = _contract_top_level_text(source, contract)
+    declarations: list[dict] = []
+    statement_start = 0
+    for match in re.finditer(r";", top_level):
+        statement = top_level[statement_start:match.start()]
+        absolute_start = int(contract["start"]) + statement_start
+        statement_start = match.end()
+        normalized = " ".join(statement.split())
+        if not normalized:
+            continue
+        first = re.match(r"([A-Za-z_]\w*)", normalized)
+        if not first or first.group(1).lower() in _CAUSAL_STATE_DECL_SKIP:
+            continue
+        # Strip a real assignment without splitting the `=>` inside mappings.
+        assignment = re.search(r"(?<![<>=!])=(?!=|>)", normalized)
+        declaration = normalized[:assignment.start()] if assignment else normalized
+        names = re.findall(r"\b[A-Za-z_]\w*\b", declaration)
+        if len(names) < 2:
+            continue
+        name = names[-1]
+        if name.lower() in {
+            "constant", "external", "immutable", "internal", "override",
+            "payable", "private", "public", "transient",
+        }:
+            continue
+        name_matches = list(re.finditer(rf"\b{re.escape(name)}\b", declaration))
+        type_name = declaration[:name_matches[-1].start()] if name_matches else ""
+        type_name = re.sub(
+            r"\b(?:constant|external|immutable|internal|override|payable|private|"
+            r"public|transient)\b",
+            " ",
+            type_name,
+        )
+        declarations.append({
+            "name": name,
+            "line": _line_at(
+                line_starts,
+                absolute_start + (len(statement) - len(statement.lstrip())),
+            ),
+            "type": " ".join(type_name.split()),
+            "declaration": normalized[:240],
+        })
+    return declarations
+
+
+def _causal_direct_base_state_variables(
+    *,
+    contract_name: str,
+    own_state_variables: list[dict],
+    direct_bases: list[str],
+    state_by_contract: dict[str, list[dict]],
+    max_items: int,
+) -> tuple[list[dict], list[dict], list[str]]:
+    """Merge unambiguous state from direct, same-file bases for causal parsing.
+
+    This is deliberately not a Solidity linearization engine. Only bases whose
+    declarations are present in the same parsed source unit participate, and a
+    name declared by multiple direct bases is omitted rather than guessed.
+    Contract artifacts continue to report locally declared state separately;
+    the returned inherited list makes the causal expansion explicit.
+    """
+    own_names = {
+        str(item.get("name") or "").strip()
+        for item in own_state_variables
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    }
+    inherited_by_name: dict[str, list[dict]] = {}
+    for base in direct_bases:
+        for item in state_by_contract.get(base) or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name or name in own_names:
+                continue
+            inherited_by_name.setdefault(name, []).append({
+                **item,
+                "declaring_contract": base,
+                "inherited_by": contract_name,
+            })
+    ambiguous = sorted(
+        name for name, declarations in inherited_by_name.items()
+        if len(declarations) != 1
+    )
+    inherited = [
+        declarations[0]
+        for name, declarations in inherited_by_name.items()
+        if name not in ambiguous
+    ]
+    inherited.sort(key=lambda item: (
+        str(item.get("declaring_contract") or ""),
+        int(item.get("line") or 0),
+        str(item.get("name") or ""),
+    ))
+    merged = [*own_state_variables, *inherited][:max_items]
+    retained_names = {
+        str(item.get("name") or "")
+        for item in merged[len(own_state_variables):]
+    }
+    inherited = [
+        item for item in inherited
+        if str(item.get("name") or "") in retained_names
+    ]
+    return merged, inherited, ambiguous
+
+
+_CAUSAL_WRITE_OPERATOR_RE = re.compile(
+    r"\s*(?P<op>\+\+|--|[+\-*/%|&^]?=)(?!=)"
+)
+_CAUSAL_ACCESS_MAX_PER_VARIABLE = 16
+
+
+def _causal_normalize_access(value: str, *, caller_aliases: bool) -> str:
+    normalized = " ".join(str(value or "").split())
+    normalized = re.sub(r"\s*([.\[\](),])\s*", r"\1", normalized)
+    if not caller_aliases:
+        return normalized
+    normalized = re.sub(r"(?<![.\w])_msgSender\(\)", "@caller", normalized)
+    normalized = re.sub(r"(?<![.\w])msg\.sender\b", "@caller", normalized)
+    normalized = re.sub(
+        r"\b(?:address|payable)\(@caller\)", "@caller", normalized
+    )
+    return normalized
+
+
+def _causal_access_at(scan: str, start: int, name: str) -> tuple[str, str, int]:
+    """Return raw/canonical access path and its end for a state occurrence."""
+    cursor = start + len(name)
+    end = cursor
+    while cursor < len(scan):
+        while cursor < len(scan) and scan[cursor].isspace():
+            cursor += 1
+        if cursor < len(scan) and scan[cursor] == "[":
+            depth = 0
+            quote = ""
+            escaped = False
+            index = cursor
+            while index < len(scan):
+                ch = scan[index]
+                if quote:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == quote:
+                        quote = ""
+                elif ch in {"'", '"'}:
+                    quote = ch
+                elif ch == "[":
+                    depth += 1
+                elif ch == "]":
+                    depth -= 1
+                    if depth == 0:
+                        index += 1
+                        break
+                index += 1
+            if depth != 0:
+                break
+            end = index
+            cursor = index
+            continue
+        if cursor < len(scan) and scan[cursor] == ".":
+            member = re.match(r"\.\s*[A-Za-z_]\w*", scan[cursor:])
+            if not member:
+                break
+            member_end = cursor + member.end()
+            probe = member_end
+            while probe < len(scan) and scan[probe].isspace():
+                probe += 1
+            # A method name is behavior invoked on the stored reference, not a
+            # narrower storage member. Keep the receiver/index access only.
+            if probe < len(scan) and scan[probe] == "(":
+                break
+            cursor = member_end
+            end = cursor
+            continue
+        break
+    raw = _causal_normalize_access(scan[start:end], caller_aliases=False)
+    return raw, _causal_normalize_access(raw, caller_aliases=True), end
+
+
+def _causal_action_facts(
+    body: str,
+    *,
+    body_offset: int,
+    line_starts: list[int],
+    state_variables: list[dict] | None,
+    function_names: set[str] | None,
+    local_bindings: list[dict] | None,
+    current_function: str,
+    parse_source: str,
+) -> dict:
+    """Extract compact read/write/call/order facts from one scoped body.
+
+    Even on the AST path, expression classification is intentionally textual:
+    the AST supplies exact function/storage scope while this helper keeps the
+    fallback and AST artifact shapes identical.  `parse_source` makes that
+    confidence boundary explicit to downstream planning.
+    """
+    if not body:
+        return {}
+    scan = _strip_comments_preserve_layout(body)
+    used_identifiers = set(re.findall(r"\b[A-Za-z_]\w*\b", scan))
+    states = [
+        item for item in (state_variables or [])
+        if isinstance(item, dict)
+        and str(item.get("name") or "").strip() in used_identifiers
+    ]
+    binding_names = {
+        str(item.get("name") or "").strip()
+        for item in (local_bindings or [])
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    }
+    declared_state_names = {
+        str(item.get("name") or "").strip()
+        for item in (state_variables or [])
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    }
+    shadowed_state_names = binding_names & declared_state_names
+    for state in states:
+        name = str(state.get("name") or "").strip()
+        # Conservative local-declaration recognition. If a state name is
+        # shadowed anywhere in the function, omit it from causal state facts;
+        # claiming a storage dependency from a local is worse than losing this
+        # one heuristic lead. Parameters and named returns are supplied above.
+        local_declaration = re.compile(
+            rf"(?:^|[;{{}}(,])\s*(?P<type>mapping\s*\([^;{{}}]+\)|"
+            rf"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?(?:\s*\[[^\]\n]*\])*)\s+"
+            rf"(?:(?:memory|storage|calldata|payable)\s+)*{re.escape(name)}\b",
+            flags=re.MULTILINE,
+        )
+        declaration_match = local_declaration.search(scan)
+        declaration_type = (
+            str(declaration_match.group("type") or "").strip().lower()
+            if declaration_match else ""
+        )
+        if (
+            declaration_match
+            and declaration_type.split(".", 1)[0]
+            not in _CAUSAL_LOCAL_DECL_SKIP
+        ):
+            shadowed_state_names.add(name)
+    states = [
+        state for state in states
+        if str(state.get("name") or "").strip() not in shadowed_state_names
+    ]
+    used_state_declarations = len(states)
+    state_facts_truncated = used_state_declarations > _CAUSAL_STATE_FACT_MAX_ITEMS
+    states = states[:_CAUSAL_STATE_FACT_MAX_ITEMS]
+    target_types = {
+        str(item.get("name") or "").strip(): str(
+            item.get("type") or item.get("raw") or ""
+        ).strip()
+        for item in [*(state_variables or []), *(local_bindings or [])]
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    }
+    state_reads: list[dict] = []
+    state_writes: list[dict] = []
+    external_calls: list[dict] = []
+    internal_calls: list[dict] = []
+    effects: list[tuple[int, dict]] = []
+
+    def line_at(offset: int) -> int:
+        return _line_at(line_starts, body_offset + offset)
+
+    state_read_keys: set[tuple[str, str]] = set()
+    for state in states:
+        name = str(state.get("name") or "").strip()
+        declaring_contract = str(
+            state.get("declaring_contract") or ""
+        ).strip()
+        write_positions: dict[int, str] = {}
+        occurrences = []
+        for occurrence in re.finditer(rf"(?<![.\w]){re.escape(name)}\b", scan):
+            target, access_path, access_end = _causal_access_at(
+                scan, occurrence.start(), name
+            )
+            operation_match = _CAUSAL_WRITE_OPERATOR_RE.match(scan, access_end)
+            operation = (
+                str(operation_match.group("op") or "=")
+                if operation_match else ""
+            )
+            occurrences.append((occurrence.start(), target, access_path, operation))
+            if not operation:
+                continue
+            write_positions[occurrence.start()] = operation
+            if len(state_writes) >= _CAUSAL_STATE_FACT_MAX_ITEMS:
+                state_facts_truncated = True
+                continue
+            entry = {
+                "variable": name,
+                "target": target[:160],
+                "access_path": access_path[:160],
+                "access_kind": (
+                    "indexed" if "[" in access_path
+                    else "member" if "." in access_path
+                    else "scalar"
+                ),
+                "caller_keyed": "@caller" in access_path,
+                "operation": operation,
+                "line": line_at(occurrence.start()),
+            }
+            if declaring_contract:
+                entry["declaring_contract"] = declaring_contract
+            if entry not in state_writes:
+                state_writes.append(entry)
+                effects.append((occurrence.start(), {
+                    "kind": "state_write",
+                    "target": target[:160],
+                    "operation": operation,
+                    "line": entry["line"],
+                }))
+        for offset, target, access_path, _operation in occurrences:
+            operation = write_positions.get(offset)
+            # A compound assignment/increment reads and writes its prior value;
+            # the lvalue of a plain assignment is write-only.  Any additional
+            # occurrence is a read (including the RHS of `x = x + 1`).
+            if operation == "=":
+                continue
+            if len(state_reads) >= _CAUSAL_STATE_FACT_MAX_ITEMS:
+                state_facts_truncated = True
+                break
+            read_key = (name, access_path)
+            if read_key in state_read_keys:
+                continue
+            state_read_keys.add(read_key)
+            read = {
+                "variable": name,
+                "target": target[:160],
+                "access_path": access_path[:160],
+                "access_kind": (
+                    "indexed" if "[" in access_path
+                    else "member" if "." in access_path
+                    else "scalar"
+                ),
+                "caller_keyed": "@caller" in access_path,
+                "line": line_at(offset),
+            }
+            if declaring_contract:
+                read["declaring_contract"] = declaring_contract
+            state_reads.append(read)
+            effects.append((offset, {
+                "kind": "state_read",
+                "target": target[:160],
+                "line": read["line"],
+            }))
+
+    seen_calls: set[tuple[int, str, str]] = set()
+
+    def add_external(
+        match: "re.Match",
+        target: str,
+        method: str,
+        kind: str,
+        target_type: str = "",
+    ) -> None:
+        target = " ".join(str(target or "").split())[:120]
+        method = str(method or "").strip()
+        key = (match.start(), target, method)
+        if not target or not method or key in seen_calls:
+            return
+        seen_calls.add(key)
+        entry = {
+            "target": target,
+            "function": method,
+            "kind": kind,
+            "line": line_at(match.start()),
+        }
+        inferred_type = str(target_type or target_types.get(target) or "").strip()
+        if inferred_type:
+            entry["target_type"] = inferred_type[:160]
+        if (
+            re.search(r"\bvalue\s*:", match.group(0), flags=re.IGNORECASE)
+            or method.lower() in {"send", "transfer"}
+            and re.search(r"\b(?:address|payable)\b", inferred_type)
+        ):
+            entry["value_bearing"] = True
+        external_calls.append(entry)
+        effects.append((match.start(), {
+            "kind": "external_call",
+            "target": f"{target}.{method}"[:180],
+            "line": entry["line"],
+        }))
+
+    for match in _STRUCT_MEMBER_CALL_RE.finditer(scan):
+        target, method = match.group(1), match.group(2)
+        if target in _CAUSAL_MEMBER_CALL_SKIP or method in _STRUCT_MEMBER_METHOD_SKIP:
+            continue
+        kind = (
+            "low_level"
+            if method in {"call", "delegatecall", "staticcall"}
+            else "value_transfer"
+            if method in {"send", "transfer"}
+            else "member"
+        )
+        add_external(match, target, method, kind)
+        if len(external_calls) >= _CAUSAL_FACT_MAX_ITEMS:
+            break
+    if len(external_calls) < _CAUSAL_FACT_MAX_ITEMS:
+        for match in _CAUSAL_CAST_MEMBER_CALL_RE.finditer(scan):
+            add_external(
+                match,
+                str(match.group("target") or match.group("cast") or ""),
+                str(match.group("method") or ""),
+                "typed_cast",
+                str(match.group("cast") or ""),
+            )
+            if len(external_calls) >= _CAUSAL_FACT_MAX_ITEMS:
+                break
+
+    known_functions = {
+        str(function or "").strip()
+        for function in (function_names or set())
+        if str(function or "").strip()
+    }
+    # Scan call-shaped identifiers once and intersect with the contract's
+    # function names. Compiling/scanning one pattern per function made this
+    # otherwise quadratic for large generated interfaces/contracts.
+    for match in re.finditer(r"(?<![.\w])(?P<function>[A-Za-z_]\w*)\s*\(", scan):
+        function = str(match.group("function") or "")
+        if function not in known_functions:
+            continue
+        if scan[max(0, match.start() - 24):match.start()].rstrip().endswith("."):
+            continue
+        entry = {
+            "function": function,
+            "recursive": function == current_function,
+            "line": line_at(match.start()),
+        }
+        if entry in internal_calls:
+            continue
+        internal_calls.append(entry)
+        effects.append((match.start(), {
+            "kind": "internal_call",
+            "target": function,
+            "line": entry["line"],
+        }))
+        if len(internal_calls) >= _CAUSAL_FACT_MAX_ITEMS:
+            break
+
+    effects.sort(key=lambda item: (item[0], item[1]["kind"], item[1]["target"]))
+    effect_order = [
+        {"order": index, **effect}
+        for index, (_offset, effect) in enumerate(
+            effects[:_CAUSAL_FACT_MAX_ITEMS], start=1
+        )
+    ]
+    call_offsets = [
+        offset for offset, effect in effects if effect.get("kind") == "external_call"
+    ]
+    state_write_offsets = [
+        offset for offset, effect in effects if effect.get("kind") == "state_write"
+    ]
+    ordering_flags: list[str] = []
+    if call_offsets and state_write_offsets:
+        if min(call_offsets) < max(state_write_offsets):
+            ordering_flags.append("external_call_before_state_write")
+        if min(state_write_offsets) < max(call_offsets):
+            ordering_flags.append("state_write_before_external_call")
+
+    payload = {
+        "source": "ast_scoped_text" if parse_source == "ast" else "regex_scoped_text",
+        "state_reads": state_reads[:_CAUSAL_STATE_FACT_MAX_ITEMS],
+        "state_writes": state_writes[:_CAUSAL_STATE_FACT_MAX_ITEMS],
+        "external_calls": external_calls[:_CAUSAL_FACT_MAX_ITEMS],
+        "internal_calls": internal_calls[:_CAUSAL_FACT_MAX_ITEMS],
+        "effect_order": effect_order,
+        "ordering_flags": ordering_flags,
+        "shadowed_state_names": sorted(shadowed_state_names),
+        "used_state_declarations": used_state_declarations,
+        "state_facts_truncated": state_facts_truncated,
+    }
+    if not any(payload[key] for key in (
+        "state_reads", "state_writes", "external_calls", "internal_calls"
+    )) and not payload["shadowed_state_names"] and not state_facts_truncated:
+        return {}
+    return payload
+
+
+def _propagate_causal_internal_effects(entries: list[dict]) -> None:
+    """Fold bounded, unambiguous internal-callee effects into entrypoints.
+
+    This is source planning context only. Overloaded callee names, cycles, and
+    paths beyond two internal calls are left unresolved rather than guessed.
+    """
+    by_name: dict[str, list[dict]] = {}
+    for entry in entries:
+        name = str(entry.get("function") or "").strip()
+        if name:
+            by_name.setdefault(name, []).append(entry)
+    snapshots = {
+        id(entry): {
+            key: [dict(item) for item in (entry.get("causal_facts") or {}).get(key) or []]
+            for key in (
+                "state_reads", "state_writes", "external_calls", "internal_calls"
+            )
+        }
+        for entry in entries
+    }
+    field_caps = {
+        "state_reads": _CAUSAL_STATE_FACT_MAX_ITEMS,
+        "state_writes": _CAUSAL_STATE_FACT_MAX_ITEMS,
+        "external_calls": _CAUSAL_FACT_MAX_ITEMS,
+    }
+
+    def collect(
+        callee: dict,
+        *,
+        depth: int,
+        stack: set[int],
+        chain: tuple[str, ...],
+    ) -> list[tuple[str, dict]]:
+        additions: list[tuple[str, dict]] = []
+        direct = snapshots.get(id(callee), {})
+        for field in field_caps:
+            for item in direct.get(field) or []:
+                additions.append((field, {**item, "via_internal": list(chain)}))
+        if depth >= _CAUSAL_INTERNAL_EFFECT_MAX_DEPTH:
+            return additions
+        for call in direct.get("internal_calls") or []:
+            name = str(call.get("function") or "").strip()
+            targets = by_name.get(name) or []
+            if len(targets) != 1 or id(targets[0]) in stack:
+                continue
+            target = targets[0]
+            additions.extend(collect(
+                target,
+                depth=depth + 1,
+                stack={*stack, id(target)},
+                chain=(*chain, name),
+            ))
+        return additions
+
+    for entry in entries:
+        facts = entry.get("causal_facts") or {}
+        if not isinstance(facts, dict) or not facts.get("internal_calls"):
+            continue
+        additions: list[tuple[str, dict]] = []
+        resolved_chains: set[tuple[str, ...]] = set()
+        for call in snapshots.get(id(entry), {}).get("internal_calls") or []:
+            name = str(call.get("function") or "").strip()
+            targets = by_name.get(name) or []
+            if len(targets) != 1 or id(targets[0]) == id(entry):
+                continue
+            target = targets[0]
+            collected = collect(
+                target,
+                depth=1,
+                stack={id(entry), id(target)},
+                chain=(name,),
+            )
+            additions.extend(collected)
+            resolved_chains.update(
+                tuple(item.get("via_internal") or [])
+                for _field, item in collected
+                if item.get("via_internal")
+            )
+        internal_effects_truncated = False
+        for field, cap in field_caps.items():
+            current = [dict(item) for item in facts.get(field) or []]
+            seen = {
+                json.dumps(item, sort_keys=True, separators=(",", ":"))
+                for item in current
+            }
+            for addition_field, item in additions:
+                if addition_field != field:
+                    continue
+                key = json.dumps(item, sort_keys=True, separators=(",", ":"))
+                if key in seen:
+                    continue
+                if len(current) >= cap:
+                    internal_effects_truncated = True
+                    continue
+                current.append(item)
+                seen.add(key)
+            facts[field] = current
+        if resolved_chains:
+            facts["resolved_internal_effects"] = [
+                {"chain": list(chain)}
+                for chain in sorted(resolved_chains)
+            ][:_CAUSAL_FACT_MAX_ITEMS]
+        if internal_effects_truncated:
+            facts["internal_effects_truncated"] = True
+        entry["causal_facts"] = facts
+
+
+def _propagate_direct_base_internal_effects(
+    entries_by_contract: dict[str, list[dict]],
+    bases_by_contract: dict[str, list[str]],
+) -> None:
+    """Resolve plain internal calls into direct, same-file base functions.
+
+    Each child/base pool is copied before running the existing bounded resolver,
+    so inherited resolution cannot mutate a base definition or contaminate a
+    sibling child. Name collisions and overloads remain unresolved by the
+    underlying helper, which is safer than guessing Solidity dispatch.
+    """
+    local_snapshots = copy.deepcopy(entries_by_contract)
+    for child, child_entries in entries_by_contract.items():
+        base_entries = [
+            entry
+            for base in bases_by_contract.get(child) or []
+            for entry in local_snapshots.get(base) or []
+        ]
+        if not child_entries or not base_entries:
+            continue
+        working_children = copy.deepcopy(local_snapshots.get(child) or [])
+        working_pool = [*working_children, *copy.deepcopy(base_entries)]
+        _propagate_causal_internal_effects(working_pool)
+        for original, resolved in zip(
+            child_entries, working_children, strict=True
+        ):
+            original["causal_facts"] = resolved.get("causal_facts") or {}
+
+
 # Declaration patterns shared by the action-space parser and source_slice so
 # "what counts as a function declaration" has a single source of truth. Run them
 # over a comment-stripped contract block (see `_strip_comments_preserve_layout`).
@@ -15283,6 +16858,9 @@ def _function_unit_from_match(
     source: str,
     line_starts: list[int],
     max_items: int,
+    state_variables: list[dict] | None = None,
+    function_names: set[str] | None = None,
+    parse_source: str = "regex",
 ) -> dict:
     """Parse one ``function`` / ``receive`` / ``fallback`` declaration into a unit.
 
@@ -15351,10 +16929,24 @@ def _function_unit_from_match(
         returns=returns,
     )
     affordances = sorted(set(affordances).union(structural))
+    causal_facts = _causal_action_facts(
+        body,
+        body_offset=body_offset,
+        line_starts=line_starts,
+        state_variables=state_variables,
+        function_names=function_names,
+        local_bindings=[*parameters, *_parse_parameters(returns)],
+        current_function=name,
+        parse_source=parse_source,
+    )
     return {
         "contract": contract["name"],
         "contract_kind": contract["kind"],
         "function": name,
+        "signature": _action_signature({
+            "function": name,
+            "parameters": parameters,
+        }),
         "line": line,
         "end_line": end_line,
         "visibility": visibility or "unspecified",
@@ -15364,6 +16956,7 @@ def _function_unit_from_match(
         "modifiers": modifiers,
         "affordances": affordances,
         "hints": hints,
+        "causal_facts": causal_facts,
     }
 
 
@@ -15387,6 +16980,39 @@ def _parse_action_space_file(
     event_declarations = []
     global_hints = _empty_action_hints()
     scan_source = _strip_comments_preserve_layout(source)
+    contract_ranges = _contract_ranges(source, starts)
+    local_contracts = {
+        str(contract.get("name") or ""): contract
+        for contract in contract_ranges
+        if str(contract.get("name") or "")
+    }
+    state_by_contract = {
+        name: [
+            {**item, "declaring_contract": name}
+            for item in _regex_contract_state_variables(source, contract, starts)[
+                :max_items
+            ]
+        ]
+        for name, contract in local_contracts.items()
+    }
+    function_names_by_contract: dict[str, set[str]] = {}
+    for name, contract in local_contracts.items():
+        contract_scan = scan_source[contract["start"]:contract["end"]]
+        matches = list(_FUNCTION_DECL_RE.finditer(contract_scan))
+        matches.extend(_SPECIAL_FUNCTION_DECL_RE.finditer(contract_scan))
+        function_names_by_contract[name] = {
+            str(item.group(1) or "").strip()
+            for item in matches
+            if str(item.group(1) or "").strip()
+        }
+    local_bases_by_contract = {
+        name: [
+            base for base in contract.get("bases") or []
+            if base in local_contracts
+        ]
+        for name, contract in local_contracts.items()
+    }
+    function_entries_by_contract: dict[str, list[dict]] = {}
 
     public_var_pattern = re.compile(
         r"^\s*(?!function\b)(?!event\b)(?!modifier\b)"
@@ -15394,8 +17020,19 @@ def _parse_action_space_file(
         flags=re.MULTILINE,
     )
 
-    for contract in _contract_ranges(source, starts):
+    for contract in contract_ranges:
         block_scan = scan_source[contract["start"]:contract["end"]]
+        contract_name = str(contract.get("name") or "")
+        state_variables = state_by_contract.get(contract_name) or []
+        causal_state_variables, inherited_state_variables, ambiguous_state = (
+            _causal_direct_base_state_variables(
+                contract_name=contract_name,
+                own_state_variables=state_variables,
+                direct_bases=local_bases_by_contract.get(contract_name) or [],
+                state_by_contract=state_by_contract,
+                max_items=max_items,
+            )
+        )
         contract_info = {
             "name": contract["name"],
             "kind": contract["kind"],
@@ -15406,7 +17043,12 @@ def _parse_action_space_file(
             "observations": 0,
             "modifiers": [],
             "events": [],
+            "state_variables": state_variables,
         }
+        if inherited_state_variables:
+            contract_info["inherited_state_variables"] = inherited_state_variables
+        if ambiguous_state:
+            contract_info["ambiguous_inherited_state_names"] = ambiguous_state
 
         for match in re.finditer(r"\bmodifier\s+([A-Za-z_][A-Za-z0-9_]*)\b", block_scan):
             name = match.group(1)
@@ -15445,7 +17087,15 @@ def _parse_action_space_file(
         function_matches = list(_FUNCTION_DECL_RE.finditer(block_scan))
         function_matches.extend(_SPECIAL_FUNCTION_DECL_RE.finditer(block_scan))
         function_matches.sort(key=lambda item: item.start())
+        function_names = {
+            str(item.group(1) or "").strip()
+            for item in function_matches
+            if str(item.group(1) or "").strip()
+        }
+        for base in local_bases_by_contract.get(contract_name) or []:
+            function_names.update(function_names_by_contract.get(base) or set())
 
+        contract_function_entries = []
         for match in function_matches:
             unit = _function_unit_from_match(
                 match,
@@ -15453,6 +17103,8 @@ def _parse_action_space_file(
                 source=source,
                 line_starts=starts,
                 max_items=8,
+                state_variables=causal_state_variables,
+                function_names=function_names,
             )
             for key, values in unit["hints"].items():
                 global_hints[key].extend(values)
@@ -15460,6 +17112,7 @@ def _parse_action_space_file(
                 "contract": unit["contract"],
                 "contract_kind": unit["contract_kind"],
                 "function": unit["function"],
+                "signature": unit["signature"],
                 "file": path,
                 "line": unit["line"],
                 "visibility": unit["visibility"],
@@ -15469,13 +17122,19 @@ def _parse_action_space_file(
                 "modifiers": unit["modifiers"],
                 "affordances": unit["affordances"],
                 "hints": unit["hints"],
+                "causal_facts": unit["causal_facts"],
                 "parse_source": "regex",
             }
+            contract_function_entries.append(entry)
+
+        _propagate_causal_internal_effects(contract_function_entries)
+        function_entries_by_contract[contract_name] = contract_function_entries
+        for entry in contract_function_entries:
             if (
-                unit["visibility"] in {"public", "external"}
-                or unit["function"] in {"receive", "fallback"}
+                entry["visibility"] in {"public", "external"}
+                or entry["function"] in {"receive", "fallback"}
             ):
-                if unit["mutability"] in {"view", "pure"}:
+                if entry["mutability"] in {"view", "pure"}:
                     observations.append(entry)
                     contract_info["observations"] += 1
                 else:
@@ -15490,6 +17149,7 @@ def _parse_action_space_file(
                 "contract": contract["name"],
                 "contract_kind": contract["kind"],
                 "function": name,
+                "signature": f"{name}()",
                 "file": path,
                 "line": line,
                 "visibility": "public",
@@ -15505,10 +17165,21 @@ def _parse_action_space_file(
 
         contracts.append(contract_info)
 
+    _propagate_direct_base_internal_effects(
+        function_entries_by_contract,
+        local_bases_by_contract,
+    )
+
     return {
         "path": path,
         "truncated": truncated,
         "parse_source": "regex",
+        "section_totals": {
+            "contracts": len(contracts),
+            "actions": len(actions),
+            "observations": len(observations),
+            "event_declarations": len(event_declarations),
+        },
         "contracts": contracts[:max_items],
         "actions": actions[:max_items],
         "observations": observations[:max_items],
@@ -15607,6 +17278,49 @@ def _compact_action_entry(entry: dict) -> dict:
     }
     if hint_counts:
         compact["hint_counts"] = hint_counts
+    causal_facts = entry.get("causal_facts") or {}
+    if isinstance(causal_facts, dict) and causal_facts:
+        compact["causal_facts"] = {
+            key: value
+            for key, value in {
+                "source": causal_facts.get("source"),
+                "state_reads": [
+                    item.get("target") or item.get("variable")
+                    for item in causal_facts.get("state_reads") or []
+                    if isinstance(item, dict) and item.get("variable")
+                ][:4],
+                "state_writes": [
+                    item.get("target") or item.get("variable")
+                    for item in causal_facts.get("state_writes") or []
+                    if isinstance(item, dict)
+                ][:4],
+                "external_calls": [
+                    f"{item.get('target')}.{item.get('function')}"
+                    for item in causal_facts.get("external_calls") or []
+                    if isinstance(item, dict)
+                    and item.get("target") and item.get("function")
+                ][:4],
+                "internal_calls": [
+                    item.get("function")
+                    for item in causal_facts.get("internal_calls") or []
+                    if isinstance(item, dict) and item.get("function")
+                ][:4],
+                "ordering_flags": causal_facts.get("ordering_flags") or [],
+                "shadowed_state_names": (
+                    causal_facts.get("shadowed_state_names") or []
+                )[:4],
+                "resolved_internal_effects": (
+                    causal_facts.get("resolved_internal_effects") or []
+                )[:4],
+                "state_facts_truncated": causal_facts.get(
+                    "state_facts_truncated"
+                ) or None,
+                "internal_effects_truncated": causal_facts.get(
+                    "internal_effects_truncated"
+                ) or None,
+            }.items()
+            if value not in (None, "", [], {})
+        }
     return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
 
 
@@ -15693,6 +17407,46 @@ def _action_signature_groups(entries: list[dict], max_items: int) -> list[dict]:
     )[:max_items]
 
 
+def _annotate_action_signatures(entries: list[dict]) -> None:
+    """Persist signatures and mark only genuinely overloaded name groups."""
+    signatures_by_name: dict[tuple[str, str, str], set[str]] = {}
+    for entry in entries:
+        signature = str(entry.get("signature") or "").strip()
+        if not signature:
+            signature = _action_signature(entry)
+            if signature:
+                entry["signature"] = signature
+        contract = str(entry.get("contract") or "").strip()
+        function = str(entry.get("function") or "").strip()
+        source_file = posixpath.normpath(str(entry.get("file") or "").strip())
+        legacy_key = f"{contract}::{function}" if contract else function
+        canonical_signature = re.sub(r"\s+", "", signature)
+        definition_key = (
+            f"{contract}::{canonical_signature}"
+            if contract and signature else signature or legacy_key
+        )
+        if legacy_key:
+            entry["action_key"] = legacy_key
+        if definition_key:
+            entry["action_definition_key"] = definition_key
+        if function and signature:
+            signatures_by_name.setdefault(
+                (source_file, contract, function), set()
+            ).add(
+                re.sub(r"\s+", "", signature)
+            )
+    for entry in entries:
+        contract = str(entry.get("contract") or "").strip()
+        function = str(entry.get("function") or "").strip()
+        source_file = posixpath.normpath(str(entry.get("file") or "").strip())
+        overload_count = len(
+            signatures_by_name.get((source_file, contract, function)) or set()
+        )
+        entry.pop("overload_count", None)
+        if overload_count > 1:
+            entry["overload_count"] = overload_count
+
+
 def _aggregate_action_space(parsed_files: list[dict], max_items: int) -> dict:
     contracts = []
     actions = []
@@ -15701,12 +17455,23 @@ def _aggregate_action_space(parsed_files: list[dict], max_items: int) -> dict:
     event_declarations = []
     hints = _empty_action_hints()
     affordance_counts: dict[str, int] = {}
+    section_totals = {
+        "contracts": 0,
+        "actions": 0,
+        "observations": 0,
+        "event_declarations": 0,
+    }
 
     for parsed in parsed_files:
         contracts.extend(parsed["contracts"])
         actions.extend(parsed["actions"])
         observations.extend(parsed["observations"])
         event_declarations.extend(parsed["event_declarations"])
+        parsed_totals = parsed.get("section_totals") or {}
+        for key in section_totals:
+            section_totals[key] += int(
+                parsed_totals.get(key, len(parsed.get(key) or [])) or 0
+            )
         for modifier in parsed["modifiers"]:
             modifiers[modifier] = modifiers.get(modifier, 0) + 1
         for key in hints:
@@ -15714,6 +17479,8 @@ def _aggregate_action_space(parsed_files: list[dict], max_items: int) -> dict:
         for entry in parsed["actions"] + parsed["observations"]:
             for label in entry.get("affordances", []):
                 affordance_counts[label] = affordance_counts.get(label, 0) + 1
+
+    _annotate_action_signatures([*actions, *observations])
 
     scope_rank = {"contract": 0, "library": 1, "source": 2, "interface": 3}
     actions = _sort_action_entries(actions)
@@ -15762,13 +17529,13 @@ def _aggregate_action_space(parsed_files: list[dict], max_items: int) -> dict:
         },
         "top_affordances": top_affordances,
         "summary": {
-            "contracts": len(contracts),
-            "actions": len(actions),
+            "contracts": section_totals["contracts"],
+            "actions": section_totals["actions"],
             "action_signature_groups": action_family_count,
-            "observations": len(observations),
+            "observations": section_totals["observations"],
             "observation_signature_groups": observation_family_count,
             "modifiers": len(modifiers),
-            "event_declarations": len(event_declarations),
+            "event_declarations": section_totals["event_declarations"],
             "value_flow_hints": len(hints["value_flows"]),
             "external_call_hints": len(hints["external_calls"]),
             "role_gate_hints": len(hints["role_gates"]),
@@ -15783,6 +17550,84 @@ def _aggregate_action_space(parsed_files: list[dict], max_items: int) -> dict:
             "economic_parameter_hints": len(hints["economic_parameters"]),
         },
     }
+
+
+def _action_space_parsed_projection(action_space: dict, max_items: int) -> dict:
+    """Project a cumulative action-space artifact back into aggregate input.
+
+    Batch continuation artifacts are immutable cumulative snapshots. Reusing
+    the previous snapshot avoids rescanning earlier profile roots while the
+    normal aggregation path remains the single source of summary/family logic.
+    """
+    modifiers = []
+    for entry in action_space.get("modifiers") or []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("modifier") or "").strip()
+        if not name:
+            continue
+        try:
+            count = max(1, int(entry.get("count") or 1))
+        except (TypeError, ValueError):
+            count = 1
+        modifiers.extend([name] * min(count, max_items))
+        if len(modifiers) >= max_items:
+            break
+    return {
+        "section_totals": {
+            key: len(action_space.get(key) or [])
+            for key in (
+                "contracts", "actions", "observations", "event_declarations"
+            )
+        },
+        "contracts": list(action_space.get("contracts") or [])[:max_items],
+        "actions": list(action_space.get("actions") or [])[:max_items],
+        "observations": list(action_space.get("observations") or [])[:max_items],
+        "modifiers": modifiers[:max_items],
+        "event_declarations": list(
+            action_space.get("event_declarations") or []
+        )[:max_items],
+        "hints": {
+            key: list((action_space.get("hints") or {}).get(key) or [])[:max_items]
+            for key in _empty_action_hints()
+        },
+    }
+
+
+def _scope_batch_parent_error(
+    parent: dict,
+    *,
+    kind: str,
+    cursor: int,
+    fingerprint: str,
+    continuation_args: dict | None = None,
+    file_cursor: int = 0,
+) -> str:
+    batch = parent.get("scope_batch") or {}
+    if batch.get("kind") != kind:
+        return f"previous artifact is not a {kind} scope batch"
+    if str(batch.get("scope_fingerprint") or "") != fingerprint:
+        return (
+            "scope manifest changed since the previous batch; restart with "
+            "profile_cursor=0 so no profile is skipped or duplicated"
+        )
+    if (
+        batch.get("next_cursor") != cursor
+        or int(batch.get("next_file_cursor") or 0) != file_cursor
+        or not batch.get("has_more")
+    ):
+        return (
+            "previous artifact does not continue at the requested profile/file "
+            "cursor; use its scope_batch.next_cursor and next_file_cursor"
+        )
+    if continuation_args is not None:
+        parent_args = batch.get("continuation_args") or {}
+        if parent_args != continuation_args:
+            return (
+                "batch configuration changed since the previous artifact; use "
+                "its scope_batch.continuation_args or restart at profile_cursor=0"
+            )
+    return ""
 
 
 # ── AST-backed action-space extraction ───────────────────────────────────
@@ -15964,6 +17809,65 @@ def _ast_source_unit_to_parsed_file(
         )
         return body_text, body_hints
 
+    local_contract_nodes = {
+        str(node.get("name") or ""): node
+        for node in nodes
+        if isinstance(node, dict)
+        and node.get("nodeType") == "ContractDefinition"
+        and str(node.get("name") or "")
+    }
+
+    def ast_base_names(node: dict) -> list[str]:
+        names: list[str] = []
+        for base in node.get("baseContracts") or []:
+            if not isinstance(base, dict):
+                continue
+            base_name = base.get("baseName")
+            if not isinstance(base_name, dict):
+                continue
+            resolved = str(
+                base_name.get("name") or base_name.get("namePath") or ""
+            ).strip()
+            if resolved:
+                names.append(resolved.split(".")[-1])
+        return _dedupe_text(names)
+
+    state_by_contract: dict[str, list[dict]] = {}
+    function_names_by_contract: dict[str, set[str]] = {}
+    local_bases_by_contract: dict[str, list[str]] = {}
+    for contract_name, node in local_contract_nodes.items():
+        members = [
+            member for member in node.get("nodes") or []
+            if isinstance(member, dict)
+        ]
+        state_by_contract[contract_name] = [
+            {
+                "name": str(member.get("name") or "").strip(),
+                "line": _line_at(line_starts, char_offset(member)),
+                "type": _ast_type_string(member.get("typeDescriptions")),
+                "declaring_contract": contract_name,
+            }
+            for member in members
+            if member.get("nodeType") == "VariableDeclaration"
+            and member.get("stateVariable")
+            and str(member.get("name") or "").strip()
+        ][:max_items]
+        function_names_by_contract[contract_name] = {
+            (
+                str(member.get("kind") or "").strip()
+                if str(member.get("kind") or "") in {"receive", "fallback"}
+                else str(member.get("name") or "").strip()
+            )
+            for member in members
+            if member.get("nodeType") == "FunctionDefinition"
+            and str(member.get("kind") or "") != "constructor"
+        } - {""}
+        local_bases_by_contract[contract_name] = [
+            base for base in ast_base_names(node)
+            if base in local_contract_nodes
+        ]
+    function_entries_by_contract: dict[str, list[dict]] = {}
+
     for contract_node in nodes:
         if not isinstance(contract_node, dict):
             continue
@@ -15973,17 +17877,26 @@ def _ast_source_unit_to_parsed_file(
         kind = str(contract_node.get("contractKind") or "contract")
         if kind not in {"contract", "interface", "library"}:
             kind = "contract"
-        bases: list[str] = []
-        for base in contract_node.get("baseContracts") or []:
-            if not isinstance(base, dict):
-                continue
-            base_name = base.get("baseName")
-            if isinstance(base_name, dict):
-                resolved = str(
-                    base_name.get("name") or base_name.get("namePath") or ""
-                ).strip()
-                if resolved:
-                    bases.append(resolved.split(".")[-1])
+        contract_members = [
+            member
+            for member in contract_node.get("nodes") or []
+            if isinstance(member, dict)
+        ]
+        contract_name = str(contract_node.get("name") or "")
+        state_variables = state_by_contract.get(contract_name) or []
+        bases = ast_base_names(contract_node)
+        causal_state_variables, inherited_state_variables, ambiguous_state = (
+            _causal_direct_base_state_variables(
+                contract_name=contract_name,
+                own_state_variables=state_variables,
+                direct_bases=local_bases_by_contract.get(contract_name) or [],
+                state_by_contract=state_by_contract,
+                max_items=max_items,
+            )
+        )
+        function_names = set(function_names_by_contract.get(contract_name) or set())
+        for base in local_bases_by_contract.get(contract_name) or []:
+            function_names.update(function_names_by_contract.get(base) or set())
         contract_info = {
             "name": contract_node.get("name"),
             "kind": kind,
@@ -15994,11 +17907,15 @@ def _ast_source_unit_to_parsed_file(
             "observations": 0,
             "modifiers": [],
             "events": [],
+            "state_variables": state_variables,
         }
+        if inherited_state_variables:
+            contract_info["inherited_state_variables"] = inherited_state_variables
+        if ambiguous_state:
+            contract_info["ambiguous_inherited_state_names"] = ambiguous_state
 
-        for member in contract_node.get("nodes") or []:
-            if not isinstance(member, dict):
-                continue
+        contract_function_entries = []
+        for member in contract_members:
             member_type = member.get("nodeType")
             if member_type == "ModifierDefinition":
                 name = str(member.get("name") or "").strip()
@@ -16034,6 +17951,7 @@ def _ast_source_unit_to_parsed_file(
                     "contract": contract_node.get("name"),
                     "contract_kind": kind,
                     "function": name,
+                    "signature": f"{name}()",
                     "file": path,
                     "line": _line_at(line_starts, char_offset(member)),
                     "visibility": "public",
@@ -16092,10 +18010,31 @@ def _ast_source_unit_to_parsed_file(
                 returns=ast_returns,
             )
             affordances = sorted(set(affordances).union(structural))
+            body_node = member.get("body")
+            body_offset = (
+                char_offset(body_node) if isinstance(body_node, dict) else 0
+            )
+            causal_facts = _causal_action_facts(
+                body_text,
+                body_offset=body_offset,
+                line_starts=line_starts,
+                state_variables=causal_state_variables,
+                function_names=function_names,
+                local_bindings=[
+                    *ast_parameters,
+                    *_parse_parameters(ast_returns),
+                ],
+                current_function=name,
+                parse_source="ast",
+            )
             entry = {
                 "contract": contract_node.get("name"),
                 "contract_kind": kind,
                 "function": name,
+                "signature": _action_signature({
+                    "function": name,
+                    "parameters": ast_parameters,
+                }),
                 "file": path,
                 "line": _line_at(line_starts, char_offset(member)),
                 "visibility": visibility or "unspecified",
@@ -16105,10 +18044,18 @@ def _ast_source_unit_to_parsed_file(
                 "modifiers": modifiers,
                 "affordances": affordances,
                 "hints": function_hints,
+                "causal_facts": causal_facts,
                 "parse_source": "ast",
             }
-            if visibility in {"public", "external"} or name in {"receive", "fallback"}:
-                if mutability in {"view", "pure"}:
+            contract_function_entries.append(entry)
+
+        _propagate_causal_internal_effects(contract_function_entries)
+        function_entries_by_contract[contract_name] = contract_function_entries
+        for entry in contract_function_entries:
+            if entry["visibility"] in {"public", "external"} or entry[
+                "function"
+            ] in {"receive", "fallback"}:
+                if entry["mutability"] in {"view", "pure"}:
                     observations.append(entry)
                     contract_info["observations"] += 1
                 else:
@@ -16120,10 +18067,21 @@ def _ast_source_unit_to_parsed_file(
     if not saw_contract:
         return None
 
+    _propagate_direct_base_internal_effects(
+        function_entries_by_contract,
+        local_bases_by_contract,
+    )
+
     return {
         "path": path,
         "truncated": len(source_bytes) > _ACTION_MAX_FILE_CHARS,
         "parse_source": "ast",
+        "section_totals": {
+            "contracts": len(contracts),
+            "actions": len(actions),
+            "observations": len(observations),
+            "event_declarations": len(event_declarations),
+        },
         "contracts": contracts[:max_items],
         "actions": actions[:max_items],
         "observations": observations[:max_items],
@@ -16158,6 +18116,8 @@ async def _load_ast_sources(
     *,
     source_files: list[str],
     scan_root: str,
+    status: dict | None = None,
+    reuse_build_info: dict | None = None,
 ) -> dict[str, dict]:
     """Best-effort solc AST for `source_files`, keyed by absolute path.
 
@@ -16167,13 +18127,31 @@ async def _load_ast_sources(
     or the REENTBOTPRO_DISABLE_AST_MAP escape hatch) so the caller falls back
     to the regex parser. Never raises.
     """
+    if status is not None:
+        status.clear()
     if os.environ.get("REENTBOTPRO_DISABLE_AST_MAP"):
+        if status is not None:
+            status["unavailable_reason"] = "disabled_by_environment"
         return {}
     if not source_files:
+        if status is not None:
+            status["unavailable_reason"] = "no_source_files"
         return {}
     try:
-        project_root = await _foundry_project_root(container, scan_root)
+        cached_project_root = str(
+            (reuse_build_info or {}).get("project_root") or ""
+        ).strip()
+        cached_build_info = str(
+            (reuse_build_info or {}).get("build_info_path") or ""
+        ).strip()
+        reused = bool(cached_project_root and cached_build_info)
+        project_root = (
+            cached_project_root
+            if reused else await _foundry_project_root(container, scan_root)
+        )
         if not project_root:
+            if status is not None:
+                status["unavailable_reason"] = "no_foundry_project"
             return {}
         rel_to_abs: dict[str, str] = {}
         for abs_path in source_files:
@@ -16185,23 +18163,36 @@ async def _load_ast_sources(
                 continue
             rel_to_abs[rel] = abs_path
         if not rel_to_abs:
+            if status is not None:
+                status["unavailable_reason"] = "sources_outside_foundry_project"
             return {}
 
-        await container.exec(
-            "forge build --ast",
-            working_dir=project_root,
-            timeout=_AST_BUILD_TIMEOUT_SECONDS,
-        )
+        if reused:
+            build_info_path = cached_build_info
+        else:
+            await container.exec(
+                "forge build --ast",
+                working_dir=project_root,
+                timeout=_AST_BUILD_TIMEOUT_SECONDS,
+            )
 
-        find_cmd = (
-            f"find {shlex.quote(project_root)} -type f -path '*/build-info/*.json' "
-            "-printf '%T@ %p\\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-"
-        )
-        exit_code, output = await container.exec(find_cmd, timeout=20)
-        lines = [line.strip() for line in output.splitlines() if line.strip()]
-        if exit_code != 0 or not lines:
-            return {}
-        build_info_path = lines[0]
+            find_cmd = (
+                f"find {shlex.quote(project_root)} -type f -path '*/build-info/*.json' "
+                "-printf '%T@ %p\\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-"
+            )
+            exit_code, output = await container.exec(find_cmd, timeout=20)
+            lines = [line.strip() for line in output.splitlines() if line.strip()]
+            if exit_code != 0 or not lines:
+                if status is not None:
+                    status["unavailable_reason"] = "build_info_unavailable"
+                return {}
+            build_info_path = lines[0]
+        if status is not None:
+            status.update({
+                "project_root": project_root,
+                "build_info_path": build_info_path,
+                "reused_build_info": reused,
+            })
 
         keys_json = json.dumps(sorted(rel_to_abs))
         jq_filter = (
@@ -16219,6 +18210,17 @@ async def _load_ast_sources(
             timeout=120,
         )
         if not output.strip():
+            if reused:
+                # Cache cleanup or a changed project can invalidate the prior
+                # build-info path. Retry once through the normal build path.
+                return await _load_ast_sources(
+                    container,
+                    source_files=source_files,
+                    scan_root=scan_root,
+                    status=status,
+                )
+            if status is not None:
+                status["unavailable_reason"] = "ast_extract_empty"
             return {}
 
         ast_by_path: dict[str, dict] = {}
@@ -16238,6 +18240,8 @@ async def _load_ast_sources(
                 ast_by_path[abs_path] = ast
         return ast_by_path
     except Exception:
+        if status is not None:
+            status["unavailable_reason"] = "ast_load_error"
         return {}
 
 
@@ -16247,7 +18251,9 @@ async def _map_action_space(container: AuditContainer, args: dict) -> str:
         files_arg = args.get("files")
         files = _require_list(files_arg, "files") if files_arg is not None else None
         related_ids = _require_list(args.get("related_ids"), "related_ids")
-    except ValueError as exc:
+        profile_cursor = int(args.get("profile_cursor", 0) or 0)
+        source_file_cursor = int(args.get("source_file_cursor", 0) or 0)
+    except (TypeError, ValueError) as exc:
         return f"Error: {exc}"
 
     include_tests = bool(args.get("include_tests", False))
@@ -16255,23 +18261,163 @@ async def _map_action_space(container: AuditContainer, args: dict) -> str:
     max_roots = min(max(int(args.get("max_roots", 12)), 1), 100)
     max_items = min(max(int(args.get("max_items", 2000)), 1), 10_000)
     response_items = min(max(int(args.get("response_items", 6)), 1), 50)
+    action_continuation_args = {
+        "path": root,
+        "include_tests": include_tests,
+        "max_files": max_files,
+        "max_roots": max_roots,
+        "max_items": max_items,
+    }
+    previous_ref = str(args.get("previous_action_space") or "").strip()
+    if files is not None and (
+        profile_cursor or source_file_cursor or previous_ref
+    ):
+        return (
+            "Error: profile_cursor/source_file_cursor/previous_action_space "
+            "apply only to broad manifest-backed scans without explicit files"
+        )
     try:
-        source_files, truncated_files = await _discover_action_source_files(
+        scope_batch = (
+            await _manifest_source_root_batch(
+                container,
+                root,
+                cursor=profile_cursor,
+                max_roots=max_roots,
+            )
+            if files is None else None
+        )
+    except ValueError as exc:
+        return f"Error: {exc}"
+    if profile_cursor and scope_batch is None:
+        return (
+            "Error: profile_cursor requires a scope manifest with ranked profile "
+            "roots; restart with profile_cursor=0 or pass explicit files"
+        )
+    if source_file_cursor and scope_batch is None:
+        return (
+            "Error: source_file_cursor requires a scope manifest with ranked "
+            "profile roots; restart with both cursors at 0"
+        )
+    if scope_batch and not scope_batch["selected_roots"]:
+        return (
+            "Error: profile_cursor is already at the end of the scope; use the "
+            "previous cumulative action-space artifact"
+        )
+
+    previous_path = ""
+    previous_action_space = None
+    if profile_cursor or source_file_cursor:
+        if not previous_ref:
+            return (
+                "Error: previous_action_space is required when either scope "
+                "cursor is greater than 0"
+            )
+        try:
+            previous_path, previous_action_space = await _load_action_space(
+                container,
+                previous_ref,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            return f"Error: {exc}"
+        parent_error = _scope_batch_parent_error(
+            previous_action_space,
+            kind="source_roots",
+            cursor=profile_cursor,
+            fingerprint=str(scope_batch.get("scope_fingerprint") or ""),
+            continuation_args=action_continuation_args,
+            file_cursor=source_file_cursor,
+        )
+        if parent_error:
+            return f"Error: {parent_error}"
+    elif previous_ref:
+        return (
+            "Error: previous_action_space is only valid for a continuation cursor"
+        )
+
+    try:
+        source_files, truncated_files, _discovery = await _discover_action_source_files(
             container,
             root=root,
             files=files,
             include_tests=include_tests,
             max_files=max_files,
             max_roots=max_roots,
+            scan_roots_override=(
+                list(scope_batch["selected_roots"])
+                if scope_batch is not None else None
+            ),
+            file_cursor=source_file_cursor,
         )
     except ValueError as exc:
         return f"Error: {exc}"
+    if previous_action_space and source_file_cursor:
+        parent_file_fingerprint = str(
+            ((previous_action_space.get("scope_batch") or {}).get(
+                "source_file_fingerprint"
+            ) or "")
+        )
+        if (
+            parent_file_fingerprint
+            and parent_file_fingerprint
+            != str(_discovery.get("source_file_fingerprint") or "")
+        ):
+            return (
+                "Error: source files changed within the selected profile-root "
+                "batch; restart that root page with both cursors from the "
+                "controller so no file is skipped or duplicated"
+            )
+    if scope_batch is not None:
+        selected_roots_complete = truncated_files == 0
+        if selected_roots_complete:
+            scope_batch.update({
+                **_discovery,
+                "selected_roots_complete": True,
+                "completed_roots_through": scope_batch.get("processed_through"),
+                "remaining_files_in_selected_roots": 0,
+                "next_file_cursor": 0,
+            })
+        else:
+            scope_batch.update({
+                **_discovery,
+                "selected_roots_complete": False,
+                "completed_roots_through": profile_cursor,
+                "remaining_items": max(
+                    0,
+                    int(scope_batch.get("total_items") or 0) - profile_cursor,
+                ),
+                "remaining_files_in_selected_roots": truncated_files,
+                "has_more": True,
+                "next_cursor": profile_cursor,
+                "next_file_cursor": int(
+                    _discovery.get("source_files_processed_through") or 0
+                ),
+            })
 
-    ast_by_path = await _load_ast_sources(
-        container,
-        source_files=source_files,
-        scan_root=root,
+    ast_previous_source = (
+        (previous_action_space or {}).get("source") or {}
+        if previous_action_space else {}
     )
+    previous_ast_status = ast_previous_source.get("ast_status") or {}
+    ast_status: dict = {}
+    if previous_ast_status.get("unavailable_reason") == "no_foundry_project":
+        ast_by_path = {}
+        ast_status = {
+            "unavailable_reason": "no_foundry_project",
+            "reused_series_unavailable": True,
+        }
+    else:
+        reuse_build_info = {
+            key: previous_ast_status.get(key)
+            for key in ("project_root", "build_info_path")
+            if previous_ast_status.get(key)
+        }
+        ast_by_path = await _load_ast_sources(
+            container,
+            source_files=source_files,
+            scan_root=root,
+            status=ast_status,
+            reuse_build_info=reuse_build_info or None,
+        )
     parsed_files = []
     read_errors = []
     parse_source_counts = {"ast": 0, "regex": 0}
@@ -16296,6 +18442,27 @@ async def _map_action_space(container: AuditContainer, args: dict) -> str:
         parse_source_counts[source_kind] = parse_source_counts.get(source_kind, 0) + 1
         parsed_files.append(parsed)
 
+    batch_files_requested = len(source_files)
+    batch_files_scanned = len(parsed_files)
+    batch_parsed_files = list(parsed_files)
+    batch_read_errors = list(read_errors)
+    batch_parse_source_counts = dict(parse_source_counts)
+    previous_source = ast_previous_source
+    if previous_action_space:
+        parsed_files = [
+            _action_space_parsed_projection(previous_action_space, max_items),
+            *parsed_files,
+        ]
+        read_errors = [
+            *(previous_source.get("read_errors") or []),
+            *read_errors,
+        ]
+        previous_counts = previous_source.get("parse_source_counts") or {}
+        parse_source_counts = {
+            key: int(previous_counts.get(key) or 0) + int(parse_source_counts.get(key) or 0)
+            for key in {"ast", "regex"}
+        }
+
     if parse_source_counts["ast"] and parse_source_counts["regex"]:
         parse_mode = "mixed"
     elif parse_source_counts["ast"]:
@@ -16303,34 +18470,145 @@ async def _map_action_space(container: AuditContainer, args: dict) -> str:
     else:
         parse_mode = "regex"
 
+    batch_aggregate = _aggregate_action_space(batch_parsed_files, max_items)
     aggregate = _aggregate_action_space(parsed_files, max_items)
+    additive_summary_keys = (
+        "contracts",
+        "actions",
+        "observations",
+        "event_declarations",
+        "value_flow_hints",
+        "external_call_hints",
+        "role_gate_hints",
+        "event_hints",
+        "state_mutation_hints",
+        "oracle_read_hints",
+        "router_call_hints",
+        "bridge_message_hints",
+        "callback_surface_hints",
+        "authorization_check_hints",
+        "cross_contract_call_hints",
+        "economic_parameter_hints",
+    )
+    previous_totals = (
+        (previous_action_space or {}).get("cumulative_totals")
+        or (previous_action_space or {}).get("summary")
+        or {}
+    )
+    cumulative_totals = {
+        key: int(previous_totals.get(key) or 0)
+        + int(batch_aggregate["summary"].get(key) or 0)
+        for key in additive_summary_keys
+    }
+    aggregate["summary"].update(cumulative_totals)
+    section_retention = {
+        key: {
+            "cumulative_total": cumulative_totals[key],
+            "retained": len(aggregate[key]),
+            "omitted_by_item_limit": max(
+                0,
+                cumulative_totals[key] - len(aggregate[key]),
+            ),
+        }
+        for key in ("contracts", "actions", "observations", "event_declarations")
+    }
     status = "observed"
     validity_notes = []
-    if source_files and not parsed_files:
+    cumulative_files_scanned = int(previous_source.get("files_scanned") or 0) + (
+        batch_files_scanned
+    )
+    if source_files and not cumulative_files_scanned:
         status = "invalid_empty_source"
         validity_notes.append(
             "Requested Solidity source files were discovered but none could be read."
         )
+    if previous_action_space:
+        validity_notes = _merge_unique_strings(
+            previous_action_space.get("validity_notes"),
+            validity_notes,
+        )
+    if any(
+        item["omitted_by_item_limit"] > 0
+        for item in section_retention.values()
+    ):
+        validity_notes = _merge_unique_strings(
+            validity_notes,
+            [
+                "Cumulative section totals exceed max_items; section_retention "
+                "records the omitted counts. Omitted actions remain unmapped, "
+                "not rejected."
+            ],
+        )
+    current_truncated_source_files = [
+        item["path"]
+        for item in (
+            parsed_files[1:] if previous_action_space else parsed_files
+        )
+        if item.get("truncated")
+    ]
+    cumulative_truncated_source_files = _merge_unique_strings(
+        previous_source.get("truncated_source_files"),
+        current_truncated_source_files,
+    )
     state = await _load_campaign_state(container)
     action_space_id = _next_campaign_id(state, "action_space")
+    if scope_batch is not None:
+        parent_batch = (previous_action_space or {}).get("scope_batch") or {}
+        completed_roots = (
+            list(scope_batch.get("selected_roots") or [])
+            if scope_batch.get("selected_roots_complete") else []
+        )
+        scope_batch = {
+            **scope_batch,
+            "series_id": parent_batch.get("series_id") or action_space_id,
+            "parent_action_space": previous_path or None,
+            "processed_roots": [
+                *(parent_batch.get("processed_roots") or []),
+                *completed_roots,
+            ],
+            "continuation_args": action_continuation_args,
+        }
     action_space = {
         "id": action_space_id,
         "status": status,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source": {
             "path": root,
-            "files_requested": len(source_files),
-            "files_scanned": len(parsed_files),
-            "files_truncated_by_limit": truncated_files,
+            "files_requested": int(previous_source.get("files_requested") or 0)
+            + batch_files_requested,
+            "files_scanned": cumulative_files_scanned,
+            "files_truncated_by_limit": (
+                truncated_files
+                if scope_batch is not None
+                else int(previous_source.get("files_truncated_by_limit") or 0)
+                + truncated_files
+            ),
+            "batch_files_requested": batch_files_requested,
+            "batch_files_scanned": batch_files_scanned,
+            "batch_files_truncated_by_limit": truncated_files,
             "profile_roots_limit": max_roots if files is None else None,
+            "profile_cursor": profile_cursor if scope_batch is not None else None,
+            "max_files": max_files,
+            "max_items": max_items,
+            "source_file_cursor": (
+                source_file_cursor if scope_batch is not None else None
+            ),
+            "batch_source_files_total": (
+                _discovery.get("source_files_total")
+                if scope_batch is not None else None
+            ),
             "include_tests": include_tests,
             "read_errors": read_errors,
+            "batch_read_errors": batch_read_errors,
             "parse_mode": parse_mode,
             "parse_source_counts": parse_source_counts,
-            "truncated_source_files": [
-                item["path"] for item in parsed_files if item.get("truncated")
-            ],
+            "batch_parse_source_counts": batch_parse_source_counts,
+            "ast_status": ast_status,
+            "truncated_source_files": cumulative_truncated_source_files,
         },
+        "scope_batch": scope_batch,
+        "cumulative_totals": cumulative_totals,
+        "section_retention": section_retention,
         "validity_notes": validity_notes,
         "related_ids": [str(item) for item in related_ids],
         **aggregate,
@@ -16353,8 +18631,10 @@ async def _map_action_space(container: AuditContainer, args: dict) -> str:
                 f"Status: {status}\n"
                 f"Parse mode: {parse_mode}\n"
                 f"Source root: {root}\n"
-                f"Files scanned: {len(parsed_files)}"
-                f" (+{truncated_files} over file limit)\n"
+                f"Files scanned: {cumulative_files_scanned} cumulative "
+                f"({batch_files_scanned} this batch)"
+                f" (+{action_space['source']['files_truncated_by_limit']} over "
+                "file limits)\n"
                 f"Contracts: {aggregate['summary']['contracts']}\n"
                 f"State-changing actions: {aggregate['summary']['actions']}\n"
                 f"Action signature groups: {aggregate['summary']['action_signature_groups']}\n"
@@ -16374,6 +18654,8 @@ async def _map_action_space(container: AuditContainer, args: dict) -> str:
         "path": action_space_path,
         "result_id": result_id or None,
         "source": action_space["source"],
+        "scope_batch": scope_batch,
+        "section_retention": section_retention,
         "validity_notes": validity_notes,
         "summary": aggregate["summary"],
         "top_affordances": aggregate["top_affordances"][:response_items],
@@ -16422,7 +18704,10 @@ async def _map_action_space(container: AuditContainer, args: dict) -> str:
                 aggregate["summary"]["observation_signature_groups"]
                 - max(3, response_items // 2),
             ),
-            "note": "Open the artifact path for the full action grammar.",
+            "note": (
+                "Open the artifact path for the full retained action grammar; "
+                "section_retention records any item-limit omissions."
+            ),
         },
     }
     return json.dumps(response, indent=2, sort_keys=True)
@@ -16448,8 +18733,8 @@ _STM_FOCUS_OPTIONS = (
     "state_machine",
     "external_boundary",
 )
-# Response/ordering priority for the generic invariant families. The artifact
-# always keeps every family; `focus` only promotes a subset to the front.
+# Response/retention priority for generic invariant families. `focus` promotes
+# a subset; exact omitted counts and a bounded frontier make any cap explicit.
 _STM_INVARIANT_KIND_ORDER = (
     "conservation",
     "authorization_binding",
@@ -16568,7 +18853,7 @@ def _stm_source_slice_hint(value: object) -> dict:
 
 def _stm_unit_from_action(action: dict) -> dict:
     """Adapt an action-space action entry into the per-function unit shape the
-    model builder expects (used only as a fallback when no source is scanned)."""
+    model builder expects."""
     unit = dict(action)
     unit.setdefault("start_line", action.get("line"))
     unit.setdefault("end_line", action.get("line"))
@@ -16577,6 +18862,93 @@ def _stm_unit_from_action(action: dict) -> dict:
     unit.setdefault("parameters", action.get("parameters") or [])
     unit.setdefault("modifiers", action.get("modifiers") or [])
     return unit
+
+
+def _action_space_source_files(action_space: dict) -> list[str]:
+    """Return the retained source-file inventory from an action-space artifact.
+
+    A completed cumulative action space already paid the cost of discovering
+    every manifest root.  Downstream source mappers can reuse its concrete file
+    inventory instead of independently applying a first-page ``max_roots``
+    bound.  Every retained section is inspected because a file may contain only
+    an interface, event, observation, or global hint.
+    """
+    files: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: object) -> None:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            return
+        try:
+            normalized = _normalize_action_source_path(text)
+        except ValueError:
+            return
+        if not normalized.endswith(".sol"):
+            return
+        seen.add(normalized)
+        files.append(normalized)
+
+    for section in (
+        "contracts",
+        "actions",
+        "observations",
+        "event_declarations",
+    ):
+        for entry in action_space.get(section) or []:
+            if isinstance(entry, dict):
+                add(entry.get("file"))
+    for entries in (action_space.get("hints") or {}).values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, dict):
+                add(entry.get("file"))
+    return files
+
+
+def _stm_unit_identity(unit: dict) -> tuple[str, str, str]:
+    """Stable source-definition identity shared by parsed and mapped units."""
+    file = str(unit.get("file") or "").strip()
+    if file:
+        file = posixpath.normpath(file)
+    contract = str(unit.get("contract") or "").strip()
+    signature = str(unit.get("signature") or "").strip()
+    if not signature:
+        signature = _action_signature(unit)
+    if not signature:
+        signature = str(unit.get("function") or "").strip()
+    return file, contract, signature
+
+
+def _stm_enrich_source_unit(source_unit: dict, mapped_unit: dict) -> dict:
+    """Prefer mapped public-definition facts without losing source-only units.
+
+    The source parser still contributes internal/private functions and precise
+    line spans.  For the same public/external definition, however, the
+    cumulative action-space entry may carry AST-backed modifiers and causal
+    facts; those should replace a weaker regex reparse instead of being dropped.
+    """
+    enriched = dict(source_unit)
+    for key in (
+        "visibility",
+        "mutability",
+        "parameters",
+        "returns",
+        "modifiers",
+        "hints",
+        "causal_facts",
+        "parse_source",
+    ):
+        value = mapped_unit.get(key)
+        if value not in (None, "", [], {}):
+            enriched[key] = value
+    enriched["affordances"] = _merge_unique_strings(
+        source_unit.get("affordances"),
+        mapped_unit.get("affordances"),
+    )
+    enriched["action_space_enriched"] = True
+    return enriched
 
 
 def _stm_dedupe_strings(items: list, cap: int) -> list[str]:
@@ -16688,25 +19060,30 @@ def _stm_build_tracked_state(
     units: list[dict],
     *,
     protocol_graph: dict | None,
-    max_items: int,
 ) -> list[dict]:
     groups: dict[tuple, dict] = {}
     order: list[tuple] = []
     for unit in units:
         contract = str(unit.get("contract") or "")
-        file = unit.get("file")
+        file = str(unit.get("file") or "").strip()
+        normalized_file = posixpath.normpath(file) if file else ""
         for write in _stm_state_writes(unit):
             target = write["target"]
             name = _stm_state_base_name(target)
             if not name:
                 continue
             kind = _stm_classify_state(target, write.get("text"))
-            key = (contract, name)
+            # A contract name is not a source definition.  Key tracked state by
+            # its concrete source file as well so two profile roots containing
+            # ``Vault.balances`` cannot be combined into a fabricated
+            # conservation invariant.
+            key = (normalized_file, contract, name)
             record = groups.get(key)
             if record is None:
                 record = {
                     "name": name,
                     "contract": contract,
+                    "file": normalized_file,
                     "evidence": [],
                     "_kinds": set(),
                 }
@@ -16741,10 +19118,32 @@ def _stm_build_tracked_state(
             tracked.append({
                 "name": name,
                 "contract": str(node.get("contract") or ""),
+                "file": _graph_node_source_file(node),
                 "kind": "asset_hint" if node_kind == "asset_hint" else "external_dependency",
                 "evidence": [f"protocol_graph:{graph_id}" if graph_id else "protocol_graph"],
             })
-    return tracked[:max_items]
+    deduped: list[dict] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for record in tracked:
+        key = (
+            str(record.get("file") or ""),
+            str(record.get("contract") or ""),
+            str(record.get("name") or ""),
+            str(record.get("kind") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(record)
+    return sorted(
+        deduped,
+        key=lambda record: (
+            _STM_STATE_KIND_RANK.get(str(record.get("kind") or ""), 9),
+            str(record.get("file") or ""),
+            str(record.get("contract") or ""),
+            str(record.get("name") or ""),
+        ),
+    )
 
 
 def _stm_unit_signals(unit: dict) -> dict:
@@ -16942,10 +19341,14 @@ def _stm_entrypoint_record(unit: dict, signals: dict, *, cap: int = 6) -> dict:
         for label in unit.get("affordances") or []
         if label in _STM_STRUCTURAL_AFFORDANCE_LABELS
     ]
+    signature = str(unit.get("signature") or "").strip() or _action_signature(unit)
     record = {
         "contract": str(unit.get("contract") or ""),
         "function": str(unit.get("function") or ""),
-        "signature": unit.get("signature"),
+        "signature": signature,
+        "action_key": _action_logical_key(unit),
+        "action_definition_key": _action_signature_key(unit),
+        "action_uid": _action_stable_uid(unit),
         "line": unit.get("start_line"),
         "file": file,
         "mutability": unit.get("mutability"),
@@ -16986,8 +19389,10 @@ def _stm_order_entrypoints(entrypoints: list[dict], focus: str) -> list[dict]:
         entrypoints,
         key=lambda entry: (
             -(focus_boost(entry) * 10 + base_score(entry)),
+            entry.get("file") or "",
             entry.get("contract") or "",
             entry.get("function") or "",
+            entry.get("signature") or "",
         ),
     )
 
@@ -17001,16 +19406,29 @@ def _stm_invariant(
     candidate_observations: list[str],
     contract: str = "",
     function: str = "",
+    file: str = "",
+    signature: str = "",
+    action_definition_key: str = "",
+    action_uid: str = "",
 ) -> dict:
-    return {
+    invariant = {
         "kind": kind,
         "contract": contract,
         "function": function,
+        "file": file,
+        "signature": signature,
+        "action_definition_key": action_definition_key,
+        "action_uid": action_uid,
         "statement": statement,
         "source": "generic",
         "evidence": [ref for ref in evidence if ref][:6],
         "falsification_ideas": falsification_ideas[:4],
         "candidate_observations": candidate_observations[:4],
+    }
+    return {
+        key: value
+        for key, value in invariant.items()
+        if value not in (None, "", [], {})
     }
 
 
@@ -17032,18 +19450,23 @@ def _stm_collect_invariants(
     tracked_state: list[dict],
 ) -> list[dict]:
     invariants: list[dict] = []
-    by_contract: dict[str, list[dict]] = {}
+    by_contract: dict[tuple[str, str], list[dict]] = {}
     for state in tracked_state:
-        by_contract.setdefault(state.get("contract") or "", []).append(state)
+        file = str(state.get("file") or "").strip()
+        if file:
+            file = posixpath.normpath(file)
+        contract = str(state.get("contract") or "")
+        by_contract.setdefault((file, contract), []).append(state)
 
     # Contract-level families: conservation + state machine.
-    for contract, states in by_contract.items():
+    for (file, contract), states in by_contract.items():
         mapping_names = [s["name"] for s in states if s["kind"] == "mapping"]
         aggregate_names = [s["name"] for s in states if s["kind"] == "aggregate"]
         if mapping_names and aggregate_names:
             invariants.append(_stm_invariant(
                 kind="conservation",
                 contract=contract,
+                file=file,
                 statement=(
                     f"In {contract}, the sum of per-account entries in "
                     f"{', '.join(mapping_names[:4])} must stay consistent with the "
@@ -17067,6 +19490,7 @@ def _stm_collect_invariants(
             invariants.append(_stm_invariant(
                 kind="state_machine",
                 contract=contract,
+                file=file,
                 statement=(
                     f"In {contract}, the lifecycle state(s) "
                     f"{', '.join(lifecycle_names[:4])} must only transition in the "
@@ -17088,6 +19512,7 @@ def _stm_collect_invariants(
 
     # Function-level families.
     for unit in units:
+        unit_invariant_start = len(invariants)
         signals = _stm_unit_signals(unit)
         contract = str(unit.get("contract") or "")
         function = str(unit.get("function") or "")
@@ -17259,21 +19684,100 @@ def _stm_collect_invariants(
                 ],
             ))
 
+        # Attach the concrete source definition after deriving all invariant
+        # families for this unit.  This keeps the family builders readable while
+        # ensuring overloads and same-named definitions survive finalization and
+        # can be rebound only to their exact action-space entrypoint.
+        unit_file, _unit_contract, unit_signature = _stm_unit_identity(unit)
+        unit_identity = {
+            "file": unit_file,
+            "signature": unit_signature,
+            "action_definition_key": _action_signature_key(unit),
+            "action_uid": _action_stable_uid(unit),
+        }
+        for invariant in invariants[unit_invariant_start:]:
+            invariant.update({
+                key: value
+                for key, value in unit_identity.items()
+                if value not in (None, "")
+            })
+
     return invariants
+
+
+def _stm_retain_section(
+    items: list[dict],
+    max_items: int,
+    *,
+    frontier_fields: tuple[str, ...],
+    category_field: str = "",
+) -> tuple[list[dict], dict]:
+    retained = items[:max_items]
+    omitted = items[max_items:]
+    omitted_by_category: dict[str, int] = {}
+    omitted_by_source: dict[str, int] = {}
+    for item in omitted:
+        if category_field:
+            category = str(item.get(category_field) or "unknown")
+            omitted_by_category[category] = (
+                omitted_by_category.get(category, 0) + 1
+            )
+        source = str(item.get("file") or "<unknown>")
+        omitted_by_source[source] = omitted_by_source.get(source, 0) + 1
+    source_summary_limit = 16
+    source_summary = [
+        {"file": file, "omitted": count}
+        for file, count in sorted(
+            omitted_by_source.items(),
+            key=lambda entry: (-entry[1], entry[0]),
+        )[:source_summary_limit]
+    ]
+    frontier_limit = 20
+    omitted_frontier = [
+        {
+            key: item.get(key)
+            for key in frontier_fields
+            if item.get(key) not in (None, "")
+        }
+        for item in omitted[:frontier_limit]
+    ]
+    retention = {
+        "total": len(items),
+        "retained": len(retained),
+        "omitted_by_item_limit": len(omitted),
+        "max_items": max_items,
+        "omitted_source_count": len(omitted_by_source),
+        "omitted_sources": source_summary,
+        "omitted_sources_truncated": max(
+            0, len(omitted_by_source) - len(source_summary)
+        ),
+        "omitted_frontier": omitted_frontier,
+        "omitted_frontier_truncated": max(
+            0, len(omitted) - len(omitted_frontier)
+        ),
+    }
+    if category_field:
+        retention[f"omitted_by_{category_field}"] = dict(
+            sorted(omitted_by_category.items())
+        )
+    return retained, retention
 
 
 def _stm_finalize_invariants(
     invariants: list[dict],
     focus: str,
     max_items: int,
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
     seen: set[tuple] = set()
     deduped: list[dict] = []
     for invariant in invariants:
         key = (
             invariant["kind"],
+            invariant.get("file", ""),
             invariant.get("contract", ""),
             invariant.get("function", ""),
+            invariant.get("action_definition_key", ""),
+            invariant.get("signature", ""),
         )
         if key in seen:
             continue
@@ -17294,13 +19798,28 @@ def _stm_finalize_invariants(
             kind_rank,
             invariant.get("contract", ""),
             invariant.get("function", ""),
+            invariant.get("signature", ""),
+            invariant.get("file", ""),
         )
 
     deduped.sort(key=sort_key)
-    deduped = deduped[:max_items]
-    for index, invariant in enumerate(deduped, start=1):
+    retained, retention = _stm_retain_section(
+        deduped,
+        max_items,
+        frontier_fields=(
+            "kind",
+            "file",
+            "contract",
+            "function",
+            "signature",
+            "action_definition_key",
+            "action_uid",
+        ),
+        category_field="kind",
+    )
+    for index, invariant in enumerate(retained, start=1):
         invariant["id"] = f"inv-{index:03d}"
-    return deduped
+    return retained, retention
 
 
 def _stm_required_setup(kind: str, contract: str) -> list[str]:
@@ -17343,16 +19862,46 @@ def _stm_experiment_prompts(
     for invariant in invariants:
         contract = invariant.get("contract") or ""
         function = invariant.get("function") or ""
+        invariant_file = str(invariant.get("file") or "").strip()
         if function:
-            targets = [f"{contract}.{function}" if contract else function]
+            targets = [{
+                key: invariant.get(key)
+                for key in (
+                    "contract",
+                    "function",
+                    "signature",
+                    "file",
+                    "action_definition_key",
+                    "action_uid",
+                )
+                if invariant.get(key) not in (None, "", [], {})
+            }]
         else:
             targets = [
-                f"{entry.get('contract')}.{entry.get('function')}"
-                for entry in by_contract.get(contract, [])[:4]
+                {
+                    key: entry.get(key)
+                    for key in (
+                        "contract",
+                        "function",
+                        "signature",
+                        "file",
+                        "action_key",
+                        "action_definition_key",
+                        "action_uid",
+                    )
+                    if entry.get(key) not in (None, "", [], {})
+                }
+                for entry in by_contract.get(contract, [])
+                if (
+                    not invariant_file
+                    or posixpath.normpath(str(entry.get("file") or ""))
+                    == posixpath.normpath(invariant_file)
+                )
             ]
+            targets = targets[:4]
         title = f"Falsify {invariant['kind']} in {contract or 'scope'}"
         if function:
-            title += f".{function}"
+            title += f".{invariant.get('signature') or function}"
         prompts.append({
             "title": title,
             "target_actions": targets[:6] or [
@@ -17363,7 +19912,7 @@ def _stm_experiment_prompts(
             "required_setup": _stm_required_setup(invariant["kind"], contract),
             "notes": [
                 "Planning prompt only — turn it into a runnable PoC with "
-                "compose_sequence_experiment / create_experiment.",
+                "compose_sequence_experiment after structured hypothesis admission.",
                 "This is not evidence.",
             ],
         })
@@ -17458,6 +20007,7 @@ def _stm_compact_tracked(state: dict) -> dict:
         for key, value in {
             "name": state.get("name"),
             "contract": state.get("contract"),
+            "file": state.get("file"),
             "kind": state.get("kind"),
             "evidence": (state.get("evidence") or [])[:3],
         }.items()
@@ -17472,6 +20022,10 @@ def _stm_compact_entrypoint(entry: dict) -> dict:
             "contract": entry.get("contract"),
             "function": entry.get("function"),
             "signature": entry.get("signature"),
+            "file": entry.get("file"),
+            "action_key": entry.get("action_key"),
+            "action_definition_key": entry.get("action_definition_key"),
+            "action_uid": entry.get("action_uid"),
             "line": entry.get("line"),
             "writes": [write.get("target") for write in (entry.get("writes") or [])[:4]],
             "authorization": [
@@ -17491,6 +20045,9 @@ def _stm_compact_invariant(invariant: dict) -> dict:
         for key, value in {
             "id": invariant.get("id"),
             "kind": invariant.get("kind"),
+            "file": invariant.get("file"),
+            "signature": invariant.get("signature"),
+            "action_definition_key": invariant.get("action_definition_key"),
             "statement": _truncate_response_text(invariant.get("statement"), 260),
             "evidence": (invariant.get("evidence") or [])[:3],
             "falsification_ideas": (invariant.get("falsification_ideas") or [])[:2],
@@ -17529,8 +20086,29 @@ async def _extract_state_transition_model(container: AuditContainer, args: dict)
     blockers: list[str] = []
     read_errors: list[dict] = []
 
+    action_space = None
+    action_space_path = ""
+    if action_space_ref:
+        try:
+            action_space_path, action_space = await _load_action_space(
+                container, action_space_ref
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            blockers.append(
+                f"action_space {action_space_ref} could not be loaded: {exc}"
+            )
+    action_space_files = (
+        _action_space_source_files(action_space)
+        if files is None and isinstance(action_space, dict)
+        else []
+    )
+    if action_space_files:
+        # Reuse the completed cumulative mapper's concrete inventory.  This
+        # avoids independently rediscovering only the first max_roots profiles.
+        files = action_space_files
+
     try:
-        source_files, truncated_files = await _discover_action_source_files(
+        source_files, truncated_files, _discovery = await _discover_action_source_files(
             container,
             root=root,
             files=files,
@@ -17550,17 +20128,7 @@ async def _extract_state_transition_model(container: AuditContainer, args: dict)
             continue
         units.extend(_iter_function_units(path, source))
 
-    action_space = None
-    action_space_path = ""
-    if action_space_ref:
-        try:
-            action_space_path, action_space = await _load_action_space(
-                container, action_space_ref
-            )
-        except (FileNotFoundError, ValueError) as exc:
-            blockers.append(
-                f"action_space {action_space_ref} could not be loaded: {exc}"
-            )
+    source_unit_count = len(units)
     protocol_graph = None
     protocol_graph_path = ""
     if protocol_graph_ref:
@@ -17573,12 +20141,32 @@ async def _extract_state_transition_model(container: AuditContainer, args: dict)
                 f"protocol_graph {protocol_graph_ref} could not be loaded: {exc}"
             )
 
-    used_action_space_fallback = False
-    if not units and isinstance(action_space, dict):
-        for action in action_space.get("actions") or []:
-            if isinstance(action, dict):
-                units.append(_stm_unit_from_action(action))
-        used_action_space_fallback = bool(units)
+    action_space_units_considered = 0
+    action_space_units_enriched = 0
+    action_space_units_merged = 0
+    if isinstance(action_space, dict):
+        known_units = {
+            _stm_unit_identity(unit): index
+            for index, unit in enumerate(units)
+        }
+        for section in ("actions", "observations"):
+            for action in action_space.get(section) or []:
+                if not isinstance(action, dict):
+                    continue
+                action_space_units_considered += 1
+                unit = _stm_unit_from_action(action)
+                identity = _stm_unit_identity(unit)
+                if identity in known_units:
+                    index = known_units[identity]
+                    units[index] = _stm_enrich_source_unit(units[index], unit)
+                    action_space_units_enriched += 1
+                    continue
+                known_units[identity] = len(units)
+                units.append(unit)
+                action_space_units_merged += 1
+    used_action_space_fallback = bool(
+        not source_unit_count and action_space_units_merged
+    )
 
     if contract_filter:
         units = [
@@ -17594,24 +20182,52 @@ async def _extract_state_transition_model(container: AuditContainer, args: dict)
         ]
 
     unit_signals = [(unit, _stm_unit_signals(unit)) for unit in units]
-    tracked_state = _stm_build_tracked_state(
-        units, protocol_graph=protocol_graph, max_items=max_items
+    all_tracked_state = _stm_build_tracked_state(
+        units, protocol_graph=protocol_graph
     )
-    entrypoints = _stm_order_entrypoints(
+    tracked_state, tracked_state_retention = _stm_retain_section(
+        all_tracked_state,
+        max_items,
+        frontier_fields=("kind", "file", "contract", "name"),
+        category_field="kind",
+    )
+    all_entrypoints = _stm_order_entrypoints(
         [
             _stm_entrypoint_record(unit, signals)
             for unit, signals in unit_signals
             if signals["is_entrypoint"] and signals["is_mutating"]
         ],
         focus,
-    )[:max_items]
-    invariants = _stm_finalize_invariants(
-        _stm_collect_invariants(units, tracked_state), focus, max_items
+    )
+    entrypoints, entrypoint_retention = _stm_retain_section(
+        all_entrypoints,
+        max_items,
+        frontier_fields=(
+            "file",
+            "contract",
+            "function",
+            "signature",
+            "action_definition_key",
+            "action_uid",
+        ),
+    )
+    invariants, invariant_retention = _stm_finalize_invariants(
+        _stm_collect_invariants(units, all_tracked_state), focus, max_items
     )
     experiment_prompts = _stm_experiment_prompts(
-        invariants, entrypoints, max_items=min(max_items, 12)
+        invariants, all_entrypoints, max_items=min(max_items, 12)
     )
     lenses = _stm_lenses(units)
+    section_retention = {
+        "tracked_state": tracked_state_retention,
+        "entrypoints": entrypoint_retention,
+        "candidate_invariants": invariant_retention,
+    }
+    retention_omissions = {
+        section: int(retention.get("omitted_by_item_limit") or 0)
+        for section, retention in section_retention.items()
+        if int(retention.get("omitted_by_item_limit") or 0) > 0
+    }
 
     if not source_files and not used_action_space_fallback:
         status = "not_found"
@@ -17627,6 +20243,32 @@ async def _extract_state_transition_model(container: AuditContainer, args: dict)
         )
     else:
         status = "observed"
+    if retention_omissions:
+        if status == "observed":
+            status = "partial"
+        omitted_summary = ", ".join(
+            f"{section}={count}"
+            for section, count in sorted(retention_omissions.items())
+        )
+        blockers.append(
+            f"Modeled sections exceed max_items ({omitted_summary}) and remain "
+            "an explicit unmapped frontier."
+        )
+    action_scope_batch = (
+        action_space.get("scope_batch") or {}
+        if isinstance(action_space, dict) else {}
+    )
+    action_scope_incomplete = bool(
+        action_scope_batch.get("kind") == "source_roots"
+        and action_scope_batch.get("has_more")
+    )
+    if action_scope_incomplete:
+        status = "partial"
+        blockers.append(
+            "The referenced cumulative action-space batch is incomplete; "
+            "continue its controller-provided cursor before treating this as a "
+            "full-scope state model."
+        )
     if read_errors:
         blockers.append(f"{len(read_errors)} source file(s) could not be read.")
     if function_filter and not units:
@@ -17652,6 +20294,18 @@ async def _extract_state_transition_model(container: AuditContainer, args: dict)
             "protocol_graph": protocol_graph_path or (protocol_graph_ref or None),
             "source_slice": slice_hint or None,
             "used_action_space_fallback": used_action_space_fallback or None,
+            "source_units": source_unit_count,
+            "action_space_units_considered": action_space_units_considered,
+            "action_space_units_enriched": action_space_units_enriched,
+            "action_space_units_merged": action_space_units_merged,
+            "file_inventory_source": (
+                action_space_path if action_space_files else None
+            ),
+            "action_space_scope_complete": (
+                not action_scope_incomplete
+                if action_scope_batch.get("kind") == "source_roots"
+                else None
+            ),
         }.items()
         if value not in (None, "", [], {})
     }
@@ -17660,6 +20314,44 @@ async def _extract_state_transition_model(container: AuditContainer, args: dict)
         "Invariants are generic hypotheses to falsify with experiments; protocol "
         "lenses are optional and appear only when source evidence supports them.",
     ]
+    if action_space_units_merged:
+        notes.append(
+            f"Merged {action_space_units_merged} callable definition(s) from the "
+            "referenced cumulative action space because their identities were "
+            "not present in the bounded source scan."
+        )
+    if action_space_units_enriched:
+        notes.append(
+            f"Preferred cumulative action-space facts for "
+            f"{action_space_units_enriched} matching public/external "
+            "definition(s), while retaining source-parsed internal functions "
+            "and line spans."
+        )
+    action_retention_omissions = sum(
+        int((entry or {}).get("omitted_by_item_limit") or 0)
+        for entry in (
+            (action_space or {}).get("section_retention") or {}
+        ).values()
+        if isinstance(entry, dict)
+    )
+    if action_retention_omissions:
+        notes.append(
+            f"The action-space artifact records {action_retention_omissions} "
+            "definition(s) omitted by its item limit; those definitions remain "
+            "unmapped, not rejected."
+        )
+    if retention_omissions:
+        notes.append(
+            "The model reached its retention bound: "
+            + ", ".join(
+                f"{section} retained {section_retention[section]['retained']} of "
+                f"{section_retention[section]['total']}"
+                for section in sorted(retention_omissions)
+            )
+            + ". Each bounded omitted source/identity frontier is planning debt, "
+            "not evidence that the omitted state, entrypoints, or invariants are "
+            "covered or rejected."
+        )
 
     state = await _load_campaign_state(container)
     model_id = _next_campaign_id(state, "state_transition_model")
@@ -17667,13 +20359,24 @@ async def _extract_state_transition_model(container: AuditContainer, args: dict)
     invariant_kinds = sorted({invariant["kind"] for invariant in invariants})
     summary = {
         "tracked_state": len(tracked_state),
+        "tracked_state_total": tracked_state_retention["total"],
+        "tracked_state_omitted": tracked_state_retention["omitted_by_item_limit"],
         "entrypoints": len(entrypoints),
+        "entrypoints_total": entrypoint_retention["total"],
+        "entrypoints_omitted": entrypoint_retention["omitted_by_item_limit"],
         "candidate_invariants": len(invariants),
+        "candidate_invariants_total": invariant_retention["total"],
+        "candidate_invariants_omitted": invariant_retention[
+            "omitted_by_item_limit"
+        ],
         "invariant_kinds": invariant_kinds,
         "experiment_prompts": len(experiment_prompts),
         "lenses": sorted(lenses.keys()),
         "contracts": len(contracts),
         "files_scanned": len(source_files) - len(read_errors),
+        "source_units": source_unit_count,
+        "action_space_units_enriched": action_space_units_enriched,
+        "action_space_units_merged": action_space_units_merged,
     }
     model = {
         "state_transition_model_id": model_id,
@@ -17683,6 +20386,11 @@ async def _extract_state_transition_model(container: AuditContainer, args: dict)
         "title": title or f"State-transition model: {root}",
         "scope": scope,
         "summary": summary,
+        "source_inventory": {
+            "files": source_files,
+            "count": len(source_files),
+        },
+        "section_retention": section_retention,
         "tracked_state": tracked_state,
         "entrypoints": entrypoints,
         "candidate_invariants": invariants,
@@ -17706,9 +20414,12 @@ async def _extract_state_transition_model(container: AuditContainer, args: dict)
                 f"Path: {model_path}\n"
                 f"Status: {status}\n"
                 f"Contracts: {len(contracts)}\n"
-                f"Tracked state: {len(tracked_state)}\n"
-                f"Entrypoints: {len(entrypoints)}\n"
-                f"Candidate invariants: {len(invariants)} "
+                f"Tracked state: {len(tracked_state)} retained of "
+                f"{tracked_state_retention['total']}\n"
+                f"Entrypoints: {len(entrypoints)} retained of "
+                f"{entrypoint_retention['total']}\n"
+                f"Candidate invariants: {len(invariants)} retained of "
+                f"{invariant_retention['total']} "
                 f"({', '.join(invariant_kinds) or 'none'})\n"
                 f"Experiment prompts: {len(experiment_prompts)}\n"
                 f"Lenses: {', '.join(sorted(lenses.keys())) or 'none'}\n"
@@ -17730,6 +20441,7 @@ async def _extract_state_transition_model(container: AuditContainer, args: dict)
         "focus": focus,
         "scope": scope,
         "summary": summary,
+        "section_retention": section_retention,
         "tracked_state": [
             _stm_compact_tracked(state) for state in tracked_state[:response_items]
         ],
@@ -17749,7 +20461,10 @@ async def _extract_state_transition_model(container: AuditContainer, args: dict)
             "entrypoints": max(0, len(entrypoints) - response_items),
             "candidate_invariants": max(0, len(invariants) - response_items),
             "experiment_prompts": max(0, len(experiment_prompts) - prompt_items),
-            "note": "Open the artifact path for the full model.",
+            "note": (
+                "Open the artifact path for the full retained model and bounded "
+                "omitted-invariant frontier."
+            ),
         },
     }
     return json.dumps(response, indent=2, sort_keys=True)
@@ -17803,9 +20518,15 @@ def _iter_function_units(path: str, source: str) -> list[dict]:
     units: list[dict] = []
     for contract in _contract_ranges(source, starts):
         block_scan = scan_source[contract["start"]:contract["end"]]
+        state_variables = _regex_contract_state_variables(source, contract, starts)
         matches = list(_FUNCTION_DECL_RE.finditer(block_scan))
         matches.extend(_SPECIAL_FUNCTION_DECL_RE.finditer(block_scan))
         matches.sort(key=lambda item: item.start())
+        function_names = {
+            str(item.group(1) or "").strip()
+            for item in matches
+            if str(item.group(1) or "").strip()
+        }
         for match in matches:
             unit = _function_unit_from_match(
                 match,
@@ -17813,6 +20534,8 @@ def _iter_function_units(path: str, source: str) -> list[dict]:
                 source=source,
                 line_starts=starts,
                 max_items=12,
+                state_variables=state_variables,
+                function_names=function_names,
             )
             units.append({
                 "file": path,
@@ -17827,6 +20550,7 @@ def _iter_function_units(path: str, source: str) -> list[dict]:
                 "returns": unit["returns"],
                 "affordances": unit["affordances"],
                 "hints": unit["hints"],
+                "causal_facts": unit["causal_facts"],
                 "start_line": unit["line"],
                 "end_line": unit["end_line"],
             })
@@ -17952,7 +20676,7 @@ async def _source_slice(container: AuditContainer, args: dict) -> str:
             }, indent=2, sort_keys=True)
     else:
         try:
-            discovered, _truncated = await _discover_action_source_files(
+            discovered, _truncated, _discovery = await _discover_action_source_files(
                 container,
                 root=root,
                 files=None,
@@ -18172,14 +20896,25 @@ def _profile_matches_focus(profile: dict, focus_contracts: set[str]) -> bool:
     return bool(values.intersection(focus_contracts))
 
 
+def _source_path_within_root(file_path: str, source_root: str) -> bool:
+    file_path = posixpath.normpath(str(file_path or "").strip())
+    source_root = posixpath.normpath(str(source_root or "").strip())
+    if not file_path or not source_root or source_root == ".":
+        return False
+    return file_path == source_root or file_path.startswith(source_root + "/")
+
+
 def _action_matches_profile(action: dict, profile: dict) -> bool:
     contract = str(action.get("contract") or "").strip().lower()
     profile_contract = str(profile.get("contract") or "").strip().lower()
-    if contract and profile_contract and contract == profile_contract:
-        return True
-    file_path = str(action.get("file") or "")
-    src_path = str(profile.get("src") or "").rstrip("/")
-    return bool(src_path and file_path.startswith(src_path + "/"))
+    file_path = str(action.get("file") or "").strip()
+    src_path = str(profile.get("src") or "").strip()
+    if src_path:
+        # A profile root is the hard identity boundary. Keep dependencies inside
+        # it for source-relation classification, but never pull in a same-named
+        # definition retained from another deployment/profile root.
+        return _source_path_within_root(file_path, src_path)
+    return bool(contract and profile_contract and contract == profile_contract)
 
 
 def _action_space_contract_bases(action_space: dict | None) -> dict[tuple[str, str], set[str]]:
@@ -18189,16 +20924,64 @@ def _action_space_contract_bases(action_space: dict | None) -> dict[tuple[str, s
     for contract in action_space.get("contracts") or []:
         if not isinstance(contract, dict):
             continue
-        file_path = str(contract.get("file") or "")
+        file_path = posixpath.normpath(str(contract.get("file") or "").strip())
         name = str(contract.get("name") or "").strip()
-        if not file_path or not name:
+        if not file_path or file_path == "." or not name:
             continue
         bases[(file_path, name.lower())] = {
             str(item).strip().lower()
             for item in contract.get("bases") or []
             if str(item).strip()
         }
+    # Some legacy/minimal action-space fixtures omit the contracts section.
+    # Action and observation definitions still establish source identity, but
+    # never invent inheritance edges.
+    for section in ("actions", "observations"):
+        for action in action_space.get(section) or []:
+            if not isinstance(action, dict):
+                continue
+            file_path = posixpath.normpath(
+                str(action.get("file") or "").strip()
+            )
+            name = str(action.get("contract") or "").strip().lower()
+            if file_path and file_path != "." and name:
+                bases.setdefault((file_path, name), set())
     return bases
+
+
+def _contract_definition_keys(
+    *,
+    contract_name: str,
+    source_root: str,
+    bases_by_contract: dict[tuple[str, str], set[str]],
+    definitions_by_name: dict[str, list[tuple[str, str]]] | None = None,
+) -> list[tuple[str, str]]:
+    name = str(contract_name or "").strip().lower()
+    if not name:
+        return []
+    candidates = (
+        (definitions_by_name or {}).get(name)
+        if definitions_by_name is not None
+        else [key for key in bases_by_contract if key[1] == name]
+    ) or []
+    return sorted(
+        key for key in candidates
+        if (
+            not source_root
+            or _source_path_within_root(key[0], source_root)
+        )
+    )
+
+
+def _contract_definitions_by_name(
+    bases_by_contract: dict[tuple[str, str], set[str]],
+) -> dict[str, list[tuple[str, str]]]:
+    definitions: dict[str, list[tuple[str, str]]] = {}
+    for key in bases_by_contract:
+        definitions.setdefault(key[1], []).append(key)
+    for entries in definitions.values():
+        entries.sort()
+    return definitions
 
 
 def _contract_inherits_contract(
@@ -18207,25 +20990,60 @@ def _contract_inherits_contract(
     child_contract: str,
     base_contract: str,
     bases_by_contract: dict[tuple[str, str], set[str]],
+    source_root: str = "",
+    definitions_by_name: dict[str, list[tuple[str, str]]] | None = None,
 ) -> bool:
     child = child_contract.strip().lower()
     target = base_contract.strip().lower()
     if not child or not target:
         return False
-    pending = list(bases_by_contract.get((file_path, child), set()))
-    seen = set()
+    file_path = posixpath.normpath(str(file_path or "").strip())
+    source_root = posixpath.normpath(str(source_root or "").strip())
+    if source_root == ".":
+        source_root = ""
+    if source_root and not _source_path_within_root(file_path, source_root):
+        return False
+    target_key = (file_path, target)
+    if target_key not in bases_by_contract:
+        return False
+    child_keys = _contract_definition_keys(
+        contract_name=child,
+        source_root=source_root,
+        bases_by_contract=bases_by_contract,
+        definitions_by_name=definitions_by_name,
+    )
+    if len(child_keys) != 1:
+        return False
+    pending = [child_keys[0]]
+    seen: set[tuple[str, str]] = set()
+    max_definitions = 128
     while pending:
-        name = pending.pop()
-        if name in seen:
+        definition = pending.pop()
+        if definition in seen:
             continue
-        seen.add(name)
-        if name == target:
+        seen.add(definition)
+        if len(seen) > max_definitions:
+            return False
+        if definition == target_key:
             return True
-        direct_bases = set(bases_by_contract.get((file_path, name), set()))
-        for (_contract_file, contract_name), base_names in bases_by_contract.items():
-            if contract_name == name:
-                direct_bases.update(base_names)
-        pending.extend(direct_bases - seen)
+        definition_file, _definition_name = definition
+        for base_name in sorted(bases_by_contract.get(definition) or set()):
+            candidates = _contract_definition_keys(
+                contract_name=base_name,
+                source_root=source_root,
+                bases_by_contract=bases_by_contract,
+                definitions_by_name=definitions_by_name,
+            )
+            same_file = [key for key in candidates if key[0] == definition_file]
+            resolved = (
+                same_file[0]
+                if len(same_file) == 1
+                else candidates[0]
+                if len(candidates) == 1
+                else None
+            )
+            if resolved is not None and resolved not in seen:
+                pending.append(resolved)
     return False
 
 
@@ -18234,6 +21052,7 @@ def _action_source_relation(
     profile: dict,
     *,
     bases_by_contract: dict[tuple[str, str], set[str]],
+    definitions_by_name: dict[str, list[tuple[str, str]]] | None = None,
 ) -> dict:
     action_contract = str(action.get("contract") or "").strip()
     profile_contract = str(profile.get("contract") or "").strip()
@@ -18247,9 +21066,35 @@ def _action_source_relation(
     if not action_contract or not profile_contract:
         relation["reasons"].append("missing action or profile contract")
         return relation
+    if src_path and not _source_path_within_root(file_path, src_path):
+        relation.update({"kind": "external_source", "executable_source": False})
+        relation["reasons"].append(
+            "action source file is outside the deployed profile source root"
+        )
+        return relation
     if action_contract.lower() == profile_contract.lower():
-        relation.update({"kind": "profile_contract", "executable_source": True})
-        relation["reasons"].append("action contract matches deployed profile contract")
+        profile_definitions = _contract_definition_keys(
+            contract_name=profile_contract,
+            source_root=src_path,
+            bases_by_contract=bases_by_contract,
+            definitions_by_name=definitions_by_name,
+        )
+        action_definition = (
+            posixpath.normpath(file_path), action_contract.lower()
+        )
+        if len(profile_definitions) == 1 and profile_definitions[0] == action_definition:
+            relation.update({"kind": "profile_contract", "executable_source": True})
+            relation["reasons"].append(
+                "action definition uniquely matches the deployed profile contract within its source root"
+            )
+            return relation
+        relation.update({
+            "kind": "ambiguous_profile_source",
+            "executable_source": False,
+        })
+        relation["reasons"].append(
+            "same-named action definition is not unique within the deployed profile source root"
+        )
         return relation
     if action.get("contract_kind") == "interface":
         relation.update({"kind": "source_interface_only", "executable_source": False})
@@ -18259,12 +21104,14 @@ def _action_source_relation(
         relation.update({"kind": "source_library_only", "executable_source": False})
         relation["reasons"].append("action is declared on a library, not the deployed profile contract")
         return relation
-    if src_path and file_path.startswith(src_path + "/"):
+    if src_path and _source_path_within_root(file_path, src_path):
         if _contract_inherits_contract(
             file_path=file_path,
             child_contract=profile_contract,
             base_contract=action_contract,
             bases_by_contract=bases_by_contract,
+            source_root=src_path,
+            definitions_by_name=definitions_by_name,
         ):
             relation.update({"kind": "inherited_base", "executable_source": True})
             relation["reasons"].append("action contract is inherited by deployed profile contract")
@@ -18274,8 +21121,10 @@ def _action_source_relation(
             "action is from another contract in the same source root but is not inherited by the deployed profile contract"
         )
         return relation
-    relation.update({"kind": "external_source", "executable_source": False})
-    relation["reasons"].append("action source file is outside the deployed profile source root")
+    relation.update({"kind": "unresolved_source_identity", "executable_source": False})
+    relation["reasons"].append(
+        "profile source root is unavailable, so executable source identity cannot be resolved"
+    )
     return relation
 
 
@@ -18301,6 +21150,52 @@ def _action_signature(action: dict) -> str:
     return f"{function}({','.join(parameter_types)})"
 
 
+def _action_signature_hint(action: dict) -> str:
+    signature = str(action.get("signature") or "").strip()
+    source = action.get("source") if isinstance(action.get("source"), dict) else {}
+    signature = signature or str(source.get("signature") or "").strip()
+    if not signature:
+        action_key = str(action.get("action_key") or action.get("key") or "").strip()
+        _contract, separator, tail = action_key.partition("::")
+        if separator and "(" in tail:
+            signature = tail
+    return re.sub(r"\s+", "", signature).lower()
+
+
+def _explicit_action_signature_hint(action: dict) -> str:
+    """Return an exact signature only when the action explicitly supplies one.
+
+    Sequence steps often carry typed ``parameters`` without a separate
+    ``signature`` field. Treat those types as an exact overload selector, but
+    do not infer a signature from argument expressions alone because their
+    Solidity types are not reliably knowable at scaffold time.
+    """
+    signature = _action_signature_hint(action)
+    if signature:
+        return signature
+    if "parameters" not in action:
+        return ""
+    parameters = action.get("parameters")
+    if not isinstance(parameters, list):
+        return ""
+    parameter_types = []
+    for parameter in parameters:
+        if not isinstance(parameter, dict):
+            return ""
+        parameter_type = _parameter_type(
+            str(parameter.get("raw") or parameter.get("type") or "")
+        )
+        if not parameter_type:
+            return ""
+        parameter_types.append(parameter_type)
+    function = str(action.get("function") or "").strip()
+    if not function:
+        return ""
+    return re.sub(
+        r"\s+", "", f"{function}({','.join(parameter_types)})"
+    ).lower()
+
+
 def _action_arg_names(action: dict) -> list[str]:
     names = []
     for index, param in enumerate(action.get("parameters") or [], start=1):
@@ -18312,7 +21207,33 @@ def _action_arg_names(action: dict) -> list[str]:
 
 
 def _action_logical_key(action: dict) -> str:
-    return _coverage_action_key(action)
+    explicit = str(action.get("action_key") or "").strip()
+    if explicit:
+        return explicit
+    contract = str(action.get("contract") or "").strip()
+    function = str(action.get("function") or "").strip()
+    return f"{contract}::{function}" if contract else function
+
+
+def _action_signature_key(action: dict) -> str:
+    contract = str(action.get("contract") or "").strip()
+    signature = str(action.get("signature") or "").strip()
+    source = action.get("source") if isinstance(action.get("source"), dict) else {}
+    signature = signature or str(source.get("signature") or "").strip()
+    signature = re.sub(r"\s+", "", signature) if signature else _action_signature(action)
+    return f"{contract}::{signature}" if contract else signature
+
+
+def _action_identity_aliases(action: dict) -> set[str]:
+    """Legacy display key plus precise definition aliases for safe joins."""
+    aliases = {
+        str(action.get("action_key") or "").strip(),
+        str(action.get("action_definition_key") or "").strip(),
+        _action_logical_key(action),
+        _action_signature_key(action),
+        _coverage_action_key(action),
+    }
+    return {alias for alias in aliases if alias}
 
 
 def _live_reachability_clone_family_key(
@@ -18341,11 +21262,11 @@ def _live_reachability_clone_family_key(
 
 def _action_stable_uid(action: dict) -> str:
     file_part = str(action.get("file") or "").strip()
-    line = str(action.get("line") or "").strip()
+    line = str(action.get("line") or action.get("start_line") or "").strip()
     return ":".join(
         item for item in (
             file_part,
-            _coverage_action_key(action),
+            _action_signature_key(action),
             line,
         )
         if item
@@ -19110,7 +22031,15 @@ async def _inventory_live_targets(
         address = _inventory_target_address(item)
         if not _solidity_address_literal(address):
             return f"Error: targets[{index}] has invalid address"
-        key = address.lower()
+        network, chain_id = _canonical_chain(
+            item.get("network"), item.get("chain_id")
+        )
+        normalized_target = {
+            "target_address": address,
+            "network": network,
+            "chain_id": chain_id,
+        }
+        key = _chain_qualified_target_identity(normalized_target)
         if key in seen:
             continue
         seen.add(key)
@@ -19122,6 +22051,8 @@ async def _inventory_live_targets(
             "contract": item.get("contract"),
             "kind": item.get("kind"),
             "address": address,
+            "network": network,
+            "chain_id": chain_id,
             "selectors": [
                 str(selector) for selector in selectors
                 if str(selector).strip()
@@ -19141,6 +22072,8 @@ async def _inventory_live_targets(
             {
                 "address": target["address"],
                 "names": [target.get("contract"), target.get("label")],
+                "network": target.get("network"),
+                "chain_id": target.get("chain_id"),
             }
             for target in targets
         ],
@@ -19196,7 +22129,7 @@ async def _inventory_live_targets(
                     "rpc_not_configured" if status == "grouped" else "chain_unresolved"
                 ),
             })
-        return {
+        entry = {
             **target,
             "network": assignment.get("network"),
             "chain_id": assignment.get("chain_id"),
@@ -19204,6 +22137,8 @@ async def _inventory_live_targets(
             "rpc_endpoint": _rpc_endpoint_summary(endpoint) if group else None,
             "probe": probe,
         }
+        entry["target_identity"] = _chain_qualified_target_metadata(entry)
+        return entry
 
     async def _probe_bounded(
         semaphore: asyncio.Semaphore,
@@ -19323,6 +22258,7 @@ async def _inventory_live_targets(
             "network": entry.get("network"),
             "chain_id": entry.get("chain_id"),
             "chain_status": entry.get("chain_status"),
+            "target_identity": entry.get("target_identity"),
             "code_present": probe.get("code_present"),
             "rpc_available": probe.get("rpc_available"),
             "skipped": probe.get("skipped"),
@@ -19416,11 +22352,15 @@ def _compact_exposure_entry(exposure: dict) -> dict:
     authority_probe = exposure.get("authority_probe") or {}
     compact = {
         "action_key": exposure.get("action_key"),
+        "action_definition_key": exposure.get("action_definition_key"),
         "contract": exposure.get("contract"),
         "contract_kind": exposure.get("contract_kind"),
         "function": exposure.get("function"),
         "signature": exposure.get("signature"),
         "target_address": exposure.get("target_address"),
+        "network": exposure.get("network"),
+        "chain_id": exposure.get("chain_id"),
+        "target_identity": exposure.get("target_identity"),
         "profile_contract": exposure.get("profile_contract"),
         "file": exposure.get("file"),
         "line": exposure.get("line"),
@@ -19471,6 +22411,7 @@ def _compact_profile_reachability(profile: dict, *, max_exposures: int) -> dict:
             "network": profile.get("network"),
             "chain_id": profile.get("chain_id"),
             "chain_status": profile.get("chain_status"),
+            "target_identity": profile.get("target_identity"),
             "priority_score": profile.get("priority_score"),
             "tags": profile.get("tags") or [],
             "probe": _compact_probe_summary(profile.get("probe") or {}),
@@ -19596,6 +22537,222 @@ async def _load_latest_artifact(
     return "", None
 
 
+def _addressed_scope_profiles(
+    manifest: dict,
+    focus_contracts: set[str],
+) -> list[dict]:
+    return [
+        profile
+        for profile in manifest.get("ranked_profiles") or []
+        if isinstance(profile, dict)
+        and profile.get("address")
+        and _profile_matches_focus(profile, focus_contracts)
+    ]
+
+
+def _live_profile_scope_batch(
+    profiles: list[dict],
+    *,
+    manifest_path: str,
+    focus_contracts: set[str],
+    cursor: int,
+    limit: int,
+) -> tuple[list[dict], dict]:
+    identities = [
+        {
+            "profile": profile.get("profile"),
+            "contract": profile.get("contract"),
+            "address": str(profile.get("address") or "").lower(),
+            "src": profile.get("src"),
+            "chain_key": _chain_qualified_target_identity(profile)[0],
+        }
+        for profile in profiles
+    ]
+    if cursor < 0 or cursor > len(profiles):
+        raise ValueError(
+            f"profile_cursor must be between 0 and {len(profiles)} for this scope"
+        )
+    end = min(cursor + max(limit, 1), len(profiles))
+    return profiles[cursor:end], {
+        "kind": "addressed_profiles",
+        "scope_manifest_path": manifest_path,
+        "scope_fingerprint": _scope_batch_fingerprint(identities),
+        "full_scope": not focus_contracts,
+        "focus_contracts": sorted(focus_contracts),
+        "cursor": cursor,
+        "limit": max(limit, 1),
+        "selected_count": max(0, end - cursor),
+        "total_items": len(profiles),
+        "processed_through": end,
+        "remaining_items": max(0, len(profiles) - end),
+        "has_more": end < len(profiles),
+        "next_cursor": end if end < len(profiles) else None,
+    }
+
+
+def _live_profile_identity(
+    profile: dict,
+    concrete_chains_by_address: dict[str, set[str]] | None = None,
+) -> tuple[str, str, str, str]:
+    chain_key, address = (
+        _coherent_target_identity(
+            profile, concrete_chains_by_address or {}
+        )
+        or _chain_qualified_target_identity(profile)
+    )
+    return (
+        str(profile.get("profile") or ""),
+        chain_key,
+        address,
+        str(profile.get("src") or ""),
+    )
+
+
+def _merge_live_profiles(previous: list[dict], current: list[dict]) -> list[dict]:
+    merged: dict[tuple[str, str, str, str], dict] = {}
+    profiles = [
+        profile for profile in [*previous, *current]
+        if isinstance(profile, dict)
+    ]
+    concrete_chains_by_address = _concrete_target_chains_by_address(profiles)
+    for profile in [*previous, *current]:
+        if not isinstance(profile, dict):
+            continue
+        merged[_live_profile_identity(
+            profile, concrete_chains_by_address
+        )] = profile
+    return list(merged.values())
+
+
+def _hydrate_live_exposure_action_facts(
+    live_reachability: dict | None,
+    action_space: dict | None,
+) -> int:
+    """Join source causal facts into live exposures in memory.
+
+    Live artifacts retain deployment/gate/binding facts and stable source keys;
+    the cumulative action-space artifact remains authoritative for source causal
+    facts.  Joining during attack-graph construction avoids serializing the same
+    causal payload once per deployed clone/address.
+    """
+    if not isinstance(live_reachability, dict) or not isinstance(action_space, dict):
+        return 0
+    by_uid: dict[str, dict] = {}
+    by_definition: dict[tuple[str, str], dict] = {}
+    logical_groups: dict[tuple[str, str, str], list[dict]] = {}
+    for action in action_space.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        uid = _action_stable_uid(action)
+        if uid:
+            by_uid[uid] = action
+        key = (
+            str(action.get("file") or "").strip(),
+            _action_signature_key(action),
+        )
+        by_definition[key] = action
+        logical_groups.setdefault((
+            str(action.get("file") or "").strip(),
+            str(action.get("contract") or "").strip(),
+            str(action.get("function") or "").strip(),
+        ), []).append(action)
+
+    joined = 0
+    for profile in live_reachability.get("profiles") or []:
+        if not isinstance(profile, dict):
+            continue
+        for exposure in profile.get("action_exposures") or []:
+            if not isinstance(exposure, dict) or exposure.get("causal_facts"):
+                continue
+            action = by_uid.get(str(exposure.get("action_uid") or ""))
+            if action is None:
+                action = by_definition.get((
+                    str(exposure.get("file") or "").strip(),
+                    str(exposure.get("action_definition_key") or "").strip(),
+                ))
+            if action is None:
+                logical = logical_groups.get((
+                    str(exposure.get("file") or "").strip(),
+                    str(exposure.get("contract") or "").strip(),
+                    str(exposure.get("function") or "").strip(),
+                )) or []
+                if len(logical) == 1:
+                    action = logical[0]
+            facts = (action or {}).get("causal_facts") or {}
+            if not facts:
+                continue
+            exposure["causal_facts"] = facts
+            joined += 1
+    return joined
+
+
+def _merge_live_chain_blocks(previous: list[dict], current: list[dict]) -> list[dict]:
+    merged: dict[str, dict] = {}
+    order = []
+    for raw in [*previous, *current]:
+        if not isinstance(raw, dict):
+            continue
+        key = str(raw.get("key") or "") or (
+            f"{raw.get('network') or ''}:{raw.get('chain_id') or ''}"
+        )
+        if key not in merged:
+            merged[key] = {**raw, "key": key, "targets": []}
+            order.append(key)
+        block = merged[key]
+        block["configured"] = bool(block.get("configured") or raw.get("configured"))
+        if not block.get("rpc_endpoint") and raw.get("rpc_endpoint"):
+            block["rpc_endpoint"] = raw.get("rpc_endpoint")
+        block["targets"] = _merge_unique_strings(
+            block.get("targets"),
+            raw.get("targets"),
+        )
+    return [merged[key] for key in order]
+
+
+def _merge_live_records(previous: list[dict], current: list[dict]) -> list[dict]:
+    merged = []
+    seen = set()
+    for record in [*previous, *current]:
+        if not isinstance(record, dict):
+            continue
+        key = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(record)
+    return merged
+
+
+def _live_profile_probe_summary(
+    profiles: list[dict],
+    *,
+    probe_concurrency: int,
+) -> dict:
+    summary = {
+        "profiles": len(profiles),
+        "probed": 0,
+        "rpc_missing": 0,
+        "code_present": 0,
+        "no_code": 0,
+        "unknown_code": 0,
+        "probe_concurrency": probe_concurrency,
+    }
+    for profile in profiles:
+        probe = profile.get("probe") or {}
+        if probe.get("executed"):
+            summary["probed"] += 1
+        if probe.get("rpc_available") is False:
+            summary["rpc_missing"] += 1
+        code_present = probe.get("code_present")
+        if code_present is True:
+            summary["code_present"] += 1
+        elif code_present is False:
+            summary["no_code"] += 1
+        else:
+            summary["unknown_code"] += 1
+    return summary
+
+
 async def _map_live_reachability(
     container: AuditContainer,
     args: dict,
@@ -19610,7 +22767,8 @@ async def _map_live_reachability(
             for item in _require_list(args.get("focus_contracts"), "focus_contracts")
             if str(item).strip()
         }
-    except ValueError as exc:
+        profile_cursor = int(args.get("profile_cursor", 0) or 0)
+    except (TypeError, ValueError) as exc:
         return f"Error: {exc}"
 
     max_profiles = min(max(int(args.get("max_profiles", 25)), 1), 100)
@@ -19625,6 +22783,56 @@ async def _map_live_reachability(
     except FileNotFoundError as exc:
         return f"Error: scope manifest not found: {exc}"
 
+    all_profiles = _addressed_scope_profiles(manifest, focus_contracts)
+    try:
+        profiles, scope_batch = _live_profile_scope_batch(
+            all_profiles,
+            manifest_path=manifest_path,
+            focus_contracts=focus_contracts,
+            cursor=profile_cursor,
+            limit=max_profiles,
+        )
+    except ValueError as exc:
+        return f"Error: {exc}"
+    if profile_cursor and not profiles:
+        return (
+            "Error: profile_cursor is already at the end of the scope; use the "
+            "previous cumulative live-reachability artifact"
+        )
+
+    previous_ref = str(args.get("previous_live_reachability") or "").strip()
+    previous_path = ""
+    previous_live_reachability = None
+    if profile_cursor:
+        if not previous_ref:
+            return (
+                "Error: previous_live_reachability is required when "
+                "profile_cursor > 0"
+            )
+        try:
+            previous_path, previous_live_reachability = await _load_latest_artifact(
+                container,
+                state,
+                explicit=previous_ref,
+                directory="/workspace/campaign/live-reachability",
+                id_prefix="lr",
+            )
+        except FileNotFoundError as exc:
+            return f"Error: {exc}"
+        parent_error = _scope_batch_parent_error(
+            previous_live_reachability or {},
+            kind="addressed_profiles",
+            cursor=profile_cursor,
+            fingerprint=str(scope_batch.get("scope_fingerprint") or ""),
+        )
+        if parent_error:
+            return f"Error: {parent_error}"
+    elif previous_ref:
+        return (
+            "Error: previous_live_reachability is only valid for "
+            "profile_cursor > 0"
+        )
+
     action_space_path = ""
     action_space = None
     action_space_ref = str(args.get("action_space") or "").strip()
@@ -19637,31 +22845,73 @@ async def _map_live_reachability(
         except (FileNotFoundError, ValueError) as exc:
             return f"Error: {exc}"
     else:
-        try:
-            action_space_path, action_space = await _load_latest_artifact(
-                container,
+        known_action_spaces = await _collapse_scope_batch_series_paths(
+            container,
+            _progress_evidence_paths(
                 state,
-                explicit="",
-                directory="/workspace/campaign/action-spaces",
-                id_prefix="as",
+                "/workspace/campaign/action-spaces/",
+            ),
+        )
+        action_space_path, action_space = await _latest_full_scope_action_space(
+            container,
+            known_action_spaces,
+        )
+        if not action_space_path and known_action_spaces:
+            action_space_path = known_action_spaces[-1]
+            action_space = await _load_campaign_json_if_exists(
+                container,
+                action_space_path,
             )
-        except FileNotFoundError:
-            action_space_path, action_space = "", None
 
     actions = (action_space or {}).get("actions") or []
     bases_by_contract = _action_space_contract_bases(action_space)
+    definitions_by_name = _contract_definitions_by_name(bases_by_contract)
     execute_probes = bool(args.get("execute_probes", True))
-    profiles = []
-    for profile in manifest.get("ranked_profiles") or []:
-        if not isinstance(profile, dict):
-            continue
-        if not profile.get("address"):
-            continue
-        if not _profile_matches_focus(profile, focus_contracts):
-            continue
-        profiles.append(profile)
-        if len(profiles) >= max_profiles:
-            break
+    parent_batch = (previous_live_reachability or {}).get("scope_batch") or {}
+    continuation_args = {
+        "scope_manifest": manifest_path,
+        "action_space": action_space_path or None,
+        "focus_contracts": sorted(focus_contracts),
+        "execute_probes": execute_probes,
+        "max_profiles": max_profiles,
+        "probe_concurrency": probe_concurrency,
+    }
+    for key in ("network", "chain_id", "fork_context", "chain_registry"):
+        if args.get(key) not in (None, ""):
+            continuation_args[key] = args.get(key)
+    continuation_args = {
+        key: value
+        for key, value in continuation_args.items()
+        if value not in (None, "", [])
+    }
+    if (
+        previous_live_reachability
+        and (parent_batch.get("continuation_args") or {}) != continuation_args
+    ):
+        return (
+            "Error: batch configuration changed since the previous artifact; "
+            "use its scope_batch.continuation_args or restart at profile_cursor=0"
+        )
+    scope_batch = {
+        **scope_batch,
+        "series_id": parent_batch.get("series_id"),
+        "parent_live_reachability": previous_path or None,
+        "selected_profiles": [
+            {
+                "profile": profile.get("profile"),
+                "contract": profile.get("contract"),
+                "address": profile.get("address"),
+                "network": profile.get("network"),
+                "chain_id": profile.get("chain_id"),
+            }
+            for profile in profiles
+        ],
+        # The cumulative `profiles` section is already the durable processed
+        # inventory. Repeating that growing list inside scope_batch made every
+        # immutable continuation snapshot needlessly larger.
+        "processed_profile_count": scope_batch.get("processed_through"),
+        "continuation_args": continuation_args,
+    }
 
     # Group profiles by their resolved chain and derive a per-chain endpoint;
     # never collapse a multi-chain scope onto one global ETH_RPC_URL.
@@ -19674,6 +22924,8 @@ async def _map_live_reachability(
             {
                 "address": str(profile.get("address") or "").strip(),
                 "names": [profile.get("contract"), profile.get("profile")],
+                "network": profile.get("network"),
+                "chain_id": profile.get("chain_id"),
             }
             for profile in profiles
         ],
@@ -19785,21 +23037,29 @@ async def _map_live_reachability(
             for index, profile in enumerate(profiles)
         ]
 
-    for index, (profile, (probe, summary_delta)) in enumerate(
-        zip(profiles, probe_results, strict=True)
-    ):
-        assignment, group, endpoint, rpc_url = _profile_chain(index)
-        for key in ("probed", "rpc_missing", "code_present", "no_code", "unknown_code"):
-            probe_summary[key] += int(summary_delta.get(key) or 0)
-        address = str(profile.get("address") or "").strip()
-        matched_actions = [
-            action for action in actions
+    # The source/profile join is deterministic and independent of RPC results.
+    # Precompute it once so the optional authority probes can run as a second
+    # bounded batch instead of serially inside profile assembly.
+    matched_actions_by_profile = [
+        [
+            action
+            for action in actions
             if isinstance(action, dict) and _action_matches_profile(action, profile)
         ]
-        authority_decisions: dict[str, bool] = {}
+        for profile in profiles
+    ]
+
+    async def _probe_profile_authority(
+        index: int,
+        profile: dict,
+        probe: dict,
+        matched_actions: list[dict],
+    ) -> dict:
+        _assignment, _group, _endpoint, rpc_url = _profile_chain(index)
         authority = str((probe.get("values") or {}).get("authority") or "").strip()
-        authority_probe_actions = [
-            action for action in matched_actions
+        authority_actions = [
+            action
+            for action in matched_actions
             if (
                 _classify_action_reachability(action).get("kind")
                 in {"role_gated", "sender_checked", "cross_domain_or_sender_gated"}
@@ -19810,34 +23070,100 @@ async def _map_live_reachability(
                 )
             )
         ]
-        if (
+        if not (
             execute_probes
             and rpc_url
             and probe.get("code_present") is True
             and authority
             and not _zero_address(authority)
-            and authority_probe_actions
+            and authority_actions
         ):
-            exit_code, output = await container.exec(
-                _authority_probe_command(
-                    target=address,
-                    authority=authority,
-                    actions=authority_probe_actions,
-                    rpc_url=rpc_url,
-                ),
-                timeout=45,
-            )
-            authority_decisions = _parse_authority_probe_output(
+            return {}
+        address = str(profile.get("address") or "").strip()
+        exit_code, output = await container.exec(
+            _authority_probe_command(
+                target=address,
+                authority=authority,
+                actions=authority_actions,
+                rpc_url=rpc_url,
+            ),
+            timeout=45,
+        )
+        return {
+            "executed": True,
+            "exit_code": exit_code,
+            "authority": authority,
+            "attacker": _AUTHORITY_PROBE_ATTACKER,
+            "decisions": _parse_authority_probe_output(
                 output,
-                authority_probe_actions,
+                authority_actions,
+            ),
+        }
+
+    async def _probe_profile_authority_bounded(
+        semaphore: asyncio.Semaphore,
+        index: int,
+        profile: dict,
+        probe: dict,
+        matched_actions: list[dict],
+    ) -> dict:
+        async with semaphore:
+            return await _probe_profile_authority(
+                index,
+                profile,
+                probe,
+                matched_actions,
             )
-            probe["authority_probe"] = {
-                "executed": True,
-                "exit_code": exit_code,
-                "authority": authority,
-                "attacker": _AUTHORITY_PROBE_ATTACKER,
-                "decisions": authority_decisions,
-            }
+
+    if execute_probes and profiles:
+        authority_semaphore = asyncio.Semaphore(probe_concurrency)
+        authority_probe_results = await asyncio.gather(
+            *(
+                _probe_profile_authority_bounded(
+                    authority_semaphore,
+                    index,
+                    profile,
+                    probe_result[0],
+                    matched_actions,
+                )
+                for index, (profile, probe_result, matched_actions) in enumerate(
+                    zip(
+                        profiles,
+                        probe_results,
+                        matched_actions_by_profile,
+                        strict=True,
+                    )
+                )
+            ),
+        )
+    else:
+        authority_probe_results = [{} for _profile in profiles]
+
+    profile_results = zip(
+        profiles,
+        probe_results,
+        matched_actions_by_profile,
+        authority_probe_results,
+        strict=True,
+    )
+    for index, (
+        profile,
+        (probe, summary_delta),
+        matched_actions,
+        profile_authority_probe,
+    ) in enumerate(profile_results):
+        assignment, group, endpoint, rpc_url = _profile_chain(index)
+        for key in ("probed", "rpc_missing", "code_present", "no_code", "unknown_code"):
+            probe_summary[key] += int(summary_delta.get(key) or 0)
+        address = str(profile.get("address") or "").strip()
+        authority_decisions = profile_authority_probe.get("decisions") or {}
+        authority = str(
+            profile_authority_probe.get("authority")
+            or (probe.get("values") or {}).get("authority")
+            or ""
+        ).strip()
+        if profile_authority_probe:
+            probe["authority_probe"] = profile_authority_probe
 
         target_binding = _live_target_binding(probe, profile=profile)
         action_exposures = []
@@ -19869,6 +23195,7 @@ async def _map_live_reachability(
                 action,
                 profile,
                 bases_by_contract=bases_by_contract,
+                definitions_by_name=definitions_by_name,
             )
             code_present = probe.get("code_present")
             if code_present is False:
@@ -19897,6 +23224,7 @@ async def _map_live_reachability(
                 exposure = "unknown"
             action_exposures.append({
                 "action_key": _action_logical_key(action),
+                "action_definition_key": _action_signature_key(action),
                 "action_uid": action_uid,
                 "contract": action.get("contract"),
                 "contract_kind": action.get("contract_kind"),
@@ -19916,6 +23244,13 @@ async def _map_live_reachability(
                 "live_status": live_status,
                 "exposure": exposure,
                 "target_address": address,
+                "network": assignment.get("network"),
+                "chain_id": assignment.get("chain_id"),
+                "target_identity": _chain_qualified_target_metadata({
+                    "target_address": address,
+                    "network": assignment.get("network"),
+                    "chain_id": assignment.get("chain_id"),
+                }),
                 "target_binding": target_binding,
                 "code_hash": (probe.get("values") or {}).get("code_sha256_16"),
                 "clone_family_key": _live_reachability_clone_family_key(
@@ -19937,6 +23272,11 @@ async def _map_live_reachability(
             "network": assignment.get("network"),
             "chain_id": assignment.get("chain_id"),
             "chain_status": assignment.get("status"),
+            "target_identity": _chain_qualified_target_metadata({
+                "address": address,
+                "network": assignment.get("network"),
+                "chain_id": assignment.get("chain_id"),
+            }),
             "rpc_endpoint": _rpc_endpoint_summary(endpoint) if group else None,
             "probe": probe,
             "target_binding": target_binding,
@@ -19957,16 +23297,7 @@ async def _map_live_reachability(
             },
         })
 
-    profile_families = _profile_families(mapped_profiles)
-    target_binding_counts: dict[str, int] = {}
-    for mapped_profile in mapped_profiles:
-        binding_kind = str(
-            (mapped_profile.get("target_binding") or {}).get("kind") or "unknown"
-        )
-        target_binding_counts[binding_kind] = (
-            target_binding_counts.get(binding_kind, 0) + 1
-        )
-    grouping = _summarize_live_probe_chains(
+    current_grouping = _summarize_live_probe_chains(
         assignments=assignments,
         groups=groups,
         entries=mapped_profiles,
@@ -19976,7 +23307,54 @@ async def _map_live_reachability(
             "address": str(profiles[index].get("address") or "").strip(),
         },
     )
+    previous_profiles = list(
+        (previous_live_reachability or {}).get("profiles") or []
+    )
+    mapped_profiles = _merge_live_profiles(previous_profiles, mapped_profiles)
+    profile_families = _profile_families(mapped_profiles)
+    probe_summary = _live_profile_probe_summary(
+        mapped_profiles,
+        probe_concurrency=probe_concurrency if execute_probes else 0,
+    )
+    target_binding_counts: dict[str, int] = {}
+    for mapped_profile in mapped_profiles:
+        binding_kind = str(
+            (mapped_profile.get("target_binding") or {}).get("kind") or "unknown"
+        )
+        target_binding_counts[binding_kind] = (
+            target_binding_counts.get(binding_kind, 0) + 1
+        )
+    chains = _merge_live_chain_blocks(
+        list((previous_live_reachability or {}).get("chains") or []),
+        current_grouping["chains"],
+    )
+    ambiguous_targets = _merge_live_records(
+        list(
+            (previous_live_reachability or {}).get("ambiguous_targets") or []
+        ),
+        current_grouping["ambiguous_targets"],
+    )
+    skipped_targets = _merge_live_records(
+        list((previous_live_reachability or {}).get("skipped_targets") or []),
+        current_grouping["skipped_targets"],
+    )
+    probed_chain_refs = {
+        (profile.get("network"), profile.get("chain_id"))
+        for profile in mapped_profiles
+        if (profile.get("probe") or {}).get("executed")
+    }
+    grouping = {
+        "chains": chains,
+        "chains_probed": [
+            block
+            for block in chains
+            if (block.get("network"), block.get("chain_id")) in probed_chain_refs
+        ],
+        "ambiguous_targets": ambiguous_targets,
+        "skipped_targets": skipped_targets,
+    }
     reachability_id = _next_campaign_id(state, "live_reachability")
+    scope_batch["series_id"] = parent_batch.get("series_id") or reachability_id
     title = str(args.get("title") or "Live reachability map").strip()
     payload = {
         "id": reachability_id,
@@ -19987,6 +23365,7 @@ async def _map_live_reachability(
         "execute_probes": execute_probes,
         "probe_concurrency": probe_concurrency if execute_probes else 0,
         "filters": {"focus_contracts": sorted(focus_contracts)},
+        "scope_batch": scope_batch,
         "profiles": mapped_profiles,
         "profile_families": profile_families,
         "chains": grouping["chains"],
@@ -20035,7 +23414,10 @@ async def _map_live_reachability(
                 if item["exposure"] == "source_artifact_only"
             ),
         },
-        "related_ids": [str(item) for item in related_ids],
+        "related_ids": _merge_unique_strings(
+            (previous_live_reachability or {}).get("related_ids"),
+            [str(item) for item in related_ids],
+        ),
     }
     path = f"/workspace/campaign/live-reachability/{reachability_id}.json"
     await container.write_file(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -20083,6 +23465,7 @@ async def _map_live_reachability(
         "live_reachability_id": reachability_id,
         "path": path,
         "result_id": result_id or None,
+        "scope_batch": scope_batch,
         "summary": payload["summary"],
         "chains_probed": [
             _compact_chain_block(block) for block in grouping["chains_probed"]
@@ -20368,7 +23751,14 @@ def _candidate_action_from_exposure(exposure: dict) -> dict:
         "actor": "attacker",
         "contract": exposure.get("contract"),
         "function": exposure.get("function"),
+        "signature": exposure.get("signature"),
         "target": exposure.get("target_address"),
+        "network": exposure.get("network"),
+        "chain_id": exposure.get("chain_id"),
+        "target_identity": (
+            exposure.get("target_identity")
+            or _chain_qualified_target_metadata(exposure)
+        ),
         "args": _action_arg_names(exposure),
         "expected_effect": _attack_graph_objective(exposure),
         "bounds": "derive from live balances, caps, fees, and authorization constraints",
@@ -20376,6 +23766,7 @@ def _candidate_action_from_exposure(exposure: dict) -> dict:
         "live_status": exposure.get("live_status"),
         "target_binding": exposure.get("target_binding"),
         "action_key": exposure.get("action_key"),
+        "action_definition_key": exposure.get("action_definition_key"),
         "action_uid": exposure.get("action_uid"),
         "clone_family_key": exposure.get("clone_family_key"),
         "affordances": exposure.get("affordances") or [],
@@ -20432,14 +23823,31 @@ def _exposure_is_live_callable(exposure: dict) -> bool:
     )
 
 
+def _attack_graph_action_identity(exposure: dict) -> str:
+    """Exact source-action identity, with legacy definition fallback."""
+    return str(
+        exposure.get("action_uid")
+        or exposure.get("action_definition_key")
+        or exposure.get("action_key")
+        or ""
+    ).strip()
+
+
 def _attack_graph_candidate_dedupe_key(exposure: dict) -> str:
-    action_key = str(exposure.get("action_key") or "").strip().lower()
+    action_identity = _attack_graph_action_identity(exposure).lower()
     reachability = str((exposure.get("reachability") or {}).get("kind") or "").strip()
     exposure_status = str(exposure.get("exposure") or "").strip()
     profile_contract = str(
         exposure.get("profile_contract") or exposure.get("contract") or ""
     ).strip().lower()
-    return "|".join([profile_contract, action_key, reachability, exposure_status])
+    legacy_key = "|".join([
+        profile_contract,
+        action_identity,
+        reachability,
+        exposure_status,
+    ])
+    chain_key, _address = _chain_qualified_target_identity(exposure)
+    return f"{chain_key}|{legacy_key}" if chain_key else legacy_key
 
 
 def _exposure_function(exposure: dict) -> str:
@@ -20553,6 +23961,9 @@ def _unique_lending_market_targets(exposures: list[dict], *, limit: int = 10) ->
         markets.append({
             "contract": exposure.get("contract"),
             "address": address,
+            "network": exposure.get("network"),
+            "chain_id": exposure.get("chain_id"),
+            "target_identity": _chain_qualified_target_metadata(exposure),
             "profile_action": exposure.get("action_key"),
             "code_context": exposure.get("file"),
         })
@@ -20749,7 +24160,7 @@ def _economic_exposure_callable(exposure: dict) -> bool:
 
 
 def _economic_group_key(exposure: dict) -> tuple[str, str]:
-    address = str(exposure.get("target_address") or "").strip().lower()
+    address = _chain_qualified_target_key(exposure)
     contract = _exposure_profile_contract(exposure)
     return address, contract
 
@@ -20757,10 +24168,11 @@ def _economic_group_key(exposure: dict) -> tuple[str, str]:
 def _economic_exposure_identity(exposure: dict | None) -> str:
     if not exposure:
         return ""
-    return ":".join(
-        str(exposure.get(key) or "").strip().lower()
-        for key in ("action_uid", "action_key", "target_address")
-    )
+    return ":".join([
+        str(exposure.get("action_uid") or "").strip().lower(),
+        str(exposure.get("action_key") or "").strip().lower(),
+        _chain_qualified_target_key(exposure),
+    ])
 
 
 def _economic_best_exposure(exposures: list[dict], role: str) -> dict | None:
@@ -20889,6 +24301,7 @@ def _economic_chain_candidate(
     protocol_graph_path: str,
     focus: str,
 ) -> dict:
+    chain_source = extraction or setup
     contract = str(
         extraction.get("profile_contract")
         or extraction.get("contract")
@@ -20909,7 +24322,13 @@ def _economic_chain_candidate(
             "Perturb accounting, valuation, message, or market state before extracting value.",
         ))
     elif motif in {"vault_share_inflation", "oracle_market_valuation"}:
-        actions.append(_economic_synthetic_donation_action(contract, target))
+        donation_action = _economic_synthetic_donation_action(contract, target)
+        donation_action.update({
+            "network": chain_source.get("network"),
+            "chain_id": chain_source.get("chain_id"),
+            "target_identity": _chain_qualified_target_metadata(chain_source),
+        })
+        actions.append(donation_action)
     actions.append(
         _economic_chain_action(
             extraction,
@@ -20925,8 +24344,9 @@ def _economic_chain_candidate(
     )
     action_key = f"Economic::{motif}::{contract}"
     title = f"Test {motif.replace('_', ' ')} chain on {contract}"
+    target_key = _chain_qualified_target_key(chain_source)
     return {
-        "attack_key": f"economic:{motif}:{target.lower() or contract.lower()}",
+        "attack_key": f"economic:{motif}:{target_key or contract.lower()}",
         "title": title,
         "priority_score": score,
         "priority": _plan_priority(score),
@@ -20937,6 +24357,9 @@ def _economic_chain_candidate(
             for action in actions
         ),
         "target_address": target,
+        "network": chain_source.get("network"),
+        "chain_id": chain_source.get("chain_id"),
+        "target_identity": _chain_qualified_target_metadata(chain_source),
         "exposure": extraction.get("exposure"),
         "reachability": extraction.get("reachability"),
         "target_binding": extraction.get("target_binding") or setup.get("target_binding"),
@@ -20966,6 +24389,11 @@ def _economic_chain_candidate(
                 str((perturbation or {}).get("target_address") or ""),
                 str(extraction.get("target_address") or ""),
             ]),
+            "core_target_identities": [
+                _chain_qualified_target_metadata(item)
+                for item in (setup, perturbation, extraction)
+                if item and item.get("target_address")
+            ],
         },
         "actions": actions,
         "objective": (
@@ -20974,7 +24402,7 @@ def _economic_chain_candidate(
             "or unauthorized mint/release relative to the live starting state."
         ),
         "observations": _economic_chain_observations(contract, target, motif),
-        "recommended_next_tool": "inventory_live_targets then prepare_fork_exploit_workbench",
+        "recommended_next_tool": "inventory_live_targets then compose_sequence_experiment",
         "required_live_evidence": [
             "inventory_live_targets for every core target and asset/underlying/controller dependency",
             "active proxy or deployed configured/economic target bindings for core deployed targets",
@@ -21039,6 +24467,7 @@ def _queue_solver_chain_candidate(
     protocol_graph_path: str,
     focus: str,
 ) -> dict:
+    chain_source = request or settlement
     contract = str(
         request.get("profile_contract")
         or request.get("contract")
@@ -21098,8 +24527,9 @@ def _queue_solver_chain_candidate(
             "Settlement leg is not attacker-callable; only continue if an authorized production solver/keeper can settle the exact request."
         )
 
+    target_key = _chain_qualified_target_key(chain_source)
     return {
-        "attack_key": f"economic:queue_solver:{target.lower() or contract.lower()}",
+        "attack_key": f"economic:queue_solver:{target_key or contract.lower()}",
         "title": f"Test queue request-to-settlement accounting on {contract}",
         "priority_score": score,
         "priority": _plan_priority(score),
@@ -21107,6 +24537,9 @@ def _queue_solver_chain_candidate(
         "contract": contract,
         "function": " -> ".join(str(action.get("function") or "step") for action in actions),
         "target_address": target,
+        "network": chain_source.get("network"),
+        "chain_id": chain_source.get("chain_id"),
+        "target_identity": _chain_qualified_target_metadata(chain_source),
         "exposure": request.get("exposure"),
         "reachability": request.get("reachability"),
         "target_binding": request.get("target_binding") or settlement.get("target_binding"),
@@ -21131,6 +24564,11 @@ def _queue_solver_chain_candidate(
                 str((mutation or {}).get("target_address") or ""),
                 str(settlement.get("target_address") or ""),
             ]),
+            "core_target_identities": [
+                _chain_qualified_target_metadata(item)
+                for item in (request, mutation, settlement)
+                if item and item.get("target_address")
+            ],
         },
         "actions": actions,
         "objective": (
@@ -21157,7 +24595,7 @@ def _queue_solver_chain_candidate(
                 ),
             },
         ],
-        "recommended_next_tool": "inventory_live_targets then prepare_fork_exploit_workbench",
+        "recommended_next_tool": "inventory_live_targets then compose_sequence_experiment",
         "required_live_evidence": [
             "inventory_live_targets for queue, vault/accountant, asset/share token, solver, and permit domain dependencies",
             "active proxy or deployed configured/economic target bindings for queue and accounting targets",
@@ -21226,7 +24664,7 @@ def _queue_solver_chain_candidates(
                 _economic_exposure_identity(settlement),
             },
         )
-        key = str(request.get("target_address") or settlement.get("target_address") or "").lower()
+        key = _chain_qualified_target_key(request or settlement)
         if key in seen_targets:
             continue
         seen_targets.add(key)
@@ -21343,7 +24781,7 @@ def _economic_chain_candidates(
             motif = "oracle_market_valuation"
         else:
             continue
-        key = (motif, str(extraction.get("target_address") or "").lower())
+        key = (motif, _chain_qualified_target_key(extraction))
         if key in seen_motifs:
             continue
         seen_motifs.add(key)
@@ -21363,7 +24801,7 @@ def _economic_chain_candidates(
     )[:6]
 
 
-def _lending_exchange_rate_candidate(
+def _lending_exchange_rate_candidate_for_chain(
     *,
     exposures: list[dict],
     action_space_path: str,
@@ -21421,6 +24859,9 @@ def _lending_exchange_rate_candidate(
         "contract": "UnderlyingToken",
         "function": "transfer",
         "target": "<collateral underlying asset>",
+        "network": mint.get("network"),
+        "chain_id": mint.get("chain_id"),
+        "target_identity": _chain_qualified_target_metadata(mint),
         "args": [collateral_address or "collateralMarket", "donationAmount"],
         "parameters": [
             {"name": "to", "raw": "address to"},
@@ -21457,8 +24898,12 @@ def _lending_exchange_rate_candidate(
         enter["expected_effect"] = "Enter the inflated collateral market before borrowing."
         actions.append(enter)
     actions.append(borrow_action)
+    legacy_attack_key = "pattern:lending:exchange-rate-collateral-inflation"
+    chain_key, _address = _chain_qualified_target_identity(mint)
     return {
-        "attack_key": "pattern:lending:exchange-rate-collateral-inflation",
+        "attack_key": (
+            f"{legacy_attack_key}:{chain_key}" if chain_key else legacy_attack_key
+        ),
         "title": "Test lending exchange-rate collateral inflation chain",
         "priority_score": 34,
         "priority": "critical",
@@ -21466,6 +24911,9 @@ def _lending_exchange_rate_candidate(
         "contract": str(mint.get("contract") or "LendingMarket"),
         "function": "mint-donate-enter-borrow",
         "target_address": collateral_address,
+        "network": mint.get("network"),
+        "chain_id": mint.get("chain_id"),
+        "target_identity": _chain_qualified_target_metadata(mint),
         "exposure": "exposed",
         "reachability": {"kind": "public", "attacker_reachable": True, "confidence": "pattern"},
         "target_binding": mint.get("target_binding"),
@@ -21481,6 +24929,14 @@ def _lending_exchange_rate_candidate(
         "mechanism": "lending_exchange_rate_inflation",
         "target_address_role": "candidate_collateral_market",
         "market_inventory": {
+            "chain": {
+                key: value
+                for key, value in {
+                    "network": mint.get("network"),
+                    "chain_id": mint.get("chain_id"),
+                }.items()
+                if value not in (None, "")
+            },
             "candidate_markets": markets,
             "collateral_market": collateral_address,
             "borrow_market": borrow_address,
@@ -21515,7 +24971,7 @@ def _lending_exchange_rate_candidate(
                 "notes": "Compare borrowed asset value, donation cost, remaining collateral value, and protocol cash.",
             },
         ],
-        "recommended_next_tool": "prepare_fork_exploit_workbench",
+        "recommended_next_tool": "compose_sequence_experiment",
         "required_live_evidence": [
             "exact live cToken market inventory from map_live_reachability addresses",
             "active proxy or deployed configured/economic target bindings for selected markets",
@@ -21539,30 +24995,177 @@ def _lending_exchange_rate_candidate(
     }
 
 
+def _lending_exchange_rate_candidates(
+    *,
+    exposures: list[dict],
+    action_space_path: str,
+    live_path: str,
+    protocol_graph_path: str,
+) -> list[dict]:
+    """Build lending-pattern candidates independently per resolved chain.
+
+    Address values and profile names are not globally unique: CREATE2 and
+    deterministic deployments routinely reuse them across networks. Chainless
+    legacy artifacts retain their former single-group behavior.
+    """
+    groups: dict[str, list[dict]] = {}
+    for exposure in exposures:
+        if not isinstance(exposure, dict):
+            continue
+        chain_key, _address = _chain_qualified_target_identity(exposure)
+        groups.setdefault(chain_key, []).append(exposure)
+    candidates = [
+        candidate
+        for group in groups.values()
+        if (candidate := _lending_exchange_rate_candidate_for_chain(
+            exposures=group,
+            action_space_path=action_space_path,
+            live_path=live_path,
+            protocol_graph_path=protocol_graph_path,
+        )) is not None
+    ]
+    return sorted(
+        candidates,
+        key=lambda item: (
+            -int(item.get("priority_score") or 0),
+            str(item.get("attack_key") or ""),
+        ),
+    )
+
+
+def _lending_exchange_rate_candidate(
+    *,
+    exposures: list[dict],
+    action_space_path: str,
+    live_path: str,
+    protocol_graph_path: str,
+) -> dict | None:
+    """Compatibility wrapper returning the highest-ranked chain candidate."""
+    candidates = _lending_exchange_rate_candidates(
+        exposures=exposures,
+        action_space_path=action_space_path,
+        live_path=live_path,
+        protocol_graph_path=protocol_graph_path,
+    )
+    return candidates[0] if candidates else None
+
+
 def _attack_graph_nodes_edges_from_exposures(exposures: list[dict]) -> tuple[list[dict], list[dict]]:
     nodes = [{"id": "actor:attacker", "kind": "actor", "label": "attacker"}]
-    edges = []
+    edges: list[dict] = []
+    seen_edges: set[tuple[str, str, str, str]] = set()
     seen_nodes = {"actor:attacker"}
+    fallback_definition_sources: dict[tuple[str, str], set[str]] = {}
+
+    def action_definition_identity(exposure: dict) -> str:
+        return str(
+            exposure.get("action_definition_key")
+            or exposure.get("action_key")
+            or exposure.get("contract")
+            or "unknown"
+        )
+
+    # Modern live artifacts carry action_uid. For older hand-authored rows,
+    # preserve the compact definition id when it is unique; only add a stable
+    # source suffix when two distinct files/definitions would otherwise merge.
+    for exposure in exposures:
+        if not isinstance(exposure, dict) or exposure.get("action_uid"):
+            continue
+        chain_key, _address = _chain_qualified_target_identity(exposure)
+        definition = action_definition_identity(exposure)
+        source_identity = _action_stable_uid(exposure) or definition
+        fallback_definition_sources.setdefault(
+            (chain_key, definition), set()
+        ).add(source_identity)
+
+    def add_edge(
+        source: str,
+        target: str,
+        kind: str,
+        *,
+        target_scope: str = "",
+        **metadata: object,
+    ) -> None:
+        marker = (source, target, kind, target_scope)
+        if marker in seen_edges:
+            return
+        seen_edges.add(marker)
+        edge = {"from": source, "to": target, "kind": kind, **metadata}
+        edges.append({
+            key: value
+            for key, value in edge.items()
+            if value not in (None, "", [], {})
+        })
+
     for exposure in exposures:
         contract = str(exposure.get("contract") or "unknown")
         address = str(exposure.get("target_address") or "")
-        contract_id = f"contract:{contract}:{address or 'unbound'}"
-        action_id = f"action:{exposure.get('action_key') or contract}"
+        chain_key, _address = _chain_qualified_target_identity(exposure)
+        target_scope = _chain_qualified_target_key(exposure) or "unbound"
+        contract_id = f"contract:{contract}:{target_scope}"
+        definition_identity = action_definition_identity(exposure)
+        action_uid = str(exposure.get("action_uid") or "").strip()
+        action_identity = action_uid or definition_identity
+        if (
+            not action_uid
+            and len(fallback_definition_sources.get(
+                (chain_key, definition_identity), set()
+            )) > 1
+        ):
+            source_identity = _action_stable_uid(exposure) or definition_identity
+            source_digest = hashlib.sha256(
+                source_identity.encode("utf-8", "replace")
+            ).hexdigest()[:12]
+            action_identity = f"{definition_identity}@{source_digest}"
+        legacy_action_id = (
+            f"action:{chain_key}:{definition_identity}"
+            if chain_key else f"action:{definition_identity}"
+        )
+        action_id = (
+            f"action:{chain_key}:{action_identity}"
+            if chain_key else f"action:{action_identity}"
+        )
         gate_id = f"gate:{(exposure.get('reachability') or {}).get('kind') or 'unknown'}"
         for node in (
-            {"id": contract_id, "kind": "contract", "label": contract, "address": address},
-            {"id": action_id, "kind": "entrypoint", "label": exposure.get("action_key"), "signature": exposure.get("signature")},
+            {
+                "id": contract_id,
+                "kind": "contract",
+                "label": contract,
+                "address": address,
+                "chain_id": exposure.get("chain_id"),
+                "network": exposure.get("network"),
+            },
+            {
+                "id": action_id,
+                "kind": "entrypoint",
+                "label": exposure.get("action_key"),
+                "signature": exposure.get("signature"),
+                "action_definition_key": definition_identity,
+                "action_uid": action_uid or None,
+                "legacy_id": legacy_action_id if action_id != legacy_action_id else None,
+                "chain_id": exposure.get("chain_id"),
+                "network": exposure.get("network"),
+            },
             {"id": gate_id, "kind": "gate", "label": (exposure.get("reachability") or {}).get("kind")},
         ):
             if node["id"] not in seen_nodes:
                 nodes.append(node)
                 seen_nodes.add(node["id"])
-        edges.extend([
-            {"from": contract_id, "to": action_id, "kind": "has_entrypoint"},
-            {"from": action_id, "to": gate_id, "kind": "has_gate"},
-        ])
+        add_edge(contract_id, action_id, "has_entrypoint")
+        add_edge(action_id, gate_id, "has_gate")
         if exposure.get("exposure") in {"exposed", "source_public_live_unknown"}:
-            edges.append({"from": "actor:attacker", "to": action_id, "kind": "can_call"})
+            # The action definition is shared by clones, but its live call edge
+            # is deployment-specific.  Retain one actor edge per chain+target
+            # while deduplicating definition-level gate/concept edges.
+            add_edge(
+                "actor:attacker",
+                action_id,
+                "can_call",
+                target_scope=target_scope,
+                target_address=address,
+                chain_id=exposure.get("chain_id"),
+                network=exposure.get("network"),
+            )
         for label in exposure.get("affordances") or []:
             concept = _GRAPH_AFFORDANCE_CONCEPTS.get(label)
             if not concept:
@@ -21571,7 +25174,7 @@ def _attack_graph_nodes_edges_from_exposures(exposures: list[dict]) -> tuple[lis
             if concept_id not in seen_nodes:
                 nodes.append({"id": concept_id, "kind": concept[1], "label": concept[2]})
                 seen_nodes.add(concept_id)
-            edges.append({"from": action_id, "to": concept_id, "kind": concept[3]})
+            add_edge(action_id, concept_id, concept[3])
     return nodes, edges
 
 
@@ -21638,6 +25241,7 @@ _ATTACK_GRAPH_MEANINGFUL_AFFORDANCES = (
 _ATTACK_GRAPH_FRONTIER_FULL_CATEGORIES = (
     "omitted_by_score",
     "omitted_by_truncation",
+    "causal_path_omissions",
     "low_signal_entrypoints",
 )
 _ATTACK_GRAPH_FRONTIER_REFERENCE_CATEGORIES = (
@@ -21708,6 +25312,7 @@ def _source_only_candidate_action(action: dict) -> dict:
         "actor": "attacker",
         "contract": action.get("contract"),
         "function": action.get("function"),
+        "signature": signature,
         "args": _action_arg_names(action),
         "expected_effect": _source_only_attack_graph_objective(action),
         "bounds": (
@@ -21716,7 +25321,8 @@ def _source_only_candidate_action(action: dict) -> dict:
         ),
         "live_exposure": "source_only",
         "live_status": "unprobed",
-        "action_key": _coverage_action_key(action),
+        "action_key": _action_logical_key(action),
+        "action_definition_key": _action_signature_key(action),
         "affordances": action.get("affordances") or [],
         "direction_hint": _attack_graph_direction_hint(action),
         "source": source,
@@ -21884,6 +25490,1104 @@ def _source_only_candidate_priority(score: int, affordances: set[str]) -> str:
     return priority
 
 
+_CAUSAL_CHAIN_MAX_DEPTH = 3
+_CAUSAL_CHAIN_MAX_CANDIDATES = 20
+_CAUSAL_CHAIN_MAX_READER_FANOUT = 64
+_CAUSAL_CHAIN_MAX_PATH_FANOUT = 32
+_CAUSAL_CHAIN_MAX_EXPANSIONS = 4096
+_CAUSAL_CHAIN_MAX_ACCESS_COMPARISONS = 20_000
+_CAUSAL_CHAIN_MAX_PATH_POOL = 80
+_CAUSAL_CHAIN_MAX_PATHS_PER_START = 8
+_CAUSAL_CHAIN_OMITTED_FRONTIER_MAX = 25
+_CAUSAL_GRAPH_MAX_DEPENDENCY_EDGES = 2000
+_CAUSAL_GRAPH_MAX_DEPENDENCY_COMPARISONS = 20_000
+_CAUSAL_INHERITANCE_CONTEXT_MAX_CHILDREN = 32
+_CAUSAL_LIVE_TARGETS_PER_PATH = 2
+_CAUSAL_CHAIN_STRONG_SINK_AFFORDANCES = frozenset({
+    "credit_or_liquidation",
+    "delegatecall",
+    "value_out_or_burn",
+})
+_CAUSAL_TOKEN_RIGHT_TYPE_RE = re.compile(
+    r"(?:\bI?ERC(?:20|721|1155)\b|\b(?:token|asset|share)\b)",
+    flags=re.IGNORECASE,
+)
+
+
+def _causal_fact_variables(action: dict, field: str) -> set[str]:
+    facts = action.get("causal_facts") or {}
+    if not isinstance(facts, dict):
+        return set()
+    return {
+        str(item.get("variable") or "").strip()
+        for item in facts.get(field) or []
+        if isinstance(item, dict) and str(item.get("variable") or "").strip()
+    }
+
+
+def _causal_compatible_state_accesses(
+    writer: dict,
+    reader: dict,
+    variable: str,
+) -> list[dict]:
+    """Return exact or caller-alias-compatible access pairs for one state name."""
+    writer_facts = [
+        item
+        for item in (writer.get("causal_facts") or {}).get("state_writes") or []
+        if isinstance(item, dict) and item.get("variable") == variable
+    ][:_CAUSAL_ACCESS_MAX_PER_VARIABLE]
+    reader_facts = [
+        item
+        for item in (reader.get("causal_facts") or {}).get("state_reads") or []
+        if isinstance(item, dict) and item.get("variable") == variable
+    ][:_CAUSAL_ACCESS_MAX_PER_VARIABLE]
+    pairs = []
+    seen = set()
+    for write in writer_facts:
+        writer_owner = str(write.get("declaring_contract") or "").strip()
+        writer_raw = _causal_normalize_access(
+            str(write.get("target") or variable), caller_aliases=False
+        )
+        writer_path = str(write.get("access_path") or "").strip() or (
+            _causal_normalize_access(writer_raw, caller_aliases=True)
+        )
+        for read in reader_facts:
+            reader_owner = str(read.get("declaring_contract") or "").strip()
+            if writer_owner and reader_owner and writer_owner != reader_owner:
+                continue
+            reader_raw = _causal_normalize_access(
+                str(read.get("target") or variable), caller_aliases=False
+            )
+            reader_path = str(read.get("access_path") or "").strip() or (
+                _causal_normalize_access(reader_raw, caller_aliases=True)
+            )
+            if writer_path != reader_path:
+                continue
+            compatibility = (
+                "exact_access"
+                if writer_raw == reader_raw
+                else "caller_identity_alias"
+                if "@caller" in writer_path
+                else "normalized_access"
+            )
+            key = (writer_raw, reader_raw, writer_path, compatibility)
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append({
+                "variable": variable,
+                "writer_access": writer_raw[:160],
+                "reader_access": reader_raw[:160],
+                "canonical_access": writer_path[:160],
+                "compatibility": compatibility,
+                **(
+                    {"declaring_contract": writer_owner}
+                    if writer_owner and writer_owner == reader_owner else {}
+                ),
+            })
+    return pairs[:_CAUSAL_ACCESS_MAX_PER_VARIABLE]
+
+
+def _causal_dependency_supported(
+    writer: dict,
+    reader: dict,
+    dependency: dict,
+) -> bool:
+    return all(
+        _causal_compatible_state_accesses(writer, reader, str(variable))
+        for variable in dependency.get("state") or []
+    )
+
+
+def _causal_action_identity(action: dict) -> tuple[str, str]:
+    """Source-definition identity used only for causal composition."""
+    return (
+        str(action.get("file") or "").strip(),
+        _coverage_action_key(action),
+    )
+
+
+def _causal_action_is_impact_sink(action: dict) -> bool:
+    """Keep causal chains focused on rights/value sinks, not every data flow."""
+    affordances = {str(item) for item in action.get("affordances") or []}
+    if affordances & _CAUSAL_CHAIN_STRONG_SINK_AFFORDANCES:
+        return True
+    if "generic_execution" in affordances and _attack_graph_generic_execution_has_economic_route(
+        action, affordances
+    ):
+        return True
+    if (
+        "cross_domain_or_message" in affordances
+        and affordances & {"token_or_native_transfer", "value_out_or_burn"}
+    ):
+        return True
+    causal_facts = action.get("causal_facts") or {}
+    if isinstance(causal_facts, dict) and any(
+        bool(call.get("value_bearing"))
+        for call in causal_facts.get("external_calls") or []
+        if isinstance(call, dict)
+    ):
+        return True
+    if isinstance(causal_facts, dict) and any(
+        str(call.get("function") or "").lower()
+        in {"safetransfer", "transfer"}
+        and bool(_CAUSAL_TOKEN_RIGHT_TYPE_RE.search(
+            str(call.get("target_type") or "")
+        ))
+        for call in causal_facts.get("external_calls") or []
+        if isinstance(call, dict)
+    ):
+        # Token/right transfers need type corroboration. transferFrom variants
+        # remain excluded because they are commonly ingress. Bare call/send
+        # names are not sinks; value-bearing calls are already captured by the
+        # structural `external_call_with_value` affordance above.
+        return True
+    return (
+        "token_or_native_transfer" in affordances
+        and _attack_graph_direction_hint(action) == "outbound_or_release"
+    )
+
+
+def _causal_direct_inheritance_contexts(
+    action_space: dict,
+) -> tuple[dict[tuple[str, str], set[str]], bool]:
+    """Storage-layout contexts for direct, same-file inheritance only."""
+    contracts = [
+        item for item in (action_space or {}).get("contracts") or []
+        if isinstance(item, dict)
+    ]
+    local_contracts: dict[tuple[str, str], str] = {}
+    for contract in contracts:
+        file_path = str(contract.get("file") or "").strip()
+        name = str(contract.get("name") or "").strip()
+        if file_path and name:
+            local_contracts[(file_path, name.lower())] = name
+    children_by_base: dict[tuple[str, str], set[str]] = {}
+    for contract in contracts:
+        file_path = str(contract.get("file") or "").strip()
+        child = str(contract.get("name") or "").strip()
+        if not file_path or not child:
+            continue
+        for base in contract.get("bases") or []:
+            base_key = (file_path, str(base or "").strip().lower())
+            if base_key in local_contracts:
+                children_by_base.setdefault(base_key, set()).add(child)
+    contexts = {key: {name} for key, name in local_contracts.items()}
+    truncated = False
+    for base_key, children in children_by_base.items():
+        ordered = sorted(children)
+        if len(ordered) > _CAUSAL_INHERITANCE_CONTEXT_MAX_CHILDREN:
+            truncated = True
+        contexts[base_key].update(
+            ordered[:_CAUSAL_INHERITANCE_CONTEXT_MAX_CHILDREN]
+        )
+    return contexts, truncated
+
+
+def _causal_source_paths(action_space: dict) -> tuple[list[dict], dict]:
+    """Return bounded local storage-context paths and search metadata."""
+    actions = [
+        action
+        for action in (action_space or {}).get("actions") or []
+        if isinstance(action, dict)
+        and str(action.get("file") or "").strip()
+        and str(action.get("visibility") or "") in {"public", "external"}
+        and str(action.get("mutability") or "") not in {"view", "pure"}
+    ]
+    actions.sort(key=lambda item: (
+        str(item.get("contract") or ""),
+        _coverage_action_key(item),
+        str(item.get("file") or ""),
+        int(item.get("line") or 0),
+    ))
+    actions_by_logical_key: dict[tuple[str, str], list[dict]] = {}
+    for action in actions:
+        key = _causal_action_identity(action)
+        actions_by_logical_key.setdefault(key, []).append(action)
+    # Source-definition keys keep identically named contracts in distinct files
+    # and retain each overload independently.  Only duplicate emissions of the
+    # exact same file+signature definition are collapsed below.
+    actions = []
+    for _key, group in sorted(actions_by_logical_key.items()):
+        # Prefer the entry with the richest scoped facts if a parser emitted a
+        # duplicate source-local definition.
+        representative = max(
+            group,
+            key=lambda action: (
+                sum(
+                    len((action.get("causal_facts") or {}).get(field) or [])
+                    for field in (
+                        "state_reads", "state_writes",
+                        "external_calls", "internal_calls",
+                    )
+                ),
+                _action_response_priority(action),
+            ),
+        )
+        actions.append(representative)
+    actions.sort(key=lambda item: (
+        -_action_response_priority(item),
+        str(item.get("contract") or ""),
+        _coverage_action_key(item),
+        str(item.get("file") or ""),
+        int(item.get("line") or 0),
+    ))
+    source_action_count = len(actions)
+    inheritance_contexts, inheritance_contexts_truncated = (
+        _causal_direct_inheritance_contexts(action_space)
+    )
+    actions_by_key: dict[tuple[str, str, str], dict] = {}
+    for action in actions:
+        file_path, action_key = _causal_action_identity(action)
+        contract = str(action.get("contract") or "").strip()
+        contexts = inheritance_contexts.get(
+            (file_path, contract.lower()), {contract}
+        )
+        for context in sorted(contexts):
+            actions_by_key[(file_path, action_key, context)] = action
+    action_nodes = sorted(
+        actions_by_key,
+        key=lambda key: (
+            -_action_response_priority(actions_by_key[key]),
+            key,
+            int(actions_by_key[key].get("line") or 0),
+        ),
+    )
+    writes_by_key = {
+        key: _causal_fact_variables(actions_by_key[key], "state_writes")
+        for key in action_nodes
+    }
+    reads_by_key = {
+        key: _causal_fact_variables(actions_by_key[key], "state_reads")
+        for key in action_nodes
+    }
+    readers_by_state: dict[
+        tuple[str, str, str], list[tuple[str, str, str]]
+    ] = {}
+    for reader_key in action_nodes:
+        source_file, _action_key, storage_context = reader_key
+        for variable in reads_by_key.get(reader_key) or set():
+            readers_by_state.setdefault(
+                (source_file, storage_context, variable), []
+            ).append(reader_key)
+    reader_fanout_truncated = False
+    for index_key, reader_keys in readers_by_state.items():
+        reader_keys.sort(key=lambda key: (
+            -_action_response_priority(actions_by_key[key]),
+            key,
+        ))
+        if len(reader_keys) > _CAUSAL_CHAIN_MAX_READER_FANOUT:
+            reader_fanout_truncated = True
+            # Preserve both terminal sinks and intermediate transitions. A
+            # simple top-N cut can drop every rare sink in a dense shared-state
+            # index (or, conversely, retain only sinks and lose depth-3 paths).
+            sink_budget = max(1, _CAUSAL_CHAIN_MAX_READER_FANOUT // 4)
+            sinks = [
+                key for key in reader_keys
+                if _causal_action_is_impact_sink(actions_by_key[key])
+            ]
+            intermediates = [
+                key for key in reader_keys
+                if not _causal_action_is_impact_sink(actions_by_key[key])
+            ]
+            selected = set(sinks[:sink_budget])
+            selected.update(intermediates[
+                :_CAUSAL_CHAIN_MAX_READER_FANOUT - len(selected)
+            ])
+            for key in reader_keys:
+                if len(selected) >= _CAUSAL_CHAIN_MAX_READER_FANOUT:
+                    break
+                selected.add(key)
+            readers_by_state[index_key] = [
+                key for key in reader_keys if key in selected
+            ][:_CAUSAL_CHAIN_MAX_READER_FANOUT]
+
+    def round_robin(
+        items: list,
+        group_key,
+    ) -> tuple[list, int]:
+        """Preserve priority within a group while rotating across groups."""
+        grouped: dict[tuple, list] = {}
+        for item in items:
+            grouped.setdefault(group_key(item), []).append(item)
+        ordered = []
+        max_group_size = max(
+            (len(group) for group in grouped.values()), default=0
+        )
+        for offset in range(max_group_size):
+            ordered.extend(
+                group[offset]
+                for group in grouped.values()
+                if offset < len(group)
+            )
+        return ordered, len(grouped)
+
+    results: list[dict] = []
+    seen: set[tuple[tuple[str, str, str], ...]] = set()
+    expansions = 0
+    expansion_cap_reached = False
+    access_comparisons = 0
+    access_comparison_cap_reached = False
+    path_pool_cap_reached = False
+    per_start_path_cap_reached = False
+    path_fanout_truncated = False
+
+    def next_steps(
+        tail: tuple[str, str, str], depth: int
+    ) -> list[tuple[tuple[str, str, str], list[str], list[dict]]]:
+        nonlocal access_comparisons, access_comparison_cap_reached
+        nonlocal path_fanout_truncated
+        writer = actions_by_key[tail]
+        source_file = str(writer.get("file") or "")
+        storage_context = tail[2]
+        dependencies: dict[tuple[str, str, str], dict] = {}
+        stop_comparisons = False
+        for variable in sorted(writes_by_key.get(tail) or set()):
+            for reader_key in readers_by_state.get(
+                (source_file, storage_context, variable), []
+            ):
+                if reader_key == tail:
+                    continue
+                if access_comparisons >= _CAUSAL_CHAIN_MAX_ACCESS_COMPARISONS:
+                    access_comparison_cap_reached = True
+                    stop_comparisons = True
+                    break
+                access_comparisons += 1
+                access_pairs = _causal_compatible_state_accesses(
+                    writer, actions_by_key[reader_key], variable
+                )
+                if not access_pairs:
+                    continue
+                dependency = dependencies.setdefault(reader_key, {
+                    "state": set(),
+                    "accesses": [],
+                })
+                dependency["state"].add(variable)
+                for pair in access_pairs:
+                    if pair not in dependency["accesses"]:
+                        dependency["accesses"].append(pair)
+            if stop_comparisons:
+                break
+        ranked = sorted(
+            dependencies.items(),
+            key=lambda item: (
+                # With room for one intermediate action, explore it before a
+                # terminal sink so complex paths are not crowded out by every
+                # direct writer->sink pair. At the final depth prefer sinks.
+                (
+                    _causal_action_is_impact_sink(actions_by_key[item[0]])
+                    if depth < _CAUSAL_CHAIN_MAX_DEPTH - 1
+                    else not _causal_action_is_impact_sink(actions_by_key[item[0]])
+                ),
+                -_action_response_priority(actions_by_key[item[0]]),
+                item[0],
+            ),
+        )
+        if len(ranked) > _CAUSAL_CHAIN_MAX_PATH_FANOUT:
+            path_fanout_truncated = True
+        return [
+            (
+                reader_key,
+                sorted(dependency["state"]),
+                dependency["accesses"][:_CAUSAL_ACCESS_MAX_PER_VARIABLE],
+            )
+            for reader_key, dependency in ranked[:_CAUSAL_CHAIN_MAX_PATH_FANOUT]
+        ]
+
+    def visit(
+        keys: list[tuple[str, str, str]],
+        dependencies: list[dict],
+        start_result_count: int,
+    ) -> None:
+        nonlocal expansions, expansion_cap_reached
+        nonlocal path_pool_cap_reached, per_start_path_cap_reached
+        if len(results) >= _CAUSAL_CHAIN_MAX_PATH_POOL:
+            path_pool_cap_reached = True
+            return
+        if len(results) - start_result_count >= _CAUSAL_CHAIN_MAX_PATHS_PER_START:
+            per_start_path_cap_reached = True
+            return
+        tail = keys[-1]
+        if len(keys) >= 2 and _causal_action_is_impact_sink(actions_by_key[tail]):
+            declared_contracts = {
+                str(actions_by_key[key].get("contract") or "").strip()
+                for key in keys
+            }
+            storage_context = tail[2]
+            # Do not duplicate a base-only path once per child. A derived
+            # context is material only when the path crosses that direct
+            # inheritance boundary.
+            if (
+                len(declared_contracts) == 1
+                and storage_context.lower()
+                != next(iter(declared_contracts)).lower()
+            ):
+                return
+            signature = tuple(keys)
+            if signature not in seen:
+                seen.add(signature)
+                results.append({
+                    "actions": [actions_by_key[key] for key in keys],
+                    "dependencies": dependencies,
+                    "storage_context": storage_context,
+                    "same_contract": len(declared_contracts) == 1,
+                })
+            # Impact is terminal for this planning path. Continuing beyond a
+            # sink generates noisy post-impact chains and consumes the bounded
+            # search budget without improving exploitability evidence.
+            return
+        if len(keys) >= _CAUSAL_CHAIN_MAX_DEPTH:
+            return
+        for next_key, variables, accesses in next_steps(tail, len(keys)):
+            if len(results) >= _CAUSAL_CHAIN_MAX_PATH_POOL:
+                path_pool_cap_reached = True
+                return
+            if (
+                len(results) - start_result_count
+                >= _CAUSAL_CHAIN_MAX_PATHS_PER_START
+            ):
+                per_start_path_cap_reached = True
+                return
+            if expansions >= _CAUSAL_CHAIN_MAX_EXPANSIONS:
+                expansion_cap_reached = True
+                return
+            if next_key in keys:
+                continue
+            expansions += 1
+            visit(
+                [*keys, next_key],
+                [
+                    *dependencies,
+                    {
+                        "writer": _coverage_action_key(actions_by_key[tail]),
+                        "reader": _coverage_action_key(actions_by_key[next_key]),
+                        "writer_action_uid": (
+                            actions_by_key[tail].get("action_uid")
+                            or _action_stable_uid(actions_by_key[tail])
+                        ),
+                        "reader_action_uid": (
+                            actions_by_key[next_key].get("action_uid")
+                            or _action_stable_uid(actions_by_key[next_key])
+                        ),
+                        "state": variables,
+                        "accesses": accesses,
+                        "source_file": actions_by_key[tail].get("file"),
+                        "storage_context": tail[2],
+                    },
+                ],
+                start_result_count,
+            )
+
+    start_nodes, source_group_count = round_robin(
+        action_nodes,
+        lambda key: (key[0], key[2]),
+    )
+    for key in start_nodes:
+        if len(results) >= _CAUSAL_CHAIN_MAX_PATH_POOL:
+            path_pool_cap_reached = True
+            break
+        action = actions_by_key[key]
+        if (
+            writes_by_key.get(key)
+            and not _causal_action_is_impact_sink(action)
+            and not expansion_cap_reached
+            and not access_comparison_cap_reached
+        ):
+            visit([key], [], len(results))
+
+    def path_rank(item: dict) -> tuple:
+        return (
+            -len(item["actions"]),
+            -sum(_action_response_priority(action) for action in item["actions"]),
+            tuple(
+                (*_causal_action_identity(action),)
+                for action in item["actions"]
+            ),
+            str(item.get("storage_context") or ""),
+        )
+
+    ranked_results = sorted(
+        results,
+        key=path_rank,
+    )
+    diverse_results, path_diversity_group_count = round_robin(
+        ranked_results,
+        lambda item: (
+            str(item["actions"][0].get("file") or ""),
+            str(item.get("storage_context") or ""),
+        ),
+    )
+    paths = diverse_results[:_CAUSAL_CHAIN_MAX_CANDIDATES]
+    selected_ids = {id(item) for item in paths}
+    omitted_paths = [
+        item for item in ranked_results if id(item) not in selected_ids
+    ]
+
+    def omitted_path_frontier_entry(path: dict) -> dict:
+        actions = path["actions"]
+        action_keys = [_coverage_action_key(action) for action in actions]
+        identity = "|".join(
+            f"{action.get('file')}:{key}:{action.get('line') or 0}"
+            for action, key in zip(actions, action_keys, strict=True)
+        )
+        return {
+            "frontier_reason": "causal_path_omissions",
+            "omission_reason": "omitted_by_causal_candidate_cap",
+            "causal_path_key": hashlib.sha256(identity.encode()).hexdigest()[:16],
+            "title": f"Omitted causal path: {' -> '.join(action_keys)}",
+            "candidate_kind": "causal_state_path",
+            "depth": len(actions),
+            "action_keys": action_keys,
+            "actions": [
+                {
+                    key: action.get(key)
+                    for key in (
+                        "contract", "function", "signature", "file", "line"
+                    )
+                    if action.get(key) not in (None, "")
+                }
+                for action in actions
+            ],
+            "dependencies": [
+                {
+                    key: dependency.get(key)
+                    for key in (
+                        "writer", "reader", "writer_action_uid",
+                        "reader_action_uid", "state", "source_file",
+                        "storage_context",
+                    )
+                    if dependency.get(key) not in (None, "", [], {})
+                }
+                for dependency in path.get("dependencies") or []
+            ],
+            "source_files": sorted({
+                str(action.get("file") or "")
+                for action in actions
+                if action.get("file")
+            }),
+            "storage_context": path.get("storage_context"),
+            "same_contract": bool(path.get("same_contract")),
+            "planning_note": (
+                "Compatible source path preserved after the candidate cap; "
+                "it remains planning context and needs live binding and a PoC."
+            ),
+        }
+
+    omitted_path_frontier = [
+        omitted_path_frontier_entry(path)
+        for path in omitted_paths[:_CAUSAL_CHAIN_OMITTED_FRONTIER_MAX]
+    ]
+    search = {
+        "max_depth": _CAUSAL_CHAIN_MAX_DEPTH,
+        "candidate_cap": _CAUSAL_CHAIN_MAX_CANDIDATES,
+        "path_pool_cap": _CAUSAL_CHAIN_MAX_PATH_POOL,
+        "per_start_path_cap": _CAUSAL_CHAIN_MAX_PATHS_PER_START,
+        "reader_fanout_cap": _CAUSAL_CHAIN_MAX_READER_FANOUT,
+        "path_fanout_cap": _CAUSAL_CHAIN_MAX_PATH_FANOUT,
+        "expansion_cap": _CAUSAL_CHAIN_MAX_EXPANSIONS,
+        "access_comparison_cap": _CAUSAL_CHAIN_MAX_ACCESS_COMPARISONS,
+        "actions_considered": source_action_count,
+        "storage_context_nodes": len(action_nodes),
+        "source_layout_groups": source_group_count,
+        "path_diversity_groups": path_diversity_group_count,
+        "path_pool_count": len(ranked_results),
+        "selected_path_count": len(paths),
+        "direct_inheritance_paths": sum(
+            not bool(item.get("same_contract")) for item in paths
+        ),
+        "inheritance_scope": "direct_same_file_only",
+        "inheritance_context_child_cap": _CAUSAL_INHERITANCE_CONTEXT_MAX_CHILDREN,
+        "inheritance_contexts_truncated": inheritance_contexts_truncated,
+        "inheritance_limitations": [
+            "the bounded causal pass performs no global imported-source or general transitive linearization"
+        ],
+        "expansions": expansions,
+        "access_comparisons": access_comparisons,
+        "candidate_cap_reached": bool(omitted_paths),
+        "path_pool_cap_reached": path_pool_cap_reached,
+        "per_start_path_cap_reached": per_start_path_cap_reached,
+        "reader_fanout_truncated": reader_fanout_truncated,
+        "path_fanout_truncated": path_fanout_truncated,
+        "expansion_cap_reached": expansion_cap_reached,
+        "access_comparison_cap_reached": access_comparison_cap_reached,
+        "omitted_path_count": len(omitted_paths),
+        "omitted_path_frontier": omitted_path_frontier,
+        "omitted_path_frontier_additional": max(
+            0, len(omitted_paths) - len(omitted_path_frontier)
+        ),
+        "diversity_policy": "round_robin_source_file_and_storage_context",
+    }
+    search["truncated"] = any(
+        search[key]
+        for key in (
+            "candidate_cap_reached",
+            "path_pool_cap_reached",
+            "per_start_path_cap_reached",
+            "reader_fanout_truncated",
+            "path_fanout_truncated",
+            "expansion_cap_reached",
+            "access_comparison_cap_reached",
+            "inheritance_contexts_truncated",
+        )
+    )
+    return paths, search
+
+
+def _causal_attack_graph_candidates(
+    *,
+    action_space: dict,
+    exposures: list[dict],
+    mode: str,
+    focus: str,
+    action_space_path: str,
+    live_path: str,
+    protocol_graph_path: str,
+) -> tuple[list[dict], dict]:
+    """Materialize bounded causal source paths in the existing attack graph.
+
+    Reachability-aware paths require every action to resolve to the same
+    chain-qualified live target. Source-only paths retain the standard
+    live-context blockers.
+    """
+    all_exposures = [
+        exposure
+        for exposure in exposures
+        if isinstance(exposure, dict)
+    ]
+    callable_exposures = [
+        exposure
+        for exposure in all_exposures
+        if _exposure_is_live_callable(exposure)
+    ]
+    concrete_chains_by_address = _concrete_target_chains_by_address(
+        all_exposures
+    )
+    exposure_index: dict[tuple[str, str, tuple[str, str]], dict] = {}
+    if mode == "reachability_aware":
+        for exposure in callable_exposures:
+            source_file = str(exposure.get("file") or "").strip()
+            target_identity = _coherent_target_identity(
+                exposure, concrete_chains_by_address
+            )
+            action_aliases = _action_identity_aliases(exposure)
+            if not action_aliases or not source_file or target_identity is None:
+                continue
+            for action_key in action_aliases:
+                key = (source_file, action_key, target_identity)
+                existing = exposure_index.get(key)
+                if existing is None or _attack_graph_candidate_score(
+                    exposure, focus
+                ) > _attack_graph_candidate_score(existing, focus):
+                    exposure_index[key] = exposure
+
+    candidates: list[dict] = []
+    paths, search = _causal_source_paths(action_space)
+    live_binding_misses = 0
+    live_targets_considered = 0
+    live_targets_selected = 0
+    live_targets_omitted = 0
+    live_target_omissions: list[dict] = []
+    live_target_omission_paths = 0
+
+    def finalize_search(*, candidate_cap_reached: bool) -> None:
+        search.update({
+            "bound_candidate_cap_reached": candidate_cap_reached,
+            "live_binding_misses": live_binding_misses,
+            "live_target_cap_per_path": _CAUSAL_LIVE_TARGETS_PER_PATH,
+            "live_targets_considered": live_targets_considered,
+            "live_targets_selected": live_targets_selected,
+            "live_targets_omitted": live_targets_omitted,
+            "live_target_omissions": live_target_omissions,
+            "live_target_omission_paths": live_target_omission_paths,
+            "live_target_omission_records_truncated": max(
+                0, live_target_omission_paths - len(live_target_omissions)
+            ),
+            "live_target_binding_truncated": live_targets_omitted > 0,
+            "truncated": bool(
+                search.get("truncated")
+                or candidate_cap_reached
+                or live_targets_omitted
+            ),
+        })
+
+    for path in paths:
+        source_actions = path["actions"]
+        action_keys = [_coverage_action_key(action) for action in source_actions]
+        action_aliases = [
+            _action_identity_aliases(action) for action in source_actions
+        ]
+        source_files = [str(action.get("file") or "").strip() for action in source_actions]
+
+        def bound_exposure(
+            file_path: str,
+            aliases: set[str],
+            target_identity: tuple[str, str],
+        ) -> dict:
+            matching = [
+                exposure_index[(file_path, alias, target_identity)]
+                for alias in sorted(aliases)
+                if (file_path, alias, target_identity) in exposure_index
+            ]
+            return max(
+                matching,
+                key=lambda exposure: _attack_graph_candidate_score(
+                    exposure, focus
+                ),
+            )
+
+        target_groups: list[tuple[tuple[str, str] | None, list[dict]]] = []
+        if mode == "source_only":
+            target_groups = [(None, source_actions)]
+        else:
+            target_sets = [
+                {
+                    target_identity
+                    for source_file, action_alias, target_identity in exposure_index
+                    if source_file == file_path and action_alias in aliases
+                }
+                for aliases, file_path in zip(
+                    action_aliases, source_files, strict=True
+                )
+            ]
+            common_targets = set.intersection(*target_sets) if target_sets else set()
+            if not common_targets:
+                live_binding_misses += 1
+            ranked_targets = sorted(
+                common_targets,
+                key=lambda target_identity: (
+                    -sum(
+                        _attack_graph_candidate_score(
+                            bound_exposure(
+                                file_path, aliases, target_identity
+                            ),
+                            focus,
+                        )
+                        for aliases, file_path in zip(
+                            action_aliases, source_files, strict=True
+                        )
+                    ),
+                    target_identity,
+                ),
+            )
+            selected_targets = ranked_targets[:_CAUSAL_LIVE_TARGETS_PER_PATH]
+            omitted_targets = ranked_targets[_CAUSAL_LIVE_TARGETS_PER_PATH:]
+            live_targets_considered += len(ranked_targets)
+            live_targets_selected += len(selected_targets)
+            live_targets_omitted += len(omitted_targets)
+            if omitted_targets:
+                live_target_omission_paths += 1
+            if omitted_targets and len(live_target_omissions) < 20:
+                live_target_omissions.append({
+                    "action_keys": action_keys,
+                    "selected_targets": [
+                        _chain_qualified_target_metadata(
+                            bound_exposure(
+                                source_files[0], action_aliases[0], identity
+                            ),
+                            identity=identity,
+                        )
+                        for identity in selected_targets
+                    ],
+                    "omitted_target_count": len(omitted_targets),
+                    "omitted_targets": [
+                        _chain_qualified_target_metadata(
+                            bound_exposure(
+                                source_files[0], action_aliases[0], identity
+                            ),
+                            identity=identity,
+                        )
+                        for identity in omitted_targets[:8]
+                    ],
+                    "additional_omitted": max(0, len(omitted_targets) - 8),
+                })
+            for target_identity in selected_targets:
+                target_groups.append((target_identity, [
+                    bound_exposure(file_path, aliases, target_identity)
+                    for aliases, file_path in zip(
+                        action_aliases, source_files, strict=True
+                    )
+                ]))
+
+        for target_identity, bound_actions in target_groups:
+            if mode == "reachability_aware" and any(
+                not _causal_dependency_supported(
+                    bound_actions[index], bound_actions[index + 1], dependency
+                )
+                for index, dependency in enumerate(path["dependencies"])
+            ):
+                continue
+            sink = bound_actions[-1]
+            target_address = (
+                target_identity[1] if target_identity is not None else ""
+            )
+            target_key = (
+                (
+                    f"{target_identity[0]}:{target_identity[1]}"
+                    if target_identity[0] else target_identity[1]
+                )
+                if target_identity is not None else ""
+            )
+            source_sink = source_actions[-1]
+            start_reachability = _classify_action_reachability(source_actions[0])
+            start_gate_unproven = (
+                mode == "source_only"
+                and start_reachability.get("attacker_reachable") is not True
+            )
+            start_gate_kind = str(
+                start_reachability.get("kind") or "unknown"
+            )
+            gate_penalty = (
+                6 if _reachability_high_trust(start_reachability) else 3
+            ) if start_gate_unproven else 0
+            if mode == "source_only":
+                action_skeletons = [
+                    _source_only_candidate_action(action) for action in source_actions
+                ]
+                if start_gate_unproven and action_skeletons:
+                    action_skeletons[0]["actor"] = (
+                        "attacker only if the source gate is bypassable or misconfigured"
+                    )
+                    action_skeletons[0].setdefault("live_blockers", []).append(
+                        f"start reachability is {start_gate_kind}; unprivileged control is unproven"
+                    )
+                base_scores = [
+                    _source_only_candidate_score(action)[0] for action in source_actions
+                ]
+            else:
+                action_skeletons = [
+                    _candidate_action_from_exposure(exposure)
+                    for exposure in bound_actions
+                ]
+                base_scores = [
+                    _attack_graph_candidate_score(exposure, focus)
+                    for exposure in bound_actions
+                ]
+            score = max(
+                1,
+                max(base_scores or [1])
+                + len(path["dependencies"]) * 2
+                + 2
+                - gate_penalty,
+            )
+            all_affordances = {
+                str(label)
+                for action in source_actions
+                for label in action.get("affordances") or []
+            }
+            priority = (
+                _source_only_candidate_priority(score, all_affordances)
+                if mode == "source_only"
+                else _plan_priority(score)
+            )
+            dependencies = []
+            for dependency_index, raw_dependency in enumerate(
+                path["dependencies"]
+            ):
+                dependency = dict(raw_dependency)
+                writer_action = bound_actions[dependency_index]
+                reader_action = bound_actions[dependency_index + 1]
+                dependency["writer_action_uid"] = str(
+                    writer_action.get("action_uid")
+                    or raw_dependency.get("writer_action_uid")
+                    or _action_stable_uid(writer_action)
+                ).strip()
+                dependency["reader_action_uid"] = str(
+                    reader_action.get("action_uid")
+                    or raw_dependency.get("reader_action_uid")
+                    or _action_stable_uid(reader_action)
+                ).strip()
+                dependencies.append(dependency)
+            state_path = [
+                f"{item['writer']} writes {', '.join(item['state'])}; "
+                f"{item['reader']} reads it"
+                for item in dependencies
+            ]
+            objective = (
+                f"Changing {', '.join(sorted({variable for item in dependencies for variable in item['state']}))} "
+                f"through {action_keys[0]} must not let {action_keys[-1]} violate: "
+                f"{_source_only_attack_graph_objective(source_sink)}"
+            )
+            source_file = source_files[0]
+            source_digest = hashlib.sha256(
+                source_file.encode("utf-8", "replace")
+            ).hexdigest()[:12]
+            attack_key = (
+                "causal:" + ">".join(action_keys) + f":source:{source_digest}"
+            )
+            if target_key:
+                attack_key += f":{target_key}"
+            blockers = (
+                ["live reachability not mapped", "target address not bound"]
+                if mode == "source_only" else []
+            )
+            if start_gate_unproven:
+                blockers.append(
+                    f"start action source reachability is {start_gate_kind}; prove an unprivileged route, gate bypass, or live misconfiguration"
+                )
+            target_binding = (
+                sink.get("target_binding") if mode == "reachability_aware" else None
+            )
+            target_metadata = (
+                _chain_qualified_target_metadata(
+                    sink,
+                    identity=target_identity,
+                )
+                if mode == "reachability_aware" and target_identity is not None
+                else None
+            )
+            same_contract = bool(path.get("same_contract", True))
+            storage_context = str(path.get("storage_context") or "").strip()
+            dependency_reason = (
+                "same_contract_state_dependencies"
+                if same_contract else "direct_inheritance_state_dependencies"
+            )
+            attacker_control_field = {}
+            if not start_gate_unproven:
+                attacker_control_field["attacker_control"] = (
+                    f"An unprivileged actor can invoke {action_keys[0]}"
+                    + (
+                        f" at {target_key}"
+                        if target_key
+                        else " once a live target is bound"
+                    )
+                )
+            candidate = {
+                "attack_key": attack_key,
+                "title": "Causal state path: " + " -> ".join(action_keys),
+                "priority_score": score,
+                "priority": priority,
+                "score_reasons": [
+                    f"{dependency_reason}+{len(dependencies) * 2}",
+                    "impact_sink+2",
+                    *(
+                        [f"unproven_start_gate-{gate_penalty}"]
+                        if start_gate_unproven else []
+                    ),
+                ],
+                "candidate_kind": "causal_state_path",
+                "mechanism": _infer_fork_workbench_mechanism(
+                    source_sink, None, "auto"
+                ),
+                "contract": source_sink.get("contract"),
+                "function": source_sink.get("function"),
+                "target_address": target_address or None,
+                "network": sink.get("network")
+                if mode == "reachability_aware" else None,
+                "chain_id": sink.get("chain_id")
+                if mode == "reachability_aware" else None,
+                "target_identity": target_metadata,
+                "target_binding": target_binding,
+                "exposure": sink.get("exposure")
+                if mode == "reachability_aware" else "source_only",
+                "reachability": sink.get("reachability")
+                if mode == "reachability_aware" else "needs_live_context",
+                "affordances": source_sink.get("affordances") or [],
+                "direction_hint": _attack_graph_direction_hint(source_sink),
+                "actions": action_skeletons,
+                "causal_path": {
+                    "same_contract": same_contract,
+                    "storage_context": storage_context,
+                    "source_file": source_file,
+                    "depth": len(action_skeletons),
+                    "dependencies": dependencies,
+                    "state_path": state_path,
+                },
+                "objective": objective,
+                "hypothesis_card": {
+                    **attacker_control_field,
+                    "state_path": state_path,
+                    "invariant_at_risk": _source_only_attack_graph_objective(
+                        source_sink
+                    ),
+                    "impact_sink": (
+                        f"{action_keys[-1]} reaches affordances: "
+                        + ", ".join(sorted(source_sink.get("affordances") or []))
+                    ),
+                    "material_preconditions": [
+                        *(
+                            [f"all actions bind to deployed target {target_key}"]
+                            if target_key else ["bind every action to one deployed target"]
+                        ),
+                        "the recorded writer-to-reader storage dependencies hold on the executable implementation",
+                        *(
+                            [
+                                f"an unprivileged actor can satisfy or bypass the {start_gate_kind} start gate"
+                            ]
+                            if start_gate_unproven else []
+                        ),
+                        *(
+                            [
+                                f"the direct local inheritance layout resolves through {storage_context}"
+                            ]
+                            if not same_contract and storage_context else []
+                        ),
+                    ],
+                    "falsifier": (
+                        "Replay the final sink without the first state-changing "
+                        "action; the measured impact must disappear."
+                    ),
+                    "objective": objective,
+                },
+                "recommended_next_tool": (
+                    "map_live_reachability then rebuild the attack graph"
+                    if mode == "source_only"
+                    else "compose_sequence_experiment with explicit actions"
+                ),
+                "required_live_evidence": [
+                    "live binding for every action in the causal path",
+                    *(
+                        [
+                            "objective live proof that an unprivileged actor can invoke the gated start action"
+                        ]
+                        if start_gate_unproven else []
+                    ),
+                    "before/after state and value objective for the final sink",
+                    "negative control without the first state perturbation",
+                ],
+                "blockers": blockers,
+                "caveats": (
+                    [
+                        "Source-only causal dependency is preserved for recall, but attacker control of the start action is unproven."
+                    ]
+                    if start_gate_unproven else []
+                ),
+                "planning_notes": [
+                    (
+                        "Heuristic same-contract causal path; planning context, not evidence."
+                        if same_contract else
+                        "Heuristic direct, same-file inheritance path; confirm compiler linearization and deployed implementation before treating it as executable."
+                    ),
+                    *(
+                        [
+                            "Do not claim unprivileged exploitability unless live authority/gate evidence resolves the start-action blocker."
+                        ]
+                        if start_gate_unproven else []
+                    ),
+                    "Falsify the state dependency and final impact with a runnable PoC and negative control.",
+                ],
+                "source": {
+                    "action_space": action_space_path,
+                    "live_reachability": live_path or None,
+                    "protocol_graph": protocol_graph_path or None,
+                },
+                "clone_family_keys": sorted({
+                    str(action.get("clone_family_key") or "")
+                    for action in bound_actions
+                    if isinstance(action, dict) and action.get("clone_family_key")
+                }),
+            }
+            candidates.append({
+                key: value
+                for key, value in candidate.items()
+                if value not in (None, "", [], {})
+            })
+            if len(candidates) >= _CAUSAL_CHAIN_MAX_CANDIDATES:
+                finalize_search(candidate_cap_reached=True)
+                return candidates, search
+    finalize_search(candidate_cap_reached=False)
+    return candidates, search
+
+
 def _source_only_low_signal_frontier_entry(
     action: dict, score: int, reasons: list[str]
 ) -> dict:
@@ -21892,15 +26596,24 @@ def _source_only_low_signal_frontier_entry(
     out of curiosity scheduling."""
     contract = str(action.get("contract") or "").strip()
     function = str(action.get("function") or "").strip()
+    action_key = _action_logical_key(action)
+    action_definition_key = _action_signature_key(action)
+    source_digest = hashlib.sha256(
+        str(action.get("file") or "").encode()
+    ).hexdigest()[:10]
     line = action.get("line")
     candidate_like = {
-        "attack_key": f"source:{contract}:{function}:{int(line) if line else 0}",
+        "attack_key": (
+            f"source:{action_definition_key}:{source_digest}:"
+            f"{int(line) if line else 0}"
+        ),
         "title": (
             f"Low-signal source entrypoint: {contract}.{function}"
             if contract
             else f"Low-signal source entrypoint: {function}"
         ),
-        "action_key": _coverage_action_key(action),
+        "action_key": action_key,
+        "action_definition_key": action_definition_key,
         "contract": contract or None,
         "function": function,
         "priority_score": score,
@@ -21935,8 +26648,9 @@ def _source_only_attack_graph_candidates(
     `_source_only_candidate_priority`) and `score_reasons`; bare entrypoints with
     no structural risk are diverted into `low_signal_frontier` (keyed for clone
     de-duplication) so they are preserved in the artifact but never flood the top
-    candidate list or curiosity scheduling. Clones of the same logical signature
-    collapse into one entry in either bucket."""
+    candidate list or curiosity scheduling. Exact duplicate records of the same
+    source definition collapse; same-signature definitions in different files
+    stay separate until live clone evidence proves they are equivalent."""
     candidates: list[dict] = []
     by_logical: dict[str, dict] = {}
     low_signal_frontier: dict[str, dict] = {}
@@ -21949,9 +26663,10 @@ def _source_only_attack_graph_candidates(
         if not function:
             continue
         contract = str(action.get("contract") or "").strip()
-        action_key = _coverage_action_key(action)
+        action_key = _action_logical_key(action)
+        action_definition_key = _action_signature_key(action)
         signature = _action_signature(action)
-        logical_key = f"{action_key}|{signature}"
+        logical_key = _coverage_definition_key(action) or action_definition_key
         base_score, score_reasons = _source_only_candidate_score(action)
         if score_reasons == ["bare_entrypoint"]:
             # Bare external/non-view entrypoint with no structural risk: preserve
@@ -22000,8 +26715,14 @@ def _source_only_attack_graph_candidates(
             "auto",
         )
         line = action.get("line")
+        source_digest = hashlib.sha256(
+            str(action.get("file") or "").encode()
+        ).hexdigest()[:10]
         candidate = {
-            "attack_key": f"source:{contract}:{function}:{int(line) if line else 0}",
+            "attack_key": (
+                f"source:{action_definition_key}:{source_digest}:"
+                f"{int(line) if line else 0}"
+            ),
             "title": (
                 f"Source-only invariant probe: {contract}.{function}"
                 if contract
@@ -22011,6 +26732,7 @@ def _source_only_attack_graph_candidates(
             "priority": priority,
             "score_reasons": score_reasons,
             "action_key": action_key,
+            "action_definition_key": action_definition_key,
             "contract": contract or None,
             "function": function,
             "signature": signature,
@@ -22026,7 +26748,7 @@ def _source_only_attack_graph_candidates(
             "objective": _source_only_attack_graph_objective(action),
             "recommended_next_tool": (
                 "map_live_reachability then build_attack_graph mode=reachability_aware, "
-                "or prepare_fork_exploit_workbench after target binding"
+                "or compose_sequence_experiment after target binding"
             ),
             "required_live_evidence": [
                 "live reachability artifact binding this action to a deployed target",
@@ -22080,6 +26802,14 @@ _STM_CANDIDATE_KIND_SCORE = {
     "bounds": 4,
 }
 
+# A single invariant can resolve to many clone deployments. Keep several
+# independently executable live branches without letting one clone family flood
+# the top-candidate budget; compact references for the rest are retained in the
+# frontier and state-model binding summary.
+_STM_LIVE_TARGETS_PER_INVARIANT = 3
+_STM_OMITTED_TARGET_FRONTIER_CAP = 32
+_STM_OMISSION_RECORD_CAP = 20
+
 
 def _stm_split_action_ref(value: object) -> tuple[str, str]:
     """Parse a target-action reference into (contract, function).
@@ -22103,11 +26833,65 @@ def _stm_split_action_ref(value: object) -> tuple[str, str]:
     return "", text
 
 
-def _stm_action_space_index(action_space: dict | None) -> dict[tuple[str, str], dict]:
+def _stm_action_ref_identity(value: object) -> dict:
+    """Normalize a model target reference without discarding source identity.
+
+    Older model artifacts used ``Contract.function`` strings.  New artifacts
+    retain the signature, definition key, uid, and file.  The old shape remains
+    readable, but callers must treat it as ambiguous when more than one source
+    definition matches.
+    """
+    if isinstance(value, dict):
+        identity = {
+            key: value.get(key)
+            for key in (
+                "contract",
+                "function",
+                "signature",
+                "file",
+                "action_definition_key",
+                "action_uid",
+            )
+            if value.get(key) not in (None, "", [], {})
+        }
+        definition_key = str(identity.get("action_definition_key") or "").strip()
+        if definition_key and "::" in definition_key:
+            definition_contract, _, definition_signature = definition_key.partition("::")
+            identity.setdefault("contract", definition_contract)
+            identity.setdefault("signature", definition_signature)
+            identity.setdefault(
+                "function", re.split(r"\(", definition_signature, 1)[0]
+            )
+        signature = str(identity.get("signature") or "").strip()
+        if signature:
+            identity.setdefault("function", re.split(r"\(", signature, 1)[0])
+        return identity
+
+    raw = str(value or "").strip()
+    contract, function = _stm_split_action_ref(raw)
+    identity = {"contract": contract, "function": function}
+    signature = ""
+    if "(" in raw:
+        tail = raw
+        for separator in ("::", "."):
+            if separator in tail:
+                _prefix, _, tail = tail.partition(separator)
+                break
+        signature = re.sub(r"\s+", "", tail)
+    if signature:
+        identity["signature"] = signature
+        if contract:
+            identity["action_definition_key"] = f"{contract}::{signature}"
+    return {key: value for key, value in identity.items() if value}
+
+
+def _stm_action_space_index(
+    action_space: dict | None,
+) -> dict[tuple[str, str], list[dict]]:
     """Index action-space actions by (contract_lower, function_lower) plus a
     contract-agnostic ("", function_lower) fallback so an invariant that names a
     function without its contract still resolves to a concrete entrypoint."""
-    index: dict[tuple[str, str], dict] = {}
+    index: dict[tuple[str, str], list[dict]] = {}
     for action in (action_space or {}).get("actions") or []:
         if not isinstance(action, dict):
             continue
@@ -22115,8 +26899,8 @@ def _stm_action_space_index(action_space: dict | None) -> dict[tuple[str, str], 
         if not function:
             continue
         contract = str(action.get("contract") or "").strip()
-        index.setdefault((contract.lower(), function.lower()), action)
-        index.setdefault(("", function.lower()), action)
+        index.setdefault((contract.lower(), function.lower()), []).append(action)
+        index.setdefault(("", function.lower()), []).append(action)
     return index
 
 
@@ -22125,6 +26909,33 @@ def _stm_prompt_matches_invariant(prompt: dict, invariant: dict) -> bool:
     invariant statement embedded in the prompt objective (how
     _stm_experiment_prompts builds them); the kind+contract title match is a
     fallback."""
+    invariant_definition = str(
+        invariant.get("action_definition_key") or ""
+    ).strip().lower()
+    invariant_uid = str(invariant.get("action_uid") or "").strip()
+    precise_targets = [
+        _stm_action_ref_identity(target)
+        for target in prompt.get("target_actions") or []
+        if isinstance(target, dict)
+        and any(
+            target.get(key)
+            for key in ("action_definition_key", "action_uid", "signature", "file")
+        )
+    ]
+    if (invariant_definition or invariant_uid) and precise_targets:
+        return any(
+            (
+                invariant_definition
+                and str(target.get("action_definition_key") or "").strip().lower()
+                == invariant_definition
+            )
+            or (
+                invariant_uid
+                and str(target.get("action_uid") or "").strip() == invariant_uid
+            )
+            for target in precise_targets
+        )
+
     statement = str(invariant.get("statement") or "").strip()
     if statement and statement in str(prompt.get("objective") or ""):
         return True
@@ -22140,36 +26951,46 @@ def _stm_prompt_matches_invariant(prompt: dict, invariant: dict) -> bool:
 def _stm_invariant_target_refs(
     invariant: dict,
     model: dict,
-) -> list[tuple[str, str]]:
-    """Ordered, de-duplicated (contract, function) targets for one invariant:
+) -> list[dict]:
+    """Ordered, de-duplicated exact targets for one invariant:
     explicit target_actions, the invariant's own function, referencing
     experiment-prompt targets, then model entrypoints for a contract-level
     invariant (no function of its own)."""
-    refs: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    refs: list[dict] = []
+    seen: set[tuple[str, ...]] = set()
 
-    def add(contract: str, function: str) -> None:
+    def add(value: object) -> None:
+        identity = _stm_action_ref_identity(value)
+        contract = str(identity.get("contract") or "").strip()
+        function = str(identity.get("function") or "").strip()
         if not function:
             return
-        key = (contract.lower(), function.lower())
+        key = (
+            contract.lower(),
+            function.lower(),
+            re.sub(r"\s+", "", str(identity.get("signature") or "")).lower(),
+            str(identity.get("action_definition_key") or "").strip().lower(),
+            posixpath.normpath(str(identity.get("file") or "").strip()),
+            str(identity.get("action_uid") or "").strip(),
+        )
         if key in seen:
             return
         seen.add(key)
-        refs.append((contract, function))
+        refs.append(identity)
 
     for item in invariant.get("target_actions") or []:
-        add(*_stm_split_action_ref(item))
+        add(item)
     contract = str(invariant.get("contract") or "").strip()
     function = str(invariant.get("function") or "").strip()
     if function:
-        add(contract, function)
+        add(invariant)
     for prompt in model.get("experiment_prompts") or []:
         if not isinstance(prompt, dict) or not _stm_prompt_matches_invariant(
             prompt, invariant
         ):
             continue
         for target in prompt.get("target_actions") or []:
-            add(*_stm_split_action_ref(target))
+            add(target)
     if not function:
         for entry in model.get("entrypoints") or []:
             if not isinstance(entry, dict):
@@ -22177,8 +26998,27 @@ def _stm_invariant_target_refs(
             entry_contract = str(entry.get("contract") or "").strip()
             if contract and entry_contract.lower() != contract.lower():
                 continue
-            add(entry_contract, str(entry.get("function") or "").strip())
+            add(entry)
     return refs
+
+
+def _stm_action_matches_target_ref(action: dict, ref: dict) -> bool:
+    """Exact source-definition filters for a normalized target reference."""
+    definition_key = str(ref.get("action_definition_key") or "").strip().lower()
+    if definition_key and _action_signature_key(action).lower() != definition_key:
+        return False
+    signature = re.sub(r"\s+", "", str(ref.get("signature") or "")).lower()
+    if signature and re.sub(r"\s+", "", _action_signature(action)).lower() != signature:
+        return False
+    action_uid = str(ref.get("action_uid") or "").strip()
+    if action_uid and _action_stable_uid(action) != action_uid:
+        return False
+    source_file = str(ref.get("file") or "").strip()
+    if source_file:
+        action_file = str(action.get("file") or "").strip()
+        if not action_file or posixpath.normpath(action_file) != posixpath.normpath(source_file):
+            return False
+    return True
 
 
 def _stm_candidate_action(action: dict, invariant: dict) -> dict:
@@ -22203,7 +27043,8 @@ def _stm_candidate_action(action: dict, invariant: dict) -> dict:
         ),
         "live_exposure": "source_only",
         "live_status": "unprobed",
-        "action_key": _coverage_action_key(action),
+        "action_key": _action_logical_key(action),
+        "action_definition_key": _action_signature_key(action),
         "affordances": [str(item) for item in action.get("affordances") or []],
         "matched_via": "state_transition_model",
         "source": source,
@@ -22217,6 +27058,185 @@ def _stm_candidate_action(action: dict, invariant: dict) -> dict:
         for key, value in candidate_action.items()
         if value not in (None, "", [], {})
     }
+
+
+def _stm_action_matches_live_exposure(action: dict, exposure: dict) -> bool:
+    """Match one modeled source action to its live-reachability exposure.
+
+    Every precise field supplied by the mapper is conjunctive. Hand-authored /
+    legacy artifacts may carry only the display key, so that remains a fallback;
+    the caller separately requires that fallback to resolve to exactly one
+    modeled definition.
+    """
+    action_contract = str(action.get("contract") or "").strip().lower()
+    exposure_contract = str(exposure.get("contract") or "").strip().lower()
+    if exposure_contract and action_contract != exposure_contract:
+        return False
+    action_function = str(action.get("function") or "").strip().lower()
+    exposure_function = str(exposure.get("function") or "").strip().lower()
+    if exposure_function and action_function != exposure_function:
+        return False
+
+    precise_identity_supplied = False
+    exposure_uid = str(exposure.get("action_uid") or "").strip()
+    if exposure_uid:
+        precise_identity_supplied = True
+        if _action_stable_uid(action) != exposure_uid:
+            return False
+    action_definition_key = _action_signature_key(action).lower()
+    exposure_definition_key = str(
+        exposure.get("action_definition_key") or ""
+    ).strip().lower()
+    if exposure_definition_key:
+        precise_identity_supplied = True
+        if action_definition_key != exposure_definition_key:
+            return False
+    exposure_signature = re.sub(
+        r"\s+", "", str(exposure.get("signature") or "")
+    ).lower()
+    if exposure_signature:
+        precise_identity_supplied = True
+        if re.sub(r"\s+", "", _action_signature(action)).lower() != exposure_signature:
+            return False
+    action_file = str(action.get("file") or "").strip()
+    exposure_file = str(exposure.get("file") or "").strip()
+    if exposure_file:
+        precise_identity_supplied = True
+        if not action_file or posixpath.normpath(action_file) != posixpath.normpath(
+            exposure_file
+        ):
+            return False
+    if precise_identity_supplied:
+        return True
+
+    action_key = _action_logical_key(action).lower()
+    exposure_key = str(exposure.get("action_key") or "").strip().lower()
+    return bool(action_key and action_key == exposure_key)
+
+
+def _stm_coherent_live_exposures(
+    matched_actions: list[dict],
+    exposures: list[dict],
+) -> list[list[dict]]:
+    """Rank coherent live bindings for every modeled action.
+
+    A multi-action invariant is useful as an executable plan only when all of
+    its actions resolve to the same chain-qualified target. Every coherent
+    target group is returned strongest-first; the caller owns its candidate cap
+    and omission accounting. Chainless legacy exposures bind only when the
+    address is absent from concrete chain data or resolves to exactly one chain.
+    """
+    if not matched_actions:
+        return []
+    all_exposures = [
+        exposure
+        for exposure in exposures
+        if isinstance(exposure, dict)
+    ]
+    callable_exposures = [
+        exposure
+        for exposure in all_exposures
+        if _exposure_is_live_callable(exposure)
+    ]
+    concrete_chains_by_address = _concrete_target_chains_by_address(
+        all_exposures
+    )
+    exposures_by_action: list[dict[tuple[str, str], dict]] = [
+        {} for _action in matched_actions
+    ]
+    for exposure in callable_exposures:
+        matching_action_indexes = [
+            index
+            for index, action in enumerate(matched_actions)
+            if _stm_action_matches_live_exposure(action, exposure)
+        ]
+        # A legacy display key, incomplete definition key, or partial source
+        # locator must not bind one deployment row to multiple modeled actions.
+        if len(matching_action_indexes) != 1:
+            continue
+        target_identity = _coherent_target_identity(
+            exposure, concrete_chains_by_address
+        )
+        if target_identity is None:
+            continue
+        by_target = exposures_by_action[matching_action_indexes[0]]
+        existing = by_target.get(target_identity)
+        if existing is None or _attack_graph_candidate_score(
+            exposure, ""
+        ) > _attack_graph_candidate_score(existing, ""):
+            by_target[target_identity] = exposure
+    for by_target in exposures_by_action:
+        if not by_target:
+            return []
+    common_targets = set.intersection(
+        *(set(items) for items in exposures_by_action)
+    )
+    if not common_targets:
+        return []
+
+    def target_rank(target: tuple[str, str]) -> tuple[int, tuple[str, str]]:
+        score = sum(
+            _attack_graph_candidate_score(items[target], "")
+            for items in exposures_by_action
+        )
+        return (-score, target)
+
+    def normalized_bound_exposure(
+        exposure: dict,
+        target: tuple[str, str],
+    ) -> dict:
+        """Carry an unambiguous inferred chain into the executable action.
+
+        `_coherent_target_identity` deliberately lets one legacy chainless row
+        inherit the sole concrete chain known for its address. Return a copy
+        with that resolved metadata so later candidate/composer stages do not
+        silently collapse the identity back to address-only.
+        """
+        direct_chain, _address = _chain_qualified_target_identity(exposure)
+        if direct_chain or not target[0]:
+            return exposure
+        chain_source = next(
+            (
+                item
+                for item in all_exposures
+                if _chain_qualified_target_identity(item) == target
+            ),
+            None,
+        )
+        if chain_source is None:
+            return exposure
+        normalized = dict(exposure)
+        network, chain_id = _canonical_chain(
+            chain_source.get("network"), chain_source.get("chain_id")
+        )
+        normalized["network"] = network
+        normalized["chain_id"] = chain_id
+        normalized["target_identity"] = _chain_qualified_target_metadata(
+            normalized,
+            identity=target,
+        )
+        return normalized
+
+    return [
+        [
+            normalized_bound_exposure(items[target], target)
+            for items in exposures_by_action
+        ]
+        for target in sorted(common_targets, key=target_rank)
+    ]
+
+
+def _stm_candidate_action_from_exposure(
+    exposure: dict,
+    invariant: dict,
+) -> dict:
+    """Keep live binding metadata while retaining the invariant objective."""
+    action = _candidate_action_from_exposure(exposure)
+    action["expected_effect"] = (
+        f"Falsify invariant: {invariant.get('statement') or invariant.get('kind')}"
+    )
+    action["matched_via"] = "state_transition_model"
+    return action
 
 
 def _stm_candidate_observations(
@@ -22276,6 +27296,154 @@ def _stm_candidate_score(invariant: dict, matched_actions: list[dict]) -> int:
     return max(1, score)
 
 
+def _stm_bound_target_metadata(bound_exposures: list[dict]) -> dict:
+    """Chain-qualified metadata shared by one coherent exposure group."""
+    if not bound_exposures:
+        return {}
+    chain_source = next(
+        (
+            exposure
+            for exposure in bound_exposures
+            if _chain_qualified_target_identity(exposure)[0]
+        ),
+        bound_exposures[0],
+    )
+    identity = _chain_qualified_target_identity(chain_source)
+    return _chain_qualified_target_metadata(chain_source, identity=identity)
+
+
+def _stm_definition_scope(bound_exposures: list[dict]) -> str:
+    """Stable exact-definition component for a target-qualified attack key."""
+    parts = []
+    for exposure in bound_exposures:
+        definition_key = str(
+            exposure.get("action_definition_key")
+            or _action_signature_key(exposure)
+            or exposure.get("action_key")
+            or "unknown"
+        ).strip()
+        source_file = str(exposure.get("file") or "").strip()
+        if source_file:
+            source_digest = hashlib.sha256(
+                posixpath.normpath(source_file).encode("utf-8", "replace")
+            ).hexdigest()[:8]
+            definition_key = f"{definition_key}@{source_digest}"
+        if definition_key not in parts:
+            parts.append(definition_key)
+    if len(parts) <= 4:
+        return ">".join(parts) or "unmatched"
+    full_scope = ">".join(parts)
+    digest = hashlib.sha256(full_scope.encode("utf-8", "replace")).hexdigest()[:10]
+    return ">".join(parts[:4]) + f">+{len(parts) - 4}:{digest}"
+
+
+def _stm_bind_candidate_to_live_target(
+    candidate: dict,
+    *,
+    bound_exposures: list[dict],
+    invariant: dict,
+    model_id: str,
+    invariant_id: str,
+    kind: str,
+    binding_rank: int,
+) -> dict:
+    """Clone one invariant plan onto an exact chain-qualified live target."""
+    rebound = copy.deepcopy(candidate)
+    target_identity = _stm_bound_target_metadata(bound_exposures)
+    target_address = target_identity.get("address")
+    candidate_actions = [
+        _stm_candidate_action_from_exposure(exposure, invariant)
+        for exposure in bound_exposures
+    ]
+    for action in candidate_actions:
+        action["target"] = target_address
+        action["target_identity"] = target_identity
+        if target_identity.get("network"):
+            action["network"] = target_identity["network"]
+        if target_identity.get("chain_id") is not None:
+            action["chain_id"] = target_identity["chain_id"]
+    representative = max(
+        bound_exposures,
+        key=lambda exposure: _attack_graph_candidate_score(exposure, ""),
+    )
+    binding_score = sum(
+        _attack_graph_candidate_score(exposure, "")
+        for exposure in bound_exposures
+    )
+    target_key = _chain_qualified_target_key(target_identity)
+    definition_scope = _stm_definition_scope(bound_exposures)
+    exposure_status = (
+        "exposed"
+        if all(exposure.get("exposure") == "exposed" for exposure in bound_exposures)
+        else "source_public_live_unknown"
+    )
+    live_status = (
+        "deployed"
+        if all(exposure.get("live_status") == "deployed" for exposure in bound_exposures)
+        else representative.get("live_status")
+    )
+    blockers = _dedupe_text([
+        str(blocker)
+        for action in candidate_actions
+        for blocker in action.get("live_blockers") or []
+    ])
+    short_target = target_key or str(target_address or "unbound")
+    rebound.update({
+        "attack_key": (
+            f"stm:{model_id}:{invariant_id}:{kind}:"
+            f"{definition_scope}:{short_target}"
+        ),
+        "title": f"{candidate.get('title')} at {short_target}",
+        "target_address": target_address,
+        "target_identity": target_identity,
+        "network": target_identity.get("network"),
+        "chain_id": target_identity.get("chain_id"),
+        "target_binding": representative.get("target_binding") or {},
+        "exposure": exposure_status,
+        "live_status": live_status,
+        "reachability": representative.get("reachability") or {},
+        "contract": invariant.get("contract") or representative.get("contract"),
+        "function": invariant.get("function") or representative.get("function"),
+        "signature": representative.get("signature"),
+        "file": representative.get("file"),
+        "action_key": representative.get("action_key"),
+        "action_definition_key": (
+            representative.get("action_definition_key")
+            or _action_signature_key(representative)
+        ),
+        "action_uid": representative.get("action_uid"),
+        "actions": candidate_actions,
+        "blockers": blockers,
+        "live_binding_rank": binding_rank,
+        "live_binding_score": binding_score,
+        "clone_family_keys": sorted({
+            str(exposure.get("clone_family_key") or "")
+            for exposure in bound_exposures
+            if exposure.get("clone_family_key")
+        }),
+        "recommended_next_tool": (
+            "inventory_live_targets then compose_sequence_experiment with "
+            "explicit actions"
+        ),
+    })
+    notes = [
+        note
+        for note in rebound.get("planning_notes") or []
+        if not str(note).startswith("Live reachability bound every modeled action")
+    ]
+    notes.insert(
+        1,
+        f"Live reachability bound every modeled action to {short_target}; "
+        "this binding is planning context, not proof.",
+    )
+    rebound["planning_notes"] = notes
+    return {
+        key: value
+        for key, value in rebound.items()
+        if value not in (None, "", [], {})
+    }
+
+
 def _state_transition_model_attack_candidates(
     model: dict,
     *,
@@ -22283,11 +27451,15 @@ def _state_transition_model_attack_candidates(
     protocol_graph: dict | None,
     source_path: str | None,
     mode: str,
+    exposures: list[dict] | None = None,
+    live_path: str | None = None,
+    binding_summary: dict | None = None,
 ) -> list[dict]:
     """Build generic invariant attack-graph candidates from a state-transition
-    model's candidate_invariants. Each candidate is keyed by invariant, mapped to
-    concrete action-space entrypoints where possible, and always needs live
-    binding before any high/critical claim."""
+    model's candidate_invariants. Source-only candidates remain invariant-keyed;
+    reachability-aware candidates are separately qualified by exact source
+    definitions plus ``(chain,address)``. These remain planning candidates,
+    never evidence or proof."""
     model_id = (
         str(model.get("state_transition_model_id") or model.get("id") or "stm").strip()
         or "stm"
@@ -22296,6 +27468,17 @@ def _state_transition_model_attack_candidates(
     lenses = model.get("lenses")
     lens_names = sorted(lenses.keys()) if isinstance(lenses, dict) and lenses else []
     candidates: list[dict] = []
+    binding_stats = {
+        "live_target_cap_per_invariant": _STM_LIVE_TARGETS_PER_INVARIANT,
+        "live_targets_considered": 0,
+        "live_targets_selected": 0,
+        "live_targets_omitted": 0,
+        "live_target_omissions": [],
+        "live_target_omission_records_truncated": 0,
+        "live_target_binding_truncated": False,
+        "_omitted_frontier_entries": [],
+        "_omission_invariants": 0,
+    }
     for position, invariant in enumerate(
         model.get("candidate_invariants") or [], start=1
     ):
@@ -22306,17 +27489,36 @@ def _state_transition_model_attack_candidates(
         statement = str(invariant.get("statement") or "").strip()
         matched_actions: list[dict] = []
         matched_keys: set[str] = set()
-        for contract, function in _stm_invariant_target_refs(invariant, model):
-            action = index.get((contract.lower(), function.lower())) or index.get(
+        for ref in _stm_invariant_target_refs(invariant, model):
+            contract = str(ref.get("contract") or "")
+            function = str(ref.get("function") or "")
+            resolved_actions = index.get(
+                (contract.lower(), function.lower())
+            ) or index.get(
                 ("", function.lower())
+            ) or []
+            has_exact_identity = any(
+                ref.get(key)
+                for key in (
+                    "signature",
+                    "file",
+                    "action_definition_key",
+                    "action_uid",
+                )
             )
-            if action is None:
+            # Legacy Contract.function references are compatible only when they
+            # resolve uniquely.  Silently expanding one old string across
+            # overloads recreates the false joins this identity layer prevents.
+            if not has_exact_identity and len(resolved_actions) != 1:
                 continue
-            key = _coverage_action_key(action)
-            if key in matched_keys:
-                continue
-            matched_keys.add(key)
-            matched_actions.append(action)
+            for action in resolved_actions:
+                if not _stm_action_matches_target_ref(action, ref):
+                    continue
+                key = _coverage_definition_key(action)
+                if key in matched_keys:
+                    continue
+                matched_keys.add(key)
+                matched_actions.append(action)
         matched_prompts = [
             prompt
             for prompt in model.get("experiment_prompts") or []
@@ -22324,14 +27526,74 @@ def _state_transition_model_attack_candidates(
             and _stm_prompt_matches_invariant(prompt, invariant)
         ]
         score = _stm_candidate_score(invariant, matched_actions)
-        # Generic model invariants are source-only planning leads until target
-        # binding exists. Cap their planning priority so "critical" is reserved
-        # for branches with concrete live exposure or objective evidence.
-        planning_score = min(score, 8)
-        blockers = [
-            "live reachability not mapped",
-            "target address not bound",
+        bound_exposure_groups = (
+            _stm_coherent_live_exposures(matched_actions, exposures or [])
+            if mode == "reachability_aware"
+            else []
+        )
+        selected_bound_groups = bound_exposure_groups[
+            :_STM_LIVE_TARGETS_PER_INVARIANT
         ]
+        omitted_bound_groups = bound_exposure_groups[
+            _STM_LIVE_TARGETS_PER_INVARIANT:
+        ]
+        bound_exposures = selected_bound_groups[0] if selected_bound_groups else []
+        live_bound = bool(bound_exposures)
+        binding_stats["live_targets_considered"] += len(bound_exposure_groups)
+        binding_stats["live_targets_selected"] += len(selected_bound_groups)
+        binding_stats["live_targets_omitted"] += len(omitted_bound_groups)
+        # Generic model invariants remain planning leads even after target
+        # binding. Cap their priority so "critical" is reserved for objective
+        # evidence rather than a model-derived invariant skeleton.
+        planning_score = min(score, 8)
+        if live_bound:
+            candidate_actions = [
+                _stm_candidate_action_from_exposure(exposure, invariant)
+                for exposure in bound_exposures
+            ]
+            representative = max(
+                bound_exposures,
+                key=lambda exposure: _attack_graph_candidate_score(exposure, ""),
+            )
+            target_address = representative.get("target_address")
+            target_binding = representative.get("target_binding") or {}
+            exposure_status = (
+                "exposed"
+                if all(item.get("exposure") == "exposed" for item in bound_exposures)
+                else "source_public_live_unknown"
+            )
+            live_status = (
+                "deployed"
+                if all(item.get("live_status") == "deployed" for item in bound_exposures)
+                else representative.get("live_status")
+            )
+            reachability = representative.get("reachability") or {}
+            blockers = _dedupe_text([
+                str(blocker)
+                for action in candidate_actions
+                for blocker in action.get("live_blockers") or []
+            ])
+        else:
+            candidate_actions = [
+                _stm_candidate_action(action, invariant) for action in matched_actions
+            ]
+            representative = {}
+            target_address = None
+            target_binding = {}
+            exposure_status = "model_invariant"
+            live_status = None
+            reachability = "needs_live_context"
+            blockers = (
+                [
+                    "live reachability did not bind every modeled action to one "
+                    "coherent callable target"
+                ]
+                if mode == "reachability_aware"
+                else [
+                    "live reachability not mapped",
+                    "target address not bound",
+                ]
+            )
         if not matched_actions:
             blockers.insert(
                 0,
@@ -22341,9 +27603,20 @@ def _state_transition_model_attack_candidates(
         planning_notes = [
             "Generic state-transition invariant probe: planning skeleton, not a "
             "finding.",
-            "Falsify the invariant with an objective experiment; live binding is "
-            "required before any high/critical claim.",
+            (
+                f"Live reachability bound every modeled action to {target_address}; "
+                "this binding is planning context, not proof."
+                if live_bound
+                else "Falsify the invariant with an objective experiment; live "
+                "binding is required before any high/critical claim."
+            ),
         ]
+        if mode == "reachability_aware" and not live_bound:
+            planning_notes.append(
+                "The supplied live-reachability map was consulted but did not "
+                "resolve one callable target for every modeled action; preserve "
+                "source/context work instead of remapping unchanged inputs."
+            )
         if lens_names:
             # Lenses annotate, they never score: surface their names so the agent
             # has the cross-reference without letting them dominate selection.
@@ -22361,14 +27634,25 @@ def _state_transition_model_attack_candidates(
             "priority": _plan_priority(planning_score),
             "candidate_kind": "generic_invariant",
             "mechanism": "generic_state_transition",
-            "exposure": "model_invariant",
-            "reachability": "needs_live_context",
+            "target_address": target_address,
+            "target_binding": target_binding,
+            "exposure": exposure_status,
+            "live_status": live_status,
+            "reachability": reachability,
             "objective": (
                 f"Falsify invariant: {statement}" if statement
                 else f"Falsify {kind} invariant"
             ),
-            "contract": invariant.get("contract") or None,
-            "function": invariant.get("function") or None,
+            "contract": (
+                invariant.get("contract")
+                or representative.get("contract")
+                or None
+            ),
+            "function": (
+                invariant.get("function")
+                or representative.get("function")
+                or None
+            ),
             "invariant": {
                 "id": invariant_id,
                 "kind": kind,
@@ -22379,10 +27663,12 @@ def _state_transition_model_attack_candidates(
                 "kind": "state_transition_model",
                 "state_transition_model": source_path,
                 "invariant_id": invariant_id,
+                **(
+                    {"live_reachability": live_path}
+                    if mode == "reachability_aware" and live_path else {}
+                ),
             },
-            "actions": [
-                _stm_candidate_action(action, invariant) for action in matched_actions
-            ],
+            "actions": candidate_actions,
             "observations": _stm_candidate_observations(invariant, matched_prompts),
             "blockers": blockers,
             "required_live_evidence": [
@@ -22399,8 +27685,14 @@ def _state_transition_model_attack_candidates(
                 if str(item).strip()
             ][:4],
             "recommended_next_tool": (
+                "inventory_live_targets then compose_sequence_experiment with "
+                "explicit actions"
+                if live_bound else
+                "record_fork_context or update_campaign with a coherent deployed "
+                "target; do not remap unchanged reachability"
+                if mode == "reachability_aware" else
                 "map_live_reachability then build_attack_graph "
-                "mode=reachability_aware, or prepare_fork_exploit_workbench after "
+                "mode=reachability_aware, or compose_sequence_experiment after "
                 "target binding"
             ),
         }
@@ -22409,7 +27701,89 @@ def _state_transition_model_attack_candidates(
             for key, value in candidate.items()
             if value not in (None, "", [], {})
         }
-        candidates.append(candidate)
+        if not live_bound:
+            candidates.append(candidate)
+            continue
+
+        selected_candidates = [
+            _stm_bind_candidate_to_live_target(
+                candidate,
+                bound_exposures=group,
+                invariant=invariant,
+                model_id=model_id,
+                invariant_id=invariant_id,
+                kind=kind,
+                binding_rank=rank,
+            )
+            for rank, group in enumerate(selected_bound_groups, start=1)
+        ]
+        candidates.extend(selected_candidates)
+        if not omitted_bound_groups:
+            continue
+
+        binding_stats["_omission_invariants"] += 1
+        omitted_refs = []
+        for offset, group in enumerate(omitted_bound_groups, start=1):
+            needs_frontier_entry = len(
+                binding_stats["_omitted_frontier_entries"]
+            ) < _STM_OMITTED_TARGET_FRONTIER_CAP
+            needs_summary_ref = len(omitted_refs) < 8
+            if not (needs_frontier_entry or needs_summary_ref):
+                continue
+            omitted_candidate = _stm_bind_candidate_to_live_target(
+                candidate,
+                bound_exposures=group,
+                invariant=invariant,
+                model_id=model_id,
+                invariant_id=invariant_id,
+                kind=kind,
+                binding_rank=len(selected_bound_groups) + offset,
+            )
+            if needs_summary_ref:
+                omitted_refs.append({
+                    "attack_key": omitted_candidate.get("attack_key"),
+                    "target_identity": omitted_candidate.get("target_identity"),
+                    "action_definition_key": omitted_candidate.get(
+                        "action_definition_key"
+                    ),
+                    "live_binding_score": omitted_candidate.get(
+                        "live_binding_score"
+                    ),
+                })
+            if needs_frontier_entry:
+                binding_stats["_omitted_frontier_entries"].append(
+                    _attack_graph_candidate_frontier_entry(
+                        omitted_candidate,
+                        reason="omitted_by_truncation",
+                    )
+                )
+        if len(binding_stats["live_target_omissions"]) < _STM_OMISSION_RECORD_CAP:
+            binding_stats["live_target_omissions"].append({
+                "invariant_id": invariant_id,
+                "invariant_kind": kind,
+                "selected_targets": [
+                    selected.get("target_identity")
+                    for selected in selected_candidates
+                    if selected.get("target_identity")
+                ],
+                "omitted_target_count": len(omitted_bound_groups),
+                "omitted_targets": omitted_refs,
+                "additional_omitted": max(
+                    0,
+                    len(omitted_bound_groups) - len(omitted_refs),
+                ),
+            })
+    binding_stats["live_target_omission_records_truncated"] = max(
+        0,
+        int(binding_stats.pop("_omission_invariants"))
+        - len(binding_stats["live_target_omissions"]),
+    )
+    binding_stats["live_target_binding_truncated"] = bool(
+        binding_stats["live_targets_omitted"]
+    )
+    if binding_summary is not None:
+        binding_summary.clear()
+        binding_summary.update(binding_stats)
     return candidates
 
 
@@ -22431,6 +27805,7 @@ def _attack_graph_candidate_frontier_entry(candidate: dict, *, reason: str) -> d
         "attack_key": candidate.get("attack_key"),
         "title": candidate.get("title"),
         "action_key": candidate.get("action_key"),
+        "action_definition_key": candidate.get("action_definition_key"),
         "contract": candidate.get("contract"),
         "function": candidate.get("function"),
         "candidate_kind": candidate.get("candidate_kind"),
@@ -22445,6 +27820,14 @@ def _attack_graph_candidate_frontier_entry(candidate: dict, *, reason: str) -> d
         "blockers": [str(item) for item in candidate.get("blockers") or []][:6],
         "recommended_next_tool": candidate.get("recommended_next_tool"),
         "target_address": candidate.get("target_address"),
+        "network": candidate.get("network"),
+        "chain_id": candidate.get("chain_id"),
+        "target_identity": candidate.get("target_identity"),
+        "signature": candidate.get("signature"),
+        "file": candidate.get("file"),
+        "action_uid": candidate.get("action_uid"),
+        "live_binding_rank": candidate.get("live_binding_rank"),
+        "live_binding_score": candidate.get("live_binding_score"),
         "duplicate_count": candidate.get("duplicate_count"),
         "candidate_id": candidate.get("candidate_id"),
         # Preserve the generic-invariant locator so a frontier-promoted branch
@@ -22461,16 +27844,22 @@ def _attack_graph_low_score_frontier_entry(exposure: dict, score: int) -> dict:
     """Compact frontier entry for a reachability exposure scored below the
     candidate floor — preserved instead of discarded."""
     action_key = str(exposure.get("action_key") or "")
+    action_definition_key = str(
+        exposure.get("action_definition_key") or action_key
+    )
+    action_identity = _attack_graph_action_identity(exposure)
+    target_key = _chain_qualified_target_key(exposure)
     candidate_like = {
         "attack_key": (
-            f"{str(exposure.get('target_address') or '').lower()}:"
-            f"{action_key}:{exposure.get('exposure')}"
+            f"{target_key}:{action_identity}:{exposure.get('exposure')}"
         ),
         "title": (
             f"Low-signal reachable {action_key}" if action_key
             else "Low-signal reachable action"
         ),
         "action_key": action_key,
+        "action_definition_key": action_definition_key,
+        "action_uid": exposure.get("action_uid"),
         "contract": exposure.get("contract"),
         "function": exposure.get("function"),
         "priority_score": score,
@@ -22481,6 +27870,9 @@ def _attack_graph_low_score_frontier_entry(exposure: dict, score: int) -> dict:
         "affordances": exposure.get("affordances") or [],
         "objective": _attack_graph_objective(exposure),
         "target_address": exposure.get("target_address"),
+        "network": exposure.get("network"),
+        "chain_id": exposure.get("chain_id"),
+        "target_identity": _chain_qualified_target_metadata(exposure),
     }
     return _attack_graph_candidate_frontier_entry(candidate_like, reason="omitted_by_score")
 
@@ -22489,8 +27881,13 @@ def _attack_graph_frontier_reference(entry: dict) -> dict:
     reference = {
         "attack_key": entry.get("attack_key"),
         "action_key": entry.get("action_key"),
+        "action_definition_key": entry.get("action_definition_key"),
         "title": entry.get("title"),
         "priority_score": entry.get("priority_score"),
+        "target_address": entry.get("target_address"),
+        "target_identity": entry.get("target_identity"),
+        "network": entry.get("network"),
+        "chain_id": entry.get("chain_id"),
         "frontier_reason": entry.get("frontier_reason"),
     }
     return {key: value for key, value in reference.items() if value not in (None, "", [], {})}
@@ -22545,6 +27942,8 @@ def _assemble_attack_graph_frontier(
     mode: str,
     low_score_entries: list[dict],
     truncated_candidates: list[dict],
+    state_model_target_omissions: list[dict],
+    causal_path_omissions: list[dict],
     frontier_max_items: int,
 ) -> tuple[dict, dict]:
     """Bucket preserved branches into the novelty frontier. Reason buckets hold
@@ -22552,7 +27951,12 @@ def _assemble_attack_graph_frontier(
     categories: dict[str, list[dict]] = {
         name: [] for name in _ATTACK_GRAPH_FRONTIER_CATEGORIES
     }
-    distinct: list[dict] = list(low_score_entries)
+    # Exact omitted live deployments and known compatible causal paths are more
+    # actionable than bare low-signal entrypoints, so reserve their place before
+    # applying the shared frontier cap. They remain planning context.
+    distinct: list[dict] = list(state_model_target_omissions)
+    distinct.extend(causal_path_omissions)
+    distinct.extend(low_score_entries)
     for candidate in truncated_candidates:
         distinct.append(
             _attack_graph_candidate_frontier_entry(candidate, reason="omitted_by_truncation")
@@ -22564,11 +27968,9 @@ def _assemble_attack_graph_frontier(
         reason = str(entry.get("frontier_reason") or "omitted_by_truncation")
         if reason in _ATTACK_GRAPH_FRONTIER_FULL_CATEGORIES:
             categories[reason].append(entry)
-        if reason == "low_signal_entrypoints":
-            # Bare entrypoints are terminal: preserved for the audit trail but
-            # kept out of the semantic/novelty buckets, the source-only
-            # needs-live-context list, and the diversity sample so they never
-            # drive curiosity exploration.
+        if reason in {"causal_path_omissions", "low_signal_entrypoints"}:
+            # These explicit cap/audit-trail records are terminal: keep them
+            # out of semantic/novelty buckets and curiosity scheduling.
             continue
         if mode == "source_only":
             categories["source_only_needs_live_context"].append(
@@ -22580,7 +27982,8 @@ def _assemble_attack_graph_frontier(
         [
             entry
             for entry in distinct
-            if entry.get("frontier_reason") != "low_signal_entrypoints"
+            if entry.get("frontier_reason")
+            not in {"causal_path_omissions", "low_signal_entrypoints"}
         ]
     )
 
@@ -22636,6 +28039,10 @@ async def _build_attack_graph(container: AuditContainer, args: dict) -> str:
         return f"Error: {stm_error}"
     if not action_space:
         return "Error: build_attack_graph requires an action-space artifact"
+    joined_live_action_facts = _hydrate_live_exposure_action_facts(
+        live_reachability,
+        action_space,
+    )
     has_live = bool(live_reachability)
     has_live_context = _live_reachability_has_deployed_context(live_reachability)
     if mode == "reachability_aware" and not has_live:
@@ -22685,10 +28092,11 @@ async def _build_attack_graph(container: AuditContainer, args: dict) -> str:
         )
 
     # Generic invariant branches from a state-transition model are merged after
-    # node/edge derivation (they are invariant-keyed, not graph nodes) and then
-    # compete on score for top candidate_chains; the rest are preserved in the
-    # frontier's generic_invariant_candidates bucket like any other branch.
+    # node/edge derivation. Source plans are invariant-keyed; live plans are
+    # separately qualified by exact definition + (chain,address). Bounded
+    # deployment overflow is preserved as compact frontier entries.
     stm_candidates: list[dict] = []
+    stm_binding_summary: dict = {}
     if stm_model:
         stm_candidates = _state_transition_model_attack_candidates(
             stm_model,
@@ -22696,22 +28104,147 @@ async def _build_attack_graph(container: AuditContainer, args: dict) -> str:
             protocol_graph=protocol_graph,
             source_path=stm_path,
             mode=resolved_mode,
+            exposures=exposures,
+            live_path=live_path or None,
+            binding_summary=stm_binding_summary,
         )
         candidates.extend(stm_candidates)
 
-    candidates.sort(key=lambda item: (-int(item.get("priority_score", 0)), item["title"]))
+    causal_candidates, causal_search = _causal_attack_graph_candidates(
+        action_space=action_space,
+        exposures=exposures,
+        mode=resolved_mode,
+        focus=focus,
+        action_space_path=action_space_path,
+        live_path=live_path or "",
+        protocol_graph_path=protocol_graph_path or "",
+    )
+    candidates.extend(causal_candidates)
+    # Keep the attack graph itself coherent with the candidate paths.  These
+    # same-contract edges are source-derived planning relations; the candidate
+    # still needs live binding, objective replay, and a negative control.
+    node_ids = {str(node.get("id") or "") for node in nodes}
+    edge_keys = {
+        (str(edge.get("from") or ""), str(edge.get("to") or ""), str(edge.get("kind") or ""))
+        for edge in edges
+    }
+
+    def scoped_action_id(chain_key: str, identity: str) -> str:
+        return (
+            f"action:{chain_key}:{identity}"
+            if chain_key else f"action:{identity}"
+        )
+
+    def causal_dependency_endpoint(
+        dependency: dict,
+        role: str,
+        chain_key: str,
+    ) -> tuple[str, str, str]:
+        definition = str(dependency.get(role) or "").strip()
+        action_uid = str(
+            dependency.get(f"{role}_action_uid") or ""
+        ).strip()
+        candidates = []
+        if action_uid:
+            candidates.append(scoped_action_id(chain_key, action_uid))
+            if definition:
+                digest = hashlib.sha256(
+                    action_uid.encode("utf-8", "replace")
+                ).hexdigest()[:12]
+                candidates.append(scoped_action_id(
+                    chain_key, f"{definition}@{digest}"
+                ))
+        if definition:
+            candidates.append(scoped_action_id(chain_key, definition))
+        for node_id in candidates:
+            if node_id in node_ids:
+                return node_id, definition, action_uid
+        # A legacy/source-only graph may not have materialized this endpoint
+        # yet. Preserve its compact definition id when available; modern live
+        # graphs resolve above to the already-existing source-stable UID node.
+        identity = definition or action_uid
+        return scoped_action_id(chain_key, identity), definition, action_uid
+
+    for candidate in causal_candidates:
+        causal_path = candidate.get("causal_path") or {}
+        candidate_identity = (
+            candidate.get("target_identity")
+            if isinstance(candidate.get("target_identity"), dict) else {}
+        )
+        chain_key = str(candidate_identity.get("chain_key") or "").strip()
+        for dependency in causal_path.get("dependencies") or []:
+            if not isinstance(dependency, dict):
+                continue
+            writer_id, writer, writer_uid = causal_dependency_endpoint(
+                dependency, "writer", chain_key
+            )
+            reader_id, reader, reader_uid = causal_dependency_endpoint(
+                dependency, "reader", chain_key
+            )
+            if not writer or not reader:
+                continue
+            for node_id, label, action_uid in (
+                (writer_id, writer, writer_uid),
+                (reader_id, reader, reader_uid),
+            ):
+                if node_id in node_ids:
+                    continue
+                nodes.append({
+                    "id": node_id,
+                    "kind": "entrypoint",
+                    "label": label,
+                    "action_definition_key": label,
+                    "action_uid": action_uid or None,
+                    "network": candidate.get("network"),
+                    "chain_id": candidate.get("chain_id"),
+                })
+                node_ids.add(node_id)
+            edge_key = (writer_id, reader_id, "feeds_state_to")
+            if edge_key in edge_keys:
+                continue
+            edges.append({
+                "from": writer_id,
+                "to": reader_id,
+                "kind": "feeds_state_to",
+                "state": dependency.get("state") or [],
+                "accesses": dependency.get("accesses") or [],
+                "source_file": dependency.get("source_file"),
+                "writer_action_uid": writer_uid or None,
+                "reader_action_uid": reader_uid or None,
+                "target_address": candidate.get("target_address"),
+                "network": candidate.get("network"),
+                "chain_id": candidate.get("chain_id"),
+            })
+            edge_keys.add(edge_key)
+
+    candidates.sort(key=lambda item: (
+        -int(item.get("priority_score", 0)),
+        int(item.get("live_binding_rank", 0) or 0),
+        item["title"],
+    ))
     top_candidates = candidates[:max_candidates]
     omitted_candidates = candidates[max_candidates:]
     for index, candidate in enumerate(top_candidates, start=1):
         candidate["candidate_id"] = f"agcand-{index:03d}"
 
+    stm_omitted_frontier = list(
+        stm_binding_summary.get("_omitted_frontier_entries") or []
+    )
     low_score_entries = list(low_score_frontier.values())
-    all_candidate_count = len(candidates) + len(low_score_entries)
+    all_candidate_count = (
+        len(candidates)
+        + len(low_score_entries)
+        + len(stm_omitted_frontier)
+    )
     if preserve_frontier:
         frontier, frontier_summary = _assemble_attack_graph_frontier(
             mode=resolved_mode,
             low_score_entries=low_score_entries,
             truncated_candidates=omitted_candidates,
+            state_model_target_omissions=stm_omitted_frontier,
+            causal_path_omissions=(
+                causal_search.get("omitted_path_frontier") or []
+            ),
             frontier_max_items=frontier_max_items,
         )
     else:
@@ -22738,6 +28271,7 @@ async def _build_attack_graph(container: AuditContainer, args: dict) -> str:
         "all_candidate_count": all_candidate_count,
         "frontier": frontier,
         "frontier_summary": frontier_summary,
+        "causal_search": causal_search,
         "summary": {
             "mode": resolved_mode,
             "nodes": len(nodes),
@@ -22756,6 +28290,12 @@ async def _build_attack_graph(container: AuditContainer, args: dict) -> str:
                 1 for item in top_candidates
                 if item.get("candidate_kind") == "generic_invariant"
             ),
+            "causal_state_path_candidates": sum(
+                1 for item in top_candidates
+                if item.get("candidate_kind") == "causal_state_path"
+            ),
+            "causal_search_truncated": bool(causal_search.get("truncated")),
+            "live_exposure_action_facts_joined": joined_live_action_facts,
             "blocked_or_gated_candidates": sum(
                 1 for item in top_candidates if item.get("blockers")
             ),
@@ -22779,6 +28319,14 @@ async def _build_attack_graph(container: AuditContainer, args: dict) -> str:
                 stm_model.get("state_transition_model_id") or stm_model.get("id")
             ),
             "candidate_count": len(stm_candidates),
+            **(
+                {
+                    key: value
+                    for key, value in stm_binding_summary.items()
+                    if not key.startswith("_")
+                }
+                if resolved_mode == "reachability_aware" else {}
+            ),
         }
         payload["state_transition_model"] = state_transition_model_summary
     path = f"/workspace/campaign/attack-graphs/{graph_id}.json"
@@ -22827,12 +28375,21 @@ async def _build_attack_graph(container: AuditContainer, args: dict) -> str:
         "needs_live_context": needs_live_context,
         "summary": payload["summary"],
         "frontier_summary": frontier_summary,
+        "causal_search": causal_search,
         "candidate_chains": top_candidates,
     }
     if state_transition_model_summary:
         response["state_transition_model"] = {
             "path": stm_path,
             "candidate_count": len(stm_candidates),
+            **(
+                {
+                    key: value
+                    for key, value in stm_binding_summary.items()
+                    if not key.startswith("_")
+                }
+                if resolved_mode == "reachability_aware" else {}
+            ),
         }
     return json.dumps(response, indent=2, sort_keys=True)
 
@@ -22845,12 +28402,23 @@ def _reachability_attack_graph_candidates(
     live_path: str,
     protocol_graph_path: str,
 ) -> tuple[list[dict], dict[str, dict], list[dict], list[dict], list[dict]]:
-    exposures = [
-        exposure
-        for profile in live_reachability.get("profiles") or []
-        for exposure in (profile.get("action_exposures") or [])
-        if isinstance(exposure, dict)
-    ]
+    exposures = []
+    for profile in live_reachability.get("profiles") or []:
+        if not isinstance(profile, dict):
+            continue
+        for raw_exposure in profile.get("action_exposures") or []:
+            if not isinstance(raw_exposure, dict):
+                continue
+            exposure = dict(raw_exposure)
+            if exposure.get("network") in (None, ""):
+                exposure["network"] = profile.get("network")
+            if exposure.get("chain_id") in (None, ""):
+                exposure["chain_id"] = profile.get("chain_id")
+            if not exposure.get("target_identity"):
+                exposure["target_identity"] = _chain_qualified_target_metadata(
+                    exposure
+                )
+            exposures.append(exposure)
     nodes, edges = _attack_graph_nodes_edges_from_exposures(exposures)
     candidates = []
     low_signal_candidates_by_key: dict[str, dict] = {}
@@ -22875,6 +28443,10 @@ def _reachability_attack_graph_candidates(
             continue
         direction_hint = _attack_graph_direction_hint(exposure)
         action_key = str(exposure.get("action_key") or "")
+        action_definition_key = str(
+            exposure.get("action_definition_key") or action_key
+        )
+        action_identity = _attack_graph_action_identity(exposure)
         if not _exposure_is_live_callable(exposure) and dedupe_key in low_signal_candidates_by_key:
             existing = low_signal_candidates_by_key[dedupe_key]
             similar = existing.setdefault("similar_targets", [])
@@ -22883,9 +28455,9 @@ def _reachability_attack_graph_candidates(
                 similar.append(target_address)
             existing["duplicate_count"] = int(existing.get("duplicate_count") or 1) + 1
             continue
+        target_key = _chain_qualified_target_key(exposure)
         attack_key = (
-            f"{str(exposure.get('target_address') or '').lower()}:"
-            f"{action_key}:{exposure.get('exposure')}"
+            f"{target_key}:{action_identity}:{exposure.get('exposure')}"
         )
         blockers = []
         if exposure.get("exposure") in {
@@ -22907,12 +28479,16 @@ def _reachability_attack_graph_candidates(
             "priority_score": score,
             "priority": _plan_priority(score),
             "action_key": action_key,
+            "action_definition_key": action_definition_key,
             "action_uid": exposure.get("action_uid"),
             "contract": exposure.get("contract"),
             "function": exposure.get("function"),
             "profile_src": exposure.get("profile_src"),
             "code_hash": exposure.get("code_hash"),
             "target_address": exposure.get("target_address"),
+            "network": exposure.get("network"),
+            "chain_id": exposure.get("chain_id"),
+            "target_identity": _chain_qualified_target_metadata(exposure),
             "exposure": exposure.get("exposure"),
             "reachability": exposure.get("reachability"),
             "target_binding": target_binding,
@@ -22959,14 +28535,12 @@ def _reachability_attack_graph_candidates(
         protocol_graph_path=protocol_graph_path or "",
         focus=focus,
     ))
-    economic_candidate = _lending_exchange_rate_candidate(
+    candidates.extend(_lending_exchange_rate_candidates(
         exposures=exposures,
         action_space_path=action_space_path,
         live_path=live_path,
         protocol_graph_path=protocol_graph_path or "",
-    )
-    if economic_candidate:
-        candidates.append(economic_candidate)
+    ))
     return candidates, low_score_frontier, exposures, nodes, edges
 
 
@@ -23001,18 +28575,6 @@ _GRAPH_HINT_CONCEPTS = {
     "cross_contract_calls": ("boundary:cross_contract", "trust_boundary", "cross-contract dependency", "calls_cross_contract_dependency"),
     "economic_parameters": ("state:economic_parameter", "economic_parameter", "economic parameter hint", "has_economic_parameter_hint"),
 }
-
-_GRAPH_STATE_DECL_RE = re.compile(
-    r"^\s*"
-    r"(?!(?:function|event|modifier|struct|enum|error|using|return|if|for|while|"
-    r"require|assert|emit|import|pragma)\b)"
-    r"(?P<type>mapping\s*\([^;]+\)|[A-Za-z_][A-Za-z0-9_<>,.\[\]]*)"
-    r"\s+"
-    r"(?:(?:public|private|internal|external|constant|immutable|override)\s+)*"
-    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
-    r"\s*(?:=|;)",
-)
-
 
 def _graph_location(file: str, line: int | None) -> dict:
     location = {"file": file}
@@ -23170,6 +28732,13 @@ def _graph_action_node_id(contract: str, function: str) -> str:
     return f"action:{contract}.{function}"
 
 
+def _graph_disambiguated_node_id(node_id: str, *identity_parts: object) -> str:
+    """Return a compact stable suffix for a source-definition collision."""
+    identity = "\0".join(str(part or "") for part in identity_parts)
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:10]
+    return f"{node_id}#{digest}"
+
+
 def _graph_state_node_id(kind: str, contract: str, name: str) -> str:
     prefix = {
         "asset_hint": "asset",
@@ -23180,7 +28749,10 @@ def _graph_state_node_id(kind: str, contract: str, name: str) -> str:
     return f"{prefix}:{contract}.{name}"
 
 
-def _graph_action_bodies(source: str, starts: list[int]) -> dict[tuple[str, str], dict]:
+def _graph_action_bodies(
+    source: str,
+    starts: list[int],
+) -> dict[tuple[str, str], dict]:
     bodies = {}
     scan_source = _strip_comments_preserve_layout(source)
     function_pattern = re.compile(
@@ -23211,15 +28783,23 @@ def _graph_action_bodies(source: str, starts: list[int]) -> dict[tuple[str, str]
             if visibility not in {"public", "external"} and name not in {"receive", "fallback"}:
                 continue
             absolute_start = contract["start"] + match.start()
+            signature = name
+            if name not in {"receive", "fallback"}:
+                parameter_types = [
+                    _parameter_type(str(parameter.get("raw") or ""))
+                    for parameter in _parse_parameters(match.group(2))
+                ]
+                signature = f"{name}({','.join(parameter_types)})"
             body = ""
             if terminator == "{":
                 open_index = contract["start"] + match.end() - 1
                 close_index = _find_matching_brace(source, open_index)
                 body = source[open_index:close_index + 1]
-            bodies[(contract["name"], name)] = {
+            line = _line_at(starts, absolute_start)
+            bodies[(contract["name"], signature)] = {
                 "body": body,
                 "file": contract.get("file"),
-                "line": _line_at(starts, absolute_start),
+                "line": line,
             }
     return bodies
 
@@ -23241,6 +28821,50 @@ def _parse_protocol_graph_file(
     nodes: dict[str, dict] = {}
     edges: dict[tuple[str, str, str], dict] = {}
     state_nodes_by_contract: dict[str, list[dict]] = {}
+    causal_readers: dict[tuple[str, str], list[str]] = {}
+    causal_writers: dict[tuple[str, str], list[str]] = {}
+    causal_actions_by_id: dict[str, dict] = {}
+    action_contracts = {
+        str(item.get("name") or ""): item
+        for item in action_space.get("contracts") or []
+        if isinstance(item, dict) and item.get("name")
+    }
+    graph_entries = (
+        (action_space.get("actions") or [])
+        + (action_space.get("observations") or [])
+    )
+    exposed_functions = {
+        (str(item.get("contract") or ""), str(item.get("function") or ""))
+        for item in graph_entries
+        if isinstance(item, dict) and item.get("contract") and item.get("function")
+    }
+    action_id_counts: dict[str, int] = {}
+    for entry in graph_entries:
+        if not isinstance(entry, dict):
+            continue
+        contract = str(entry.get("contract") or "")
+        function = str(entry.get("function") or "")
+        if contract and function:
+            legacy_id = _graph_action_node_id(contract, function)
+            action_id_counts[legacy_id] = action_id_counts.get(legacy_id, 0) + 1
+    action_ids_by_entry: dict[int, str] = {}
+    action_ids_by_name: dict[tuple[str, str], list[str]] = {}
+    for entry in graph_entries:
+        if not isinstance(entry, dict):
+            continue
+        contract = str(entry.get("contract") or "")
+        function = str(entry.get("function") or "")
+        if not contract or not function:
+            continue
+        legacy_id = _graph_action_node_id(contract, function)
+        action_id = legacy_id
+        if action_id_counts.get(legacy_id, 0) > 1:
+            action_id = _graph_disambiguated_node_id(
+                legacy_id,
+                _action_signature(entry),
+            )
+        action_ids_by_entry[id(entry)] = action_id
+        action_ids_by_name.setdefault((contract, function), []).append(action_id)
 
     for contract in _contract_ranges(source, starts):
         contract_id = f"contract:{contract['name']}"
@@ -23252,22 +28876,18 @@ def _parse_protocol_graph_file(
             label=contract["name"],
             location=contract_location,
         )
-        block = source[contract["start"]:contract["end"]]
-        for offset, line in enumerate(block.splitlines()):
-            stripped = line.split("//", 1)[0].strip()
-            if not stripped:
+        contract_entry = action_contracts.get(str(contract["name"])) or {}
+        for declaration in contract_entry.get("state_variables") or []:
+            if not isinstance(declaration, dict):
                 continue
-            match = _GRAPH_STATE_DECL_RE.match(stripped)
-            if not match:
+            name = str(declaration.get("name") or "").strip()
+            if not name:
                 continue
-            type_name = " ".join(match.group("type").split())
-            name = match.group("name")
+            type_name = str(declaration.get("type") or "").strip()
             categories = _graph_state_categories(type_name, name)
-            if not categories:
-                continue
             kind = _graph_state_node_kind(categories)
             node_id = _graph_state_node_id(kind, contract["name"], name)
-            line_number = _line_at(starts, contract["start"]) + offset
+            line_number = int(declaration.get("line") or contract["line"])
             location = _graph_location(path, line_number)
             _graph_add_node(
                 nodes,
@@ -23288,7 +28908,7 @@ def _parse_protocol_graph_file(
                 kind=edge_kind,
                 label=edge_label,
                 location=location,
-                evidence=stripped[:240],
+                evidence=str(declaration.get("declaration") or name)[:240],
             )
             state_nodes_by_contract.setdefault(contract["name"], []).append({
                 "id": node_id,
@@ -23297,14 +28917,21 @@ def _parse_protocol_graph_file(
                 "categories": categories,
             })
 
+    state_nodes_by_owner_name = {
+        (owner, str(item.get("name") or "")): item
+        for owner, state_nodes in state_nodes_by_contract.items()
+        for item in state_nodes
+        if item.get("name")
+    }
     action_bodies = _graph_action_bodies(source, starts)
-    for entry in action_space.get("actions", []) + action_space.get("observations", []):
+    for entry in graph_entries:
         contract = str(entry.get("contract") or "")
         function = str(entry.get("function") or "")
         if not contract or not function:
             continue
         contract_id = f"contract:{contract}"
-        action_id = _graph_action_node_id(contract, function)
+        legacy_action_id = _graph_action_node_id(contract, function)
+        action_id = action_ids_by_entry.get(id(entry), legacy_action_id)
         location = _graph_location(path, entry.get("line"))
         node_kind = "observation" if entry.get("mutability") in {"view", "pure"} else "entrypoint"
         affordances = [str(item) for item in entry.get("affordances") or []]
@@ -23317,6 +28944,8 @@ def _parse_protocol_graph_file(
             location=location,
             contract=contract,
             function=function,
+            signature=_action_signature(entry),
+            legacy_id=(legacy_action_id if action_id != legacy_action_id else None),
             mutability=entry.get("mutability"),
             visibility=entry.get("visibility"),
         )
@@ -23368,9 +28997,18 @@ def _parse_protocol_graph_file(
                 location=location,
             )
 
-        action_body = action_bodies.get((contract, function), {}).get("body", "")
+        action_body = action_bodies.get(
+            (contract, _action_signature(entry)),
+            {},
+        ).get("body", "")
         if action_body:
             for state_node in state_nodes_by_contract.get(contract, []):
+                # Preserve the legacy heuristic reference edges for categorized
+                # asset/accounting/dependency/trust nodes only. Exact bounded
+                # causal facts below cover bland state; scanning every body for
+                # every unknown declaration would reintroduce quadratic noise.
+                if not state_node.get("categories"):
+                    continue
                 name = re.escape(state_node["name"])
                 if not re.search(rf"\b{name}\b", action_body):
                     continue
@@ -23389,6 +29027,163 @@ def _parse_protocol_graph_file(
                     label=edge_kind.replace("_", " "),
                     location=location,
                 )
+
+        causal_facts = (
+            entry.get("causal_facts")
+            if isinstance(entry.get("causal_facts"), dict)
+            else {}
+        )
+        causal_actions_by_id[action_id] = entry
+        state_nodes_by_name = {
+            str(item.get("name") or ""): item
+            for item in state_nodes_by_contract.get(contract, [])
+            if item.get("name")
+        }
+        for read in causal_facts.get("state_reads") or []:
+            if not isinstance(read, dict):
+                continue
+            variable = str(read.get("variable") or "").strip()
+            declaring_contract = str(
+                read.get("declaring_contract") or contract
+            ).strip()
+            state_node = state_nodes_by_owner_name.get(
+                (declaring_contract, variable)
+            ) or state_nodes_by_name.get(variable)
+            if not state_node:
+                continue
+            read_location = _graph_location(path, read.get("line") or entry.get("line"))
+            _graph_add_edge(
+                edges,
+                action_id,
+                state_node["id"],
+                kind="reads_state",
+                label="reads state",
+                location=read_location,
+                evidence=str(read.get("target") or variable)[:240],
+            )
+            readers = causal_readers.setdefault(
+                (declaring_contract, variable), []
+            )
+            if action_id not in readers:
+                readers.append(action_id)
+        for write in causal_facts.get("state_writes") or []:
+            if not isinstance(write, dict):
+                continue
+            variable = str(write.get("variable") or "").strip()
+            declaring_contract = str(
+                write.get("declaring_contract") or contract
+            ).strip()
+            state_node = state_nodes_by_owner_name.get(
+                (declaring_contract, variable)
+            ) or state_nodes_by_name.get(variable)
+            if not state_node:
+                continue
+            write_location = _graph_location(
+                path, write.get("line") or entry.get("line")
+            )
+            _graph_add_edge(
+                edges,
+                action_id,
+                state_node["id"],
+                kind="writes_state",
+                label="writes state",
+                location=write_location,
+                evidence=str(write.get("target") or variable)[:240],
+            )
+            writers = causal_writers.setdefault(
+                (declaring_contract, variable), []
+            )
+            if action_id not in writers:
+                writers.append(action_id)
+        for call in causal_facts.get("external_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            target = str(call.get("target") or "").strip()
+            called_function = str(call.get("function") or "").strip()
+            if not target or not called_function:
+                continue
+            call_id = f"external_call:{contract}.{target}.{called_function}"
+            call_location = _graph_location(
+                path, call.get("line") or entry.get("line")
+            )
+            _graph_add_node(
+                nodes,
+                call_id,
+                kind="external_call",
+                label=f"{target}.{called_function}",
+                tags=[str(call.get("kind") or "external")],
+                location=call_location,
+                contract=contract,
+                function=called_function,
+            )
+            _graph_add_edge(
+                edges,
+                action_id,
+                call_id,
+                kind="calls_external",
+                label="calls external",
+                location=call_location,
+            )
+        for call in causal_facts.get("internal_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            called_function = str(call.get("function") or "").strip()
+            if not called_function:
+                continue
+            called_ids = action_ids_by_name.get((contract, called_function), [])
+            # Source facts do not currently retain argument types. Refuse to
+            # guess which overload was called; the overload nodes remain
+            # visible and independently discoverable in the graph.
+            if len(called_ids) > 1:
+                continue
+            called_id = (
+                called_ids[0]
+                if called_ids
+                else _graph_action_node_id(contract, called_function)
+            )
+            call_location = _graph_location(
+                path, call.get("line") or entry.get("line")
+            )
+            if called_id not in nodes and (contract, called_function) not in exposed_functions:
+                _graph_add_node(
+                    nodes,
+                    called_id,
+                    kind="internal_function",
+                    label=f"{contract}.{called_function}",
+                    location=call_location,
+                    contract=contract,
+                    function=called_function,
+                )
+            _graph_add_edge(
+                edges,
+                action_id,
+                called_id,
+                kind="calls_internal",
+                label="calls internal",
+                location=call_location,
+            )
+        for ordering in causal_facts.get("ordering_flags") or []:
+            ordering = str(ordering or "").strip()
+            if ordering not in {
+                "external_call_before_state_write",
+                "state_write_before_external_call",
+            }:
+                continue
+            boundary_id = "boundary:external_call"
+            _graph_add_node(
+                nodes,
+                boundary_id,
+                kind="trust_boundary",
+                label="external call boundary",
+            )
+            _graph_add_edge(
+                edges,
+                action_id,
+                boundary_id,
+                kind=ordering,
+                label=ordering.replace("_", " "),
+                location=location,
+            )
 
         for hint_group, concept in _GRAPH_HINT_CONCEPTS.items():
             for hint in (entry.get("hints") or {}).get(hint_group) or []:
@@ -23435,31 +29230,155 @@ def _parse_protocol_graph_file(
                 evidence=str(hint.get("text") or "")[:240],
             )
 
+    # Convert per-entrypoint facts into same-contract causal dependencies.  A
+    # writer feeding a later reader is a sequence lead, not proof that the
+    # reader is exploitable, so these edges remain planning context only.
+    causal_dependency_edge_limit = min(
+        max_items, _CAUSAL_GRAPH_MAX_DEPENDENCY_EDGES
+    )
+    causal_dependency_edges_added = 0
+    causal_dependency_edges_truncated = False
+    causal_dependency_comparisons = 0
+    causal_dependency_comparisons_truncated = False
+    stop_dependencies = False
+    for key, writers in sorted(causal_writers.items()):
+        variable = key[1]
+        for writer in sorted(writers):
+            for reader in sorted(causal_readers.get(key, [])):
+                if writer == reader:
+                    continue
+                if (
+                    causal_dependency_comparisons
+                    >= _CAUSAL_GRAPH_MAX_DEPENDENCY_COMPARISONS
+                ):
+                    causal_dependency_comparisons_truncated = True
+                    causal_dependency_edges_truncated = True
+                    stop_dependencies = True
+                    break
+                causal_dependency_comparisons += 1
+                access_pairs = _causal_compatible_state_accesses(
+                    causal_actions_by_id.get(writer) or {},
+                    causal_actions_by_id.get(reader) or {},
+                    variable,
+                )
+                if not access_pairs:
+                    continue
+                edge_key = (writer, reader, "feeds_state_to")
+                if edge_key in edges:
+                    continue
+                if causal_dependency_edges_added >= causal_dependency_edge_limit:
+                    causal_dependency_edges_truncated = True
+                    stop_dependencies = True
+                    break
+                _graph_add_edge(
+                    edges,
+                    writer,
+                    reader,
+                    kind="feeds_state_to",
+                    label="feeds state to",
+                    evidence="; ".join(
+                        f"{item['writer_access']} -> {item['reader_access']}"
+                        for item in access_pairs[:4]
+                    )[:240] or variable,
+                )
+                causal_dependency_edges_added += 1
+            if stop_dependencies:
+                break
+        if stop_dependencies:
+            break
+
     return {
         "path": path,
         "truncated": truncated or bool(action_space.get("truncated")),
         "nodes": list(nodes.values()),
         "edges": list(edges.values()),
+        "causal_dependency_edges_truncated": causal_dependency_edges_truncated,
+        "causal_dependency_comparisons": causal_dependency_comparisons,
+        "causal_dependency_comparisons_truncated": (
+            causal_dependency_comparisons_truncated
+        ),
     }
+
+
+def _graph_node_source_file(node: dict, fallback: str = "") -> str:
+    for location in node.get("locations") or []:
+        if isinstance(location, dict) and location.get("file"):
+            return str(location["file"])
+    return str(fallback or "")
+
+
+def _graph_node_is_source_definition(node: dict) -> bool:
+    if not _graph_node_source_file(node):
+        return False
+    return bool(
+        node.get("contract")
+        or node.get("kind") in {"contract", "interface", "library", "source"}
+    )
+
+
+def _protocol_graph_part_node_remaps(parts: list[dict]) -> list[dict[str, str]]:
+    """Disambiguate only IDs backed by multiple source definitions."""
+    occurrences: dict[str, list[tuple[int, dict]]] = {}
+    for part_index, part in enumerate(parts):
+        for node in part.get("nodes") or []:
+            node_id = str(node.get("id") or "")
+            if node_id and _graph_node_is_source_definition(node):
+                occurrences.setdefault(node_id, []).append((part_index, node))
+
+    remaps: list[dict[str, str]] = [{} for _part in parts]
+    for node_id, definitions in occurrences.items():
+        if len(definitions) <= 1:
+            continue
+        for part_index, node in definitions:
+            source_file = _graph_node_source_file(
+                node,
+                str(parts[part_index].get("path") or ""),
+            )
+            remaps[part_index][node_id] = _graph_disambiguated_node_id(
+                node_id,
+                source_file,
+                node.get("kind"),
+                node.get("contract"),
+                node.get("function"),
+                node.get("signature"),
+                node.get("variable"),
+                node.get("event"),
+                node.get("modifier"),
+            )
+    return remaps
 
 
 def _merge_protocol_graph_parts(parts: list[dict], max_items: int) -> dict:
     nodes: dict[str, dict] = {}
     edges: dict[tuple[str, str, str], dict] = {}
     truncated_paths = []
+    causal_dependency_truncated_paths = []
+    causal_dependency_comparison_truncated_paths = []
+    causal_dependency_comparisons = 0
+    part_node_remaps = _protocol_graph_part_node_remaps(parts)
 
-    for part in parts:
+    for part_index, part in enumerate(parts):
+        node_remap = part_node_remaps[part_index]
         if part.get("truncated"):
             truncated_paths.append(part.get("path"))
+        if part.get("causal_dependency_edges_truncated"):
+            causal_dependency_truncated_paths.append(part.get("path"))
+        causal_dependency_comparisons += int(
+            part.get("causal_dependency_comparisons") or 0
+        )
+        if part.get("causal_dependency_comparisons_truncated"):
+            causal_dependency_comparison_truncated_paths.append(part.get("path"))
         for node in part.get("nodes") or []:
+            original_node_id = str(node["id"])
+            node_id = node_remap.get(original_node_id, original_node_id)
             _graph_add_node(
                 nodes,
-                node["id"],
+                node_id,
                 kind=node.get("kind", ""),
                 label=node.get("label", ""),
                 tags=node.get("tags") or [],
             )
-            merged = nodes[node["id"]]
+            merged = nodes[node_id]
             for location in node.get("locations") or []:
                 if location not in merged["locations"]:
                     merged["locations"].append(location)
@@ -23468,12 +29387,19 @@ def _merge_protocol_graph_parts(parts: list[dict], max_items: int) -> dict:
                     continue
                 if value not in (None, "", [], {}):
                     merged.setdefault(key, value)
+            if node_id != original_node_id:
+                merged.setdefault(
+                    "legacy_id",
+                    node.get("legacy_id") or original_node_id,
+                )
         for edge in part.get("edges") or []:
-            key = (edge["source"], edge["target"], edge["kind"])
+            source = node_remap.get(str(edge["source"]), str(edge["source"]))
+            target = node_remap.get(str(edge["target"]), str(edge["target"]))
+            key = (source, target, edge["kind"])
             _graph_add_edge(
                 edges,
-                edge["source"],
-                edge["target"],
+                source,
+                target,
                 kind=edge["kind"],
                 label=edge.get("label", edge["kind"]),
             )
@@ -23531,6 +29457,35 @@ def _merge_protocol_graph_parts(parts: list[dict], max_items: int) -> dict:
         "authorization_edges": sum(1 for edge in edge_list if edge.get("kind") == "checks_authorization_binding"),
         "cross_contract_edges": sum(1 for edge in edge_list if edge.get("kind") == "calls_cross_contract_dependency"),
         "economic_parameter_edges": sum(1 for edge in edge_list if edge.get("kind") == "has_economic_parameter_hint"),
+        "state_read_edges": sum(
+            1 for edge in edge_list if edge.get("kind") == "reads_state"
+        ),
+        "state_write_edges": sum(
+            1 for edge in edge_list if edge.get("kind") == "writes_state"
+        ),
+        "state_dependency_edges": sum(
+            1 for edge in edge_list if edge.get("kind") == "feeds_state_to"
+        ),
+        "external_call_edges": sum(
+            1 for edge in edge_list if edge.get("kind") == "calls_external"
+        ),
+        "internal_call_edges": sum(
+            1 for edge in edge_list if edge.get("kind") == "calls_internal"
+        ),
+        "call_ordering_edges": sum(
+            1 for edge in edge_list
+            if edge.get("kind") in {
+                "external_call_before_state_write",
+                "state_write_before_external_call",
+            }
+        ),
+        "causal_dependency_truncated_files": len(
+            causal_dependency_truncated_paths
+        ),
+        "causal_dependency_comparisons": causal_dependency_comparisons,
+        "causal_dependency_comparison_truncated_files": len(
+            causal_dependency_comparison_truncated_paths
+        ),
         "hotspots": len(hotspots),
     }
     return {
@@ -23539,6 +29494,12 @@ def _merge_protocol_graph_parts(parts: list[dict], max_items: int) -> dict:
         "hotspots": hotspots[:max_items],
         "summary": summary,
         "truncated_source_files": [path for path in truncated_paths if path],
+        "causal_dependency_truncated_files": [
+            path for path in causal_dependency_truncated_paths if path
+        ],
+        "causal_dependency_comparison_truncated_files": [
+            path for path in causal_dependency_comparison_truncated_paths if path
+        ],
     }
 
 
@@ -23575,6 +29536,13 @@ def _protocol_graph_hotspots(
         "emits_event": 1,
         "gated_by_modifier": 1,
         "checks_sender_or_role": 1,
+        "reads_state": 1,
+        "writes_state": 2,
+        "feeds_state_to": 3,
+        "calls_external": 2,
+        "calls_internal": 1,
+        "external_call_before_state_write": 4,
+        "state_write_before_external_call": 1,
     }
     hotspots = []
     for node in nodes.values():
@@ -23603,9 +29571,12 @@ def _protocol_graph_hotspots(
         locations = node.get("locations") or []
         first_location = locations[0] if locations else {}
         hotspots.append({
+            "id": node.get("id"),
             "key": str(node.get("label") or node.get("id")).replace(".", "::", 1),
             "contract": node.get("contract"),
             "function": node.get("function"),
+            "signature": node.get("signature"),
+            "legacy_id": node.get("legacy_id"),
             "file": first_location.get("file"),
             "line": first_location.get("line"),
             "affordances": node.get("tags") or [],
@@ -23640,6 +29611,8 @@ def _compact_graph_node(node: dict) -> dict:
         "label": node.get("label"),
         "contract": node.get("contract"),
         "function": node.get("function"),
+        "signature": node.get("signature"),
+        "legacy_id": node.get("legacy_id"),
         "variable": node.get("variable"),
         "type": node.get("type"),
         "tags": (node.get("tags") or [])[:8],
@@ -23683,6 +29656,186 @@ def _graph_keyword_hints(nodes: list[dict], edges: list[dict], max_items: int) -
     return _dedupe_text(terms)[:max_items]
 
 
+def _protocol_graph_definition_identity(entry: dict, fallback: str = "") -> tuple:
+    file = _graph_node_source_file(entry, fallback)
+    if file:
+        file = posixpath.normpath(file)
+    contract = str(entry.get("contract") or "").strip()
+    signature = str(entry.get("signature") or "").strip()
+    if not signature:
+        signature = _action_signature(entry)
+    return file, contract, signature
+
+
+def _protocol_graph_action_space_projection(
+    action_space: dict,
+    parsed_files: list[dict],
+) -> tuple[dict, dict]:
+    """Project definitions absent from a bounded source graph.
+
+    The projection intentionally adds only definition/exposure context.  Rich
+    state, body, and causal edges still come from source parsing, and the graph
+    records how many projected definitions lack that richer context.
+    """
+    existing_ids = {
+        str(node.get("id") or "")
+        for part in parsed_files
+        for node in (part.get("nodes") or [])
+        if node.get("id")
+    }
+    existing_contracts = {
+        (
+            posixpath.normpath(_graph_node_source_file(node, part.get("path") or "")),
+            str(node.get("label") or node.get("contract") or "").strip(),
+        )
+        for part in parsed_files
+        for node in (part.get("nodes") or [])
+        if node.get("kind") in {"contract", "interface", "library", "source"}
+    }
+    existing_actions = {
+        _protocol_graph_definition_identity(node, part.get("path") or "")
+        for part in parsed_files
+        for node in (part.get("nodes") or [])
+        if node.get("kind") in {"entrypoint", "observation"}
+    }
+    nodes: dict[str, dict] = {}
+    edges: dict[tuple[str, str, str], dict] = {}
+    projection_contract_ids: dict[tuple[str, str], str] = {}
+
+    def unique_id(base: str, *parts: object) -> str:
+        candidate = base
+        if candidate in existing_ids or candidate in nodes:
+            candidate = _graph_disambiguated_node_id(base, *parts)
+        salt = 1
+        while candidate in existing_ids or candidate in nodes:
+            candidate = _graph_disambiguated_node_id(base, *parts, salt)
+            salt += 1
+        return candidate
+
+    contract_entries = [
+        entry for entry in action_space.get("contracts") or []
+        if isinstance(entry, dict)
+    ]
+    contract_meta = {
+        (
+            posixpath.normpath(str(entry.get("file") or "")),
+            str(entry.get("name") or "").strip(),
+        ): entry
+        for entry in contract_entries
+        if entry.get("file") and entry.get("name")
+    }
+
+    def add_contract(file: str, contract: str, *, force: bool = False) -> str:
+        key = (file, contract)
+        if key in projection_contract_ids:
+            return projection_contract_ids[key]
+        if key in existing_contracts and not force:
+            return ""
+        meta = contract_meta.get(key) or {}
+        kind = str(meta.get("kind") or "contract")
+        base = f"contract:{contract}"
+        node_id = unique_id(base, file, contract, "action_space_projection")
+        _graph_add_node(
+            nodes,
+            node_id,
+            kind=kind,
+            label=contract,
+            tags=["action_space_definition"],
+            location=_graph_location(file, meta.get("line")),
+            projection="action_space_definition",
+        )
+        projection_contract_ids[key] = node_id
+        return node_id
+
+    for file, contract in sorted(contract_meta):
+        add_contract(file, contract)
+
+    entries_considered = 0
+    definitions_added = 0
+    definition_files: set[str] = set()
+    for section, node_kind in (
+        ("actions", "entrypoint"),
+        ("observations", "observation"),
+    ):
+        for entry in action_space.get(section) or []:
+            if not isinstance(entry, dict):
+                continue
+            entries_considered += 1
+            file = posixpath.normpath(str(entry.get("file") or "").strip())
+            contract = str(entry.get("contract") or "").strip()
+            function = str(entry.get("function") or "").strip()
+            signature = _action_signature(entry)
+            if not file or not contract or not function:
+                continue
+            identity = (file, contract, signature)
+            if identity in existing_actions:
+                continue
+            contract_id = add_contract(file, contract, force=True)
+            base = _graph_action_node_id(contract, function)
+            action_id = unique_id(
+                base,
+                file,
+                contract,
+                signature,
+                entry.get("line"),
+                "action_space_projection",
+            )
+            location = _graph_location(file, entry.get("line"))
+            _graph_add_node(
+                nodes,
+                action_id,
+                kind=node_kind,
+                label=f"{contract}.{function}",
+                tags=[
+                    "action_space_definition",
+                    *[str(item) for item in entry.get("affordances") or []],
+                ],
+                location=location,
+                contract=contract,
+                function=function,
+                signature=signature,
+                mutability=entry.get("mutability"),
+                visibility=entry.get("visibility"),
+                projection="action_space_definition",
+            )
+            _graph_add_edge(
+                edges,
+                contract_id,
+                action_id,
+                kind=(
+                    "exposes_observation"
+                    if node_kind == "observation" else "exposes_entrypoint"
+                ),
+                label=(
+                    "exposes observation"
+                    if node_kind == "observation" else "exposes entrypoint"
+                ),
+                location=location,
+                evidence="projected from cumulative action-space definition",
+            )
+            definitions_added += 1
+            definition_files.add(file)
+
+    part = {
+        "path": "action-space-definition-projection",
+        "truncated": False,
+        "nodes": list(nodes.values()),
+        "edges": list(edges.values()),
+        "causal_dependency_edges_truncated": False,
+    }
+    return part, {
+        "entries_considered": entries_considered,
+        "definition_nodes_added": definitions_added,
+        "contract_nodes_added": sum(
+            1 for node in nodes.values()
+            if node.get("kind") in {"contract", "interface", "library", "source"}
+        ),
+        "definition_only_file_count": len(definition_files),
+        "definition_only_files": sorted(definition_files)[:50],
+        "definition_only_files_omitted": max(0, len(definition_files) - 50),
+    }
+
+
 async def _map_protocol_graph(container: AuditContainer, args: dict) -> str:
     try:
         root = _normalize_action_source_path(args.get("path", "/audit"))
@@ -23692,13 +29845,45 @@ async def _map_protocol_graph(container: AuditContainer, args: dict) -> str:
     except ValueError as exc:
         return f"Error: {exc}"
 
+    explicit_files = files is not None
+    action_space_ref = str(args.get("action_space") or "").strip()
+    action_space_path = ""
+    action_space = None
+    if action_space_ref:
+        try:
+            action_space_path, action_space = await _load_action_space(
+                container, action_space_ref
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            return f"Error: {exc}"
+    action_scope_batch = (
+        action_space.get("scope_batch") or {}
+        if isinstance(action_space, dict) else {}
+    )
+    if (
+        action_scope_batch.get("kind") == "source_roots"
+        and action_scope_batch.get("has_more")
+    ):
+        return (
+            "Error: action_space is an incomplete cumulative scope batch; "
+            "continue its exact controller-provided cursor before mapping the "
+            "full-scope protocol graph"
+        )
+    action_space_files = (
+        _action_space_source_files(action_space)
+        if files is None and isinstance(action_space, dict)
+        else []
+    )
+    if action_space_files:
+        files = action_space_files
+
     include_tests = bool(args.get("include_tests", False))
     max_files = min(max(int(args.get("max_files", 160)), 1), 500)
     max_roots = min(max(int(args.get("max_roots", 12)), 1), 100)
     max_items = min(max(int(args.get("max_items", 2000)), 1), 10_000)
     response_items = min(max(int(args.get("response_items", 6)), 1), 50)
     try:
-        source_files, truncated_files = await _discover_action_source_files(
+        source_files, truncated_files, _discovery = await _discover_action_source_files(
             container,
             root=root,
             files=files,
@@ -23723,7 +29908,51 @@ async def _map_protocol_graph(container: AuditContainer, args: dict) -> str:
             max_items=max_items,
         ))
 
+    source_parsed_file_count = len(parsed_files)
+    projection_stats = {
+        "entries_considered": 0,
+        "definition_nodes_added": 0,
+        "contract_nodes_added": 0,
+        "definition_only_file_count": 0,
+        "definition_only_files": [],
+        "definition_only_files_omitted": 0,
+    }
+    if isinstance(action_space, dict):
+        projection, projection_stats = _protocol_graph_action_space_projection(
+            action_space,
+            parsed_files,
+        )
+        if projection.get("nodes"):
+            parsed_files.append(projection)
+
     aggregate = _merge_protocol_graph_parts(parsed_files, max_items=max_items)
+    section_retention = {
+        "nodes": {
+            "total": int(aggregate["summary"].get("nodes") or 0),
+            "retained": len(aggregate["nodes"]),
+            "omitted_by_item_limit": max(
+                0,
+                int(aggregate["summary"].get("nodes") or 0)
+                - len(aggregate["nodes"]),
+            ),
+        },
+        "edges": {
+            "total": int(aggregate["summary"].get("edges") or 0),
+            "retained": len(aggregate["edges"]),
+            "omitted_by_item_limit": max(
+                0,
+                int(aggregate["summary"].get("edges") or 0)
+                - len(aggregate["edges"]),
+            ),
+        },
+    }
+    action_retention_omissions = sum(
+        int((entry or {}).get("omitted_by_item_limit") or 0)
+        for entry in (
+            (action_space or {}).get("section_retention") or {}
+        ).values()
+        if isinstance(entry, dict)
+    )
     state = await _load_campaign_state(container)
     graph_id = _next_campaign_id(state, "protocol_graph")
     graph = {
@@ -23732,18 +29961,66 @@ async def _map_protocol_graph(container: AuditContainer, args: dict) -> str:
         "source": {
             "path": root,
             "files_requested": len(source_files),
-            "files_scanned": len(parsed_files),
+            "files_scanned": source_parsed_file_count,
             "files_truncated_by_limit": truncated_files,
-            "profile_roots_limit": max_roots if files is None else None,
+            "profile_roots_limit": (
+                max_roots if not explicit_files and not action_space_files else None
+            ),
             "include_tests": include_tests,
+            "action_space": action_space_path or None,
+            "file_inventory_source": (
+                action_space_path if action_space_files else None
+            ),
+            "file_inventory_total": (
+                len(action_space_files) if action_space_files else None
+            ),
+            "action_space_scope_complete": (
+                True
+                if action_scope_batch.get("kind") == "source_roots" else None
+            ),
+            "action_space_projection": projection_stats,
+            "action_space_definitions_omitted_by_item_limit": (
+                action_retention_omissions
+            ),
+            "discovery": _discovery,
             "read_errors": read_errors,
             "truncated_source_files": aggregate["truncated_source_files"],
+            "causal_dependency_truncated_files": aggregate[
+                "causal_dependency_truncated_files"
+            ],
+            "causal_dependency_comparison_truncated_files": aggregate[
+                "causal_dependency_comparison_truncated_files"
+            ],
         },
         "related_ids": [str(item) for item in related_ids],
+        "section_retention": section_retention,
         "notes": [
             "Heuristic source graph for campaign planning; validate all conclusions with experiments.",
             "Asset/accounting/trust nodes are hints derived from names, types, modifiers, and call patterns.",
-        ],
+        ] + ([
+            "Causal dependency edges reached the per-file safety cap; omitted paths remain unmapped, not rejected.",
+        ] if aggregate["causal_dependency_truncated_files"] else []) + ([
+            "Causal writer/reader comparison work reached the per-file safety "
+            "cap; the graph records the affected files and treats omitted "
+            "dependencies as unmapped, not rejected.",
+        ] if aggregate[
+            "causal_dependency_comparison_truncated_files"
+        ] else []) + ([
+            f"Projected {projection_stats['definition_nodes_added']} callable "
+            "definition(s) from the cumulative action space because their source "
+            "files were outside this bounded graph scan. Rich state/body context "
+            "for those definitions remains unmapped, not rejected.",
+        ] if projection_stats["definition_nodes_added"] else []) + ([
+            f"The action-space artifact records {action_retention_omissions} "
+            "definition(s) omitted by its item limit; they remain unmapped, not "
+            "rejected.",
+        ] if action_retention_omissions else []) + ([
+            "The graph item limit omitted retained nodes or edges; see "
+            "section_retention for exact counts.",
+        ] if any(
+            entry["omitted_by_item_limit"]
+            for entry in section_retention.values()
+        ) else []),
         "summary": aggregate["summary"],
         "nodes": aggregate["nodes"],
         "edges": aggregate["edges"],
@@ -23765,14 +30042,18 @@ async def _map_protocol_graph(container: AuditContainer, args: dict) -> str:
                 f"Protocol graph: {graph_id}\n"
                 f"Path: {graph_path}\n"
                 f"Source root: {root}\n"
-                f"Files scanned: {len(parsed_files)}"
+                f"Files scanned: {source_parsed_file_count}"
                 f" (+{truncated_files} over file limit)\n"
                 f"Contracts: {graph['summary']['contracts']}\n"
                 f"Entrypoints: {graph['summary']['entrypoints']}\n"
                 f"Asset hints: {graph['summary']['asset_hints']}\n"
                 f"Accounting state hints: {graph['summary']['accounting_state']}\n"
                 f"Trust-boundary edges: {graph['summary']['trust_boundary_edges']}\n"
-                "Use this graph as planner context; it is not a finding."
+                f"Retained graph nodes: {section_retention['nodes']['retained']} "
+                f"of {section_retention['nodes']['total']}\n"
+                f"Retained graph edges: {section_retention['edges']['retained']} "
+                f"of {section_retention['edges']['total']}\n"
+                "Use the full retained graph as planner context; it is not a finding."
             ),
             evidence=[graph_path],
             related_ids=[str(item) for item in related_ids],
@@ -23785,6 +30066,7 @@ async def _map_protocol_graph(container: AuditContainer, args: dict) -> str:
         "result_id": result_id or None,
         "source": graph["source"],
         "summary": graph["summary"],
+        "section_retention": graph["section_retention"],
         "node_kinds": _counts_by_key(graph["nodes"], "kind"),
         "edge_kinds": _counts_by_key(graph["edges"], "kind"),
         "keyword_hints": _graph_keyword_hints(
@@ -23804,7 +30086,10 @@ async def _map_protocol_graph(container: AuditContainer, args: dict) -> str:
         "omitted_from_response": {
             "nodes": max(0, len(graph["nodes"]) - response_items),
             "edges": max(0, len(graph["edges"]) - response_items),
-            "note": "Open the artifact path for the full graph.",
+            "note": (
+                "Open the artifact path for the full retained graph; "
+                "section_retention records any item-limit omissions."
+            ),
         },
     }
     return json.dumps(response, indent=2, sort_keys=True)
@@ -24000,6 +30285,9 @@ def _attack_candidate_actions(candidate: dict) -> list[dict]:
             normalized["expected_effect"] = candidate.get("objective")
         if candidate.get("exposure") and not normalized.get("live_exposure"):
             normalized["live_exposure"] = candidate.get("exposure")
+        for key in ("network", "chain_id", "target_identity"):
+            if candidate.get(key) not in (None, "", [], {}):
+                normalized.setdefault(key, candidate.get(key))
         if blockers and not normalized.get("live_blockers"):
             normalized["live_blockers"] = blockers
         actions.append(normalized)
@@ -24014,6 +30302,9 @@ def _attack_candidate_actions(candidate: dict) -> list[dict]:
         "contract": contract,
         "function": function,
         "target": candidate.get("target_address"),
+        "network": candidate.get("network"),
+        "chain_id": candidate.get("chain_id"),
+        "target_identity": candidate.get("target_identity"),
         "args": [
             str(item.get("name") or f"arg{index}")
             for index, item in enumerate(candidate.get("parameters") or [], start=1)
@@ -24062,19 +30353,270 @@ def _attack_candidate_observations(candidate: dict) -> list[dict]:
     return observations
 
 
+def _attack_candidate_chain_ref(item: dict | None) -> tuple[str, dict] | None:
+    item = item if isinstance(item, dict) else {}
+    identity = (
+        item.get("target_identity")
+        if isinstance(item.get("target_identity"), dict) else {}
+    )
+    raw_network = item.get("network") or identity.get("network")
+    raw_chain_id = (
+        item.get("chain_id")
+        if item.get("chain_id") not in (None, "")
+        else identity.get("chain_id")
+    )
+    if raw_network not in (None, "") and raw_chain_id not in (None, ""):
+        network_key = _chain_group_key(*_canonical_chain(raw_network, None))
+        chain_id_key = _chain_group_key(*_canonical_chain(None, raw_chain_id))
+        if network_key and chain_id_key and network_key != chain_id_key:
+            raise ValueError(
+                "attack-graph candidate has conflicting network/chain_id "
+                "metadata; pass an explicit fork_context"
+            )
+    network, chain_id = _canonical_chain(raw_network, raw_chain_id)
+    key = _chain_group_key(network, chain_id)
+    if not key:
+        return None
+    return key, {"network": network, "chain_id": chain_id}
+
+
+def _attack_candidate_chain_binding(
+    candidate: dict,
+    live_reachability: dict | None,
+) -> dict:
+    """Resolve one unambiguous chain for direct attack-graph materialization.
+
+    Candidate/action metadata is authoritative when present. Legacy candidates
+    may inherit a chain from the referenced live-reachability profiles, but an
+    address deployed on more than one chain is never guessed.
+    """
+    direct: dict[str, dict] = {}
+    for item in [candidate, *(candidate.get("actions") or [])]:
+        if not isinstance(item, dict):
+            continue
+        ref = _attack_candidate_chain_ref(item)
+        if ref:
+            direct[ref[0]] = ref[1]
+    if len(direct) == 1:
+        return next(iter(direct.values()))
+    if len(direct) > 1:
+        chains = ", ".join(sorted(direct))
+        raise ValueError(
+            "attack-graph candidate spans multiple chains "
+            f"({chains}); pass an explicit fork_context instead of guessing"
+        )
+
+    target_addresses = {
+        str(address).strip().lower()
+        for address in _attack_candidate_target_addresses(candidate).values()
+        if str(address).strip()
+    }
+    live_refs: dict[str, dict] = {}
+    ambiguous_live_binding = False
+    for profile in (live_reachability or {}).get("profiles") or []:
+        if not isinstance(profile, dict):
+            continue
+        profile_address = str(profile.get("address") or "").strip().lower()
+        profile_matches = bool(
+            profile_address and profile_address in target_addresses
+        )
+        if profile_matches and str(profile.get("chain_status") or "") == "ambiguous":
+            ambiguous_live_binding = True
+        if profile_matches:
+            ref = _attack_candidate_chain_ref(profile)
+            if ref:
+                live_refs[ref[0]] = ref[1]
+        for raw_exposure in profile.get("action_exposures") or []:
+            if not isinstance(raw_exposure, dict):
+                continue
+            exposure_address = str(
+                raw_exposure.get("target_address") or profile_address
+            ).strip().lower()
+            if not exposure_address or exposure_address not in target_addresses:
+                continue
+            exposure = dict(raw_exposure)
+            if exposure.get("network") in (None, ""):
+                exposure["network"] = profile.get("network")
+            if exposure.get("chain_id") in (None, ""):
+                exposure["chain_id"] = profile.get("chain_id")
+            ref = _attack_candidate_chain_ref(exposure)
+            if ref:
+                live_refs[ref[0]] = ref[1]
+    if len(live_refs) == 1 and not ambiguous_live_binding:
+        return next(iter(live_refs.values()))
+    if len(live_refs) > 1 or ambiguous_live_binding:
+        chains = ", ".join(sorted(live_refs)) or "unresolved candidates"
+        raise ValueError(
+            "attack-graph target has an ambiguous live chain binding "
+            f"({chains}); pass an explicit fork_context"
+        )
+    raise ValueError(
+        "attack-graph target has no chain-qualified live binding; pass an "
+        "explicit fork_context before composing a fork experiment"
+    )
+
+
+def _explicit_fork_context_chain_ref(fork_context: dict) -> tuple[str, dict]:
+    """Resolve exactly one chain declared by a fork-context artifact."""
+    refs: dict[str, dict] = {}
+    items: list[dict] = [fork_context]
+    for collection in _FORK_ADDRESS_COLLECTIONS:
+        items.extend(
+            item
+            for item in (fork_context.get(collection) or [])
+            if isinstance(item, dict)
+        )
+    items.extend(
+        item
+        for item in (fork_context.get("target_addresses") or {}).values()
+        if isinstance(item, dict)
+    )
+    for item in items:
+        try:
+            ref = _attack_candidate_chain_ref(item)
+        except ValueError as exc:
+            raise ValueError(
+                "explicit fork_context has conflicting network/chain_id metadata"
+            ) from exc
+        if ref:
+            refs[ref[0]] = ref[1]
+    if not refs:
+        raise ValueError(
+            "explicit fork_context does not identify a chain; record network or "
+            "chain_id before composing the selected attack candidate"
+        )
+    if len(refs) > 1:
+        raise ValueError(
+            "explicit fork_context spans multiple chains "
+            f"({', '.join(sorted(refs))}); select one chain for this experiment"
+        )
+    return next(iter(refs.items()))
+
+
+def _validate_explicit_attack_candidate_fork_context(
+    *,
+    candidate: dict,
+    actions: list[dict],
+    fork_context: dict,
+    live_reachability: dict | None,
+) -> None:
+    """Reject a fork whose chain conflicts with its selected attack branch.
+
+    Candidate and action metadata is authoritative. For legacy unqualified
+    candidates, matching live-reachability profiles constrain the acceptable
+    fork chains; an explicit fork may select one of several live bindings but
+    may not silently switch to an unrelated chain.
+    """
+    fork_key, fork_chain = _explicit_fork_context_chain_ref(fork_context)
+    direct_refs: dict[str, dict] = {}
+    for item in [candidate, *(candidate.get("actions") or []), *actions]:
+        if not isinstance(item, dict):
+            continue
+        ref = _attack_candidate_chain_ref(item)
+        if ref:
+            direct_refs[ref[0]] = ref[1]
+    if len(direct_refs) > 1:
+        raise ValueError(
+            "selected attack candidate/actions span multiple chains "
+            f"({', '.join(sorted(direct_refs))}); a single fork_context cannot "
+            "resolve conflicting action identities"
+        )
+    if direct_refs:
+        expected_key, expected_chain = next(iter(direct_refs.items()))
+        if fork_key != expected_key:
+            raise ValueError(
+                "explicit fork_context chain "
+                f"{fork_chain.get('network') or fork_chain.get('chain_id')} "
+                "conflicts with selected candidate/action chain "
+                f"{expected_chain.get('network') or expected_chain.get('chain_id')}"
+            )
+        return
+
+    target_addresses = {
+        str(address).strip().lower()
+        for address in _attack_candidate_target_addresses(candidate).values()
+        if str(address).strip()
+    }
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        address = _solidity_address_literal(
+            action.get("target") or action.get("target_address")
+        )
+        if address:
+            target_addresses.add(address.lower())
+
+    live_refs: dict[str, dict] = {}
+    for profile in (live_reachability or {}).get("profiles") or []:
+        if not isinstance(profile, dict):
+            continue
+        profile_address = str(profile.get("address") or "").strip().lower()
+        if profile_address and profile_address in target_addresses:
+            ref = _attack_candidate_chain_ref(profile)
+            if ref:
+                live_refs[ref[0]] = ref[1]
+        for raw_exposure in profile.get("action_exposures") or []:
+            if not isinstance(raw_exposure, dict):
+                continue
+            exposure_address = str(
+                raw_exposure.get("target_address") or profile_address
+            ).strip().lower()
+            if not exposure_address or exposure_address not in target_addresses:
+                continue
+            exposure = dict(raw_exposure)
+            if exposure.get("network") in (None, ""):
+                exposure["network"] = profile.get("network")
+            if exposure.get("chain_id") in (None, ""):
+                exposure["chain_id"] = profile.get("chain_id")
+            ref = _attack_candidate_chain_ref(exposure)
+            if ref:
+                live_refs[ref[0]] = ref[1]
+    if live_refs and fork_key not in live_refs:
+        raise ValueError(
+            "explicit fork_context chain "
+            f"{fork_chain.get('network') or fork_chain.get('chain_id')} conflicts "
+            "with selected target live chain binding(s) "
+            f"({', '.join(sorted(live_refs))})"
+        )
+
+
+async def _attack_candidate_live_reachability(
+    container: AuditContainer,
+    candidate: dict,
+) -> dict | None:
+    source = candidate.get("source") if isinstance(candidate.get("source"), dict) else {}
+    ref = str(source.get("live_reachability") or "").strip()
+    if not ref:
+        return None
+    try:
+        path = _campaign_artifact_path(
+            ref,
+            directory="/workspace/campaign/live-reachability/",
+            prefix="lr",
+            name="live_reachability",
+        )
+    except ValueError:
+        return None
+    return await _load_campaign_artifact(container, path)
+
+
 def _attack_candidate_fork_context(
     *,
     attack_graph: dict,
     candidate: dict,
     fork_block: object,
+    live_reachability: dict | None = None,
 ) -> dict:
     targets = _attack_candidate_target_addresses(candidate)
     if not targets:
         return {}
+    chain = _attack_candidate_chain_binding(candidate, live_reachability)
     contracts = [
         {
             "label": label,
             "address": address,
+            "network": chain.get("network"),
+            "chain_id": chain.get("chain_id"),
             "kind": "attack_graph_target",
             "notes": "Target binding derived from live reachability.",
         }
@@ -24094,8 +30636,8 @@ def _attack_candidate_fork_context(
     fork_context = {
         "id": f"{attack_graph.get('id') or 'attack-graph'}:{candidate.get('candidate_id') or candidate.get('attack_key') or 'candidate'}",
         "title": f"Fork context for {candidate.get('title') or 'attack graph candidate'}",
-        "network": "mainnet",
-        "chain_id": 1,
+        "network": chain.get("network"),
+        "chain_id": chain.get("chain_id"),
         "fork_block": fork_block,
         "contracts": contracts,
         "target_addresses": targets,
@@ -24141,9 +30683,14 @@ def _attack_graph_materialization(
         "mechanism": candidate.get("mechanism"),
         "market_inventory": candidate.get("market_inventory") or {},
         "planning_notes": candidate.get("planning_notes") or [],
+        "hypothesis_card": candidate.get("hypothesis_card") or {},
+        "causal_path": candidate.get("causal_path") or {},
         "exposure": candidate.get("exposure"),
         "live_status": candidate.get("live_status"),
         "target_address": candidate.get("target_address"),
+        "network": candidate.get("network"),
+        "chain_id": candidate.get("chain_id"),
+        "target_identity": candidate.get("target_identity"),
         "blockers": candidate.get("blockers") or [],
         "required_live_evidence": candidate.get("required_live_evidence") or [],
         "source": source,
@@ -25883,164 +32430,24 @@ def _workbench_compose_success_condition(adapter: dict) -> str:
     )
 
 
-def _fork_workbench_readme(payload: dict) -> str:
-    setup_lines = "\n".join(
-        f"- `{item.get('kind')}`: {item.get('prompt')}"
-        for item in payload.get("setup_tasks") or []
-    ) or "- none"
-    blocker_lines = "\n".join(
-        f"- [{item.get('severity', 'info')}] {item.get('kind', 'check')}: {item.get('check')}"
-        for item in payload.get("blockers") or []
-    ) or "- none"
-    objective_lines = "\n".join(
-        f"- `{item.get('label')}`: match `{item.get('match')}`, direction `{item.get('direction')}`"
-        for item in payload.get("objective_templates") or []
-    ) or "- none"
-    candidate = payload.get("candidate") or {}
-    market_inventory = (candidate.get("market_inventory") or {}) if isinstance(candidate, dict) else {}
-    market_lines = "\n".join(
-        f"- `{item.get('contract') or 'market'}` at `{item.get('address')}`"
-        for item in market_inventory.get("candidate_markets") or []
-        if isinstance(item, dict)
-    ) or "- none"
-    probe_counts = {
-        key: len(value or [])
-        for key, value in (payload.get("snapshot_state_templates") or {}).items()
-    }
-    next_args = json.dumps(
-        payload.get("compose_sequence_experiment_args") or {},
-        indent=2,
-        sort_keys=True,
-    )
-    purpose_note = ""
-    if payload.get("mechanism") == "generic_state_transition":
-        purpose_note = (
-            "\n\nThis is a generic invariant / state-transition harness. It assumes "
-            "no specific token, accounting, or balance model: define the exact state "
-            "transition under test and the invariant it must not violate, then "
-            "snapshot only the concrete state the actions mutate and assert the "
-            "precise before/after delta."
-        )
-    model_guidance = payload.get("model_guidance") or {}
-    model_path = (
-        payload.get("state_transition_model_path")
-        or model_guidance.get("state_transition_model")
-    )
-    model_section = ""
-    if model_guidance:
-        falsification = "\n".join(
-            f"- {idea}" for idea in model_guidance.get("falsification_ideas") or []
-        ) or "- none"
-        lens_notes = model_guidance.get("lens_notes") or []
-        lens_block = (
-            "\n\nLens notes (annotation only):\n"
-            + "\n".join(f"- {note}" for note in lens_notes)
-            if lens_notes
-            else ""
-        )
-        model_section = (
-            "## Model Guidance\n\n"
-            f"- Invariant: `{model_guidance.get('invariant_id') or 'n/a'}` "
-            f"(kind `{model_guidance.get('kind') or 'n/a'}`)\n"
-            f"- Statement: {model_guidance.get('statement') or 'n/a'}\n"
-            f"- Model artifact: `{model_path or 'none'}`\n"
-            "- Planning context only: prove or reject this invariant with objective "
-            "execution evidence (compile, run, before/after deltas).\n\n"
-            f"Falsification ideas:\n{falsification}{lens_block}\n\n"
-        )
-    elif model_path:
-        model_section = (
-            "## Model Guidance\n\n"
-            f"- Model artifact: `{model_path}`\n"
-            "- No specific invariant matched this candidate; treat the model as "
-            "background planning context and prove any claim with objective "
-            "execution evidence.\n\n"
-        )
-    return f"""# {payload.get('title')}
-
-Workbench id: `{payload.get('id')}`
-Mechanism: `{payload.get('mechanism')}`
-Attack graph: `{payload.get('attack_graph_path') or 'none'}`
-Candidate: `{payload.get('candidate_id') or payload.get('attack_key') or 'manual'}`
-
-## Purpose
-
-Prepare a fork replay that can prove or reject the candidate with concrete setup,
-state probes, and objective deltas. This workbench is not vulnerability evidence
-until an experiment compiles, runs, and passes objective evaluation.{purpose_note}
-
-## Target
-
-- Label: `{(payload.get('target') or {}).get('label')}`
-- Address: `{(payload.get('target') or {}).get('address')}`
-- Concrete: `{(payload.get('target') or {}).get('concrete')}`
-
-## Setup Tasks
-
-{setup_lines}
-
-## Blockers
-
-{blocker_lines}
-
-## Snapshot Probe Counts
-
-```json
-{json.dumps(probe_counts, indent=2, sort_keys=True)}
-```
-
-## Candidate Market Inventory
-
-{market_lines}
-
-## Objective Templates
-
-{objective_lines}
-
-{model_section}## Suggested Sequence Arguments
-
-```json
-{next_args}
-```
-"""
-
-
-async def _prepare_fork_exploit_workbench(
+async def _sequence_mechanism_validation_plan(
     container: AuditContainer,
     args: dict,
-) -> str:
-    try:
-        related_ids = [
-            str(item) for item in _require_list(args.get("related_ids"), "related_ids")
-        ]
-        target_overrides = args.get("target_addresses") or {}
-        if not isinstance(target_overrides, dict):
-            raise ValueError("target_addresses must be an object")
-    except ValueError as exc:
-        return f"Error: {exc}"
+    *,
+    attack_graph_path: str,
+    attack_graph: dict,
+    candidate: dict,
+    fork_context_path: str,
+    fork_context: dict | None,
+    target_addresses: dict,
+) -> tuple[dict, list[dict], str, str]:
+    """Derive mechanism/setup guidance directly inside sequence composition.
 
-    attack_graph_ref = str(args.get("attack_graph") or "").strip()
-    attack_graph_path = ""
-    attack_graph = None
-    candidate = {}
-    if attack_graph_ref:
-        try:
-            attack_graph_path, attack_graph = await _load_attack_graph(
-                container,
-                attack_graph_ref,
-            )
-            candidate = _select_attack_graph_candidate(
-                attack_graph,
-                str(args.get("candidate_id") or "").strip(),
-            )
-        except (FileNotFoundError, ValueError) as exc:
-            return f"Error: {exc}"
-    if not candidate:
-        return "Error: prepare_fork_exploit_workbench requires attack_graph"
-
-    # Optional state-transition model. An explicit arg errors on an invalid ref;
-    # otherwise fall back to the candidate's own source.state_transition_model
-    # (best-effort — that locator is informational, not user-supplied).
+    Returns the durable plan, model-derived observations, an invariant statement
+    to append to the objective, and a matching invariant id. The plan is
+    planning context only; none of its snapshot templates are made executable
+    without concrete observations and target bindings.
+    """
     explicit_stm_ref = str(args.get("state_transition_model") or "").strip()
     stm_path = ""
     stm_model = None
@@ -26049,12 +32456,12 @@ async def _prepare_fork_exploit_workbench(
             container, explicit_stm_ref
         )
         if stm_error:
-            return f"Error: {stm_error}"
+            raise ValueError(stm_error)
     else:
-        candidate_source = candidate.get("source")
+        source = candidate.get("source")
         candidate_stm_ref = (
-            str(candidate_source.get("state_transition_model") or "").strip()
-            if isinstance(candidate_source, dict)
+            str(source.get("state_transition_model") or "").strip()
+            if isinstance(source, dict)
             else ""
         )
         if candidate_stm_ref:
@@ -26084,44 +32491,11 @@ async def _prepare_fork_exploit_workbench(
         if stm_model
         else None
     )
-
-    fork_context_ref = str(args.get("fork_context") or "").strip()
-    fork_context_path = ""
-    fork_context = None
-    if fork_context_ref:
-        try:
-            fork_context_path, fork_context = await _load_fork_context(
-                container,
-                fork_context_ref,
-            )
-        except (FileNotFoundError, ValueError) as exc:
-            return f"Error: {exc}"
-    else:
-        fork_context = _attack_candidate_fork_context(
-            attack_graph=attack_graph or {},
-            candidate=candidate,
-            fork_block=args.get("fork_block"),
-        ) or None
-
-    target_addresses = _attack_candidate_target_addresses(candidate)
-    if fork_context:
-        merged = dict(fork_context.get("target_addresses") or {})
-        merged.update(target_addresses)
-        target_addresses = merged
-    target_addresses.update({
-        str(key): str(value)
-        for key, value in target_overrides.items()
-        if str(key).strip() and str(value).strip()
-    })
-
-    try:
-        mechanism = _infer_fork_workbench_mechanism(
-            candidate,
-            fork_context,
-            str(args.get("mechanism") or "auto"),
-        )
-    except ValueError as exc:
-        return f"Error: {exc}"
+    mechanism = _infer_fork_workbench_mechanism(
+        candidate,
+        fork_context,
+        str(args.get("mechanism") or "auto"),
+    )
     target = _fork_workbench_primary_target(candidate, target_addresses)
     adapter = _fork_workbench_adapter(
         mechanism,
@@ -26141,213 +32515,69 @@ async def _prepare_fork_exploit_workbench(
             for item in adapter.get("blocker_checks") or []
         ],
     ]
-    title = (
-        str(args.get("title") or "").strip()
-        or f"Fork workbench for {candidate.get('title') or candidate.get('action_key')}"
-    )
-    candidate_actions = _attack_candidate_actions(candidate)
-    candidate_observations = _attack_candidate_observations(candidate)
-    compose_args = {
-        "title": candidate.get("title") or title,
-        "objective": candidate.get("objective") or (
-            "Prove or reject the selected attack graph candidate on a fork."
-        ),
-        "attack_graph": attack_graph_path,
+    model_observations = []
+    invariant_statement = ""
+    invariant_id = ""
+    if stm_invariant is not None:
+        model_observations = _workbench_normalize_model_observations(
+            stm_invariant.get("candidate_observations")
+        )
+        invariant_statement = str(stm_invariant.get("statement") or "").strip()
+        invariant_id = str(stm_invariant.get("id") or "").strip()
+    plan = {
+        "version": 1,
+        "planning_only": True,
+        "mechanism": mechanism,
+        "target": target,
+        "attack_graph_path": attack_graph_path,
+        "attack_graph_id": attack_graph.get("id"),
         "candidate_id": (
             candidate.get("candidate_id")
             or candidate.get("attack_key")
             or candidate.get("action_key")
         ),
-        "action_space": (
-            candidate.get("source", {}).get("action_space")
-            if isinstance(candidate.get("source"), dict)
-            else ""
-        ),
-        "protocol_graph": (
-            candidate.get("source", {}).get("protocol_graph")
-            if isinstance(candidate.get("source"), dict)
-            else ""
-        ),
-        "actions": candidate_actions,
-        "observations": candidate_observations,
-        "target_addresses": target_addresses,
-    }
-    setup_prompt = _workbench_compose_setup(adapter)
-    if setup_prompt:
-        compose_args["setup"] = setup_prompt
-    success_condition = _workbench_compose_success_condition(adapter)
-    if success_condition:
-        compose_args["success_condition"] = success_condition
-    if fork_context_path:
-        compose_args["fork_context"] = fork_context_path
-    if args.get("fork_block") is not None:
-        compose_args["fork_block"] = args.get("fork_block")
-
-    model_guidance = adapter.get("model_guidance")
-    if model_guidance and stm_invariant is not None:
-        statement = str(stm_invariant.get("statement") or "").strip()
-        existing_markers = {
-            json.dumps(item, sort_keys=True, default=str)
-            for item in compose_args["observations"]
-        }
-        for observation in _workbench_normalize_model_observations(
-            stm_invariant.get("candidate_observations")
-        ):
-            marker = json.dumps(observation, sort_keys=True, default=str)
-            if marker in existing_markers:
-                continue
-            existing_markers.add(marker)
-            compose_args["observations"].append(observation)
-        # The workbench stays generic unless a protocol mechanism was evidenced;
-        # model_guidance is only produced for the generic_state_transition path.
-        compose_args["mechanism"] = mechanism
-        inv_id = str(stm_invariant.get("id") or "").strip()
-        if inv_id:
-            compose_args["invariant_id"] = inv_id
-        if statement and statement not in str(compose_args.get("objective") or ""):
-            base_objective = str(compose_args.get("objective") or "").strip()
-            compose_args["objective"] = (
-                f"{base_objective} Invariant under test: {statement}".strip()
-                if base_objective
-                else f"Falsify invariant: {statement}"
-            )
-    elif stm_model is not None and stm_path:
-        # Model loaded but no specific invariant matched: surface the locator
-        # without inventing invariant-specific guidance.
-        compose_args["state_transition_model"] = stm_path
-
-    state = await _load_campaign_state(container)
-    workbench_id = _next_campaign_id(state, "fork_workbench")
-    workbench_dir = f"/workspace/campaign/fork-workbenches/{workbench_id}"
-    payload = {
-        "id": workbench_id,
-        "title": title,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "mechanism": mechanism,
-        "attack_graph_path": attack_graph_path or None,
-        "attack_graph_id": (attack_graph or {}).get("id"),
-        "candidate_id": candidate.get("candidate_id"),
-        "attack_key": candidate.get("attack_key"),
-        "action_key": candidate.get("action_key"),
-        "candidate": _attack_graph_materialization(
-            attack_graph_path=attack_graph_path,
-            attack_graph=attack_graph or {},
-            candidate=candidate,
-        ),
-        "target": target,
-        "target_addresses": target_addresses,
         "fork_context_path": fork_context_path or None,
-        "fork": _fork_context_metadata(fork_context),
         "setup_tasks": adapter.get("setup_tasks") or [],
+        "blockers": blockers,
         "snapshot_state_templates": adapter.get("snapshot_state_templates") or {},
         "objective_templates": adapter.get("objective_templates") or [],
-        "model_guidance": model_guidance or None,
+        "model_guidance": adapter.get("model_guidance") or None,
         "state_transition_model_path": stm_path or None,
-        "blockers": blockers,
-        "compose_sequence_experiment_args": compose_args,
-        "next_steps": [
-            "Resolve every blocking target/fork/setup item before running.",
-            "Use compose_sequence_experiment_args to materialize the runnable sequence scaffold.",
-            "Fill concrete calldata, balances, approvals, and protocol-specific objective assertions.",
-            "Run the scaffold, summarize trace/logs, snapshot before/after state, compare snapshots, and evaluate objectives.",
-        ],
-        "related_ids": related_ids,
+        "default_setup": _workbench_compose_setup(adapter),
+        "default_success_condition": _workbench_compose_success_condition(adapter),
     }
-    workbench_path = f"{workbench_dir}/workbench.json"
-    readme_path = f"{workbench_dir}/README.md"
-    await container.write_file(
-        workbench_path,
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    return plan, model_observations, invariant_statement, invariant_id
+
+
+def _format_mechanism_validation_plan(plan: dict | None) -> str:
+    if not isinstance(plan, dict) or not plan:
+        return "No attack-graph mechanism plan was required."
+    blockers = "\n".join(
+        f"- [{item.get('severity', 'info')}] {item.get('check')}"
+        for item in (plan.get("blockers") or [])[:12]
+        if isinstance(item, dict)
+    ) or "- none"
+    objectives = "\n".join(
+        f"- {item.get('label')} ({item.get('role') or 'check'})"
+        for item in (plan.get("objective_templates") or [])[:8]
+        if isinstance(item, dict)
+    ) or "- none"
+    probe_counts = {
+        key: len(value or [])
+        for key, value in (plan.get("snapshot_state_templates") or {}).items()
+        if isinstance(value, list)
+    }
+    return (
+        f"Mechanism: `{plan.get('mechanism') or 'unknown'}`\n\n"
+        "This is setup and falsification guidance, not proof. Placeholder probes "
+        "remain non-executable until explicitly bound.\n\n"
+        f"Blockers:\n{blockers}\n\n"
+        f"Objective templates:\n{objectives}\n\n"
+        "Snapshot template counts:\n"
+        f"```json\n{json.dumps(probe_counts, indent=2, sort_keys=True)}\n```"
     )
-    await container.write_file(readme_path, _fork_workbench_readme(payload))
 
-    now = datetime.now(timezone.utc).isoformat()
-    state["sections"]["experiment"].append({
-        "id": workbench_id,
-        "created_at": now,
-        "updated_at": now,
-        "title": title,
-        "content": (
-            "Template: fork_workbench\n"
-            f"Workbench: {workbench_path}\n"
-            f"Mechanism: {mechanism}\n"
-            f"Attack graph: {attack_graph_path or 'none'}\n"
-            f"Candidate: {candidate.get('candidate_id') or candidate.get('attack_key') or candidate.get('action_key')}\n"
-            f"Blockers: {len(blockers)}\n"
-            "Next: materialize with compose_sequence_experiment after resolving blockers."
-        ),
-        "status": "open",
-        "priority": _attack_search_priority(candidate.get("priority")),
-        "evidence": [
-            readme_path,
-            workbench_path,
-            *([attack_graph_path] if attack_graph_path else []),
-            *([fork_context_path] if fork_context_path else []),
-        ],
-        "related_ids": [
-            item for item in (
-                candidate.get("candidate_id"),
-                candidate.get("attack_key"),
-                candidate.get("action_key"),
-                *(related_ids or []),
-            )
-            if item
-        ],
-        "action_keys": [
-            str(candidate.get("action_key"))
-        ] if candidate.get("action_key") else [],
-        "attack_keys": [
-            str(candidate.get("attack_key"))
-        ] if candidate.get("attack_key") else [],
-    })
-    await _save_campaign_state(container, state)
 
-    result_id = ""
-    if args.get("record_result", True):
-        result_id = await _record_result_artifact(
-            container,
-            title=f"Fork exploit workbench: {title}",
-            content=(
-                f"Fork workbench: {workbench_id}\n"
-                f"Path: {workbench_path}\n"
-                f"Mechanism: {mechanism}\n"
-                f"Candidate: {candidate.get('candidate_id') or candidate.get('attack_key')}\n"
-                f"Blockers: {len(blockers)}\n"
-                "Use this as executable-fork planning context; it is not a finding."
-            ),
-            evidence=[workbench_path, readme_path],
-            related_ids=[
-                item for item in (
-                    workbench_id,
-                    candidate.get("candidate_id"),
-                    candidate.get("attack_key"),
-                    candidate.get("action_key"),
-                    *related_ids,
-                )
-                if item
-            ],
-            status="observed",
-        )
-
-    response = {
-        "workbench_id": workbench_id,
-        "path": workbench_path,
-        "readme": readme_path,
-        "result_id": result_id or None,
-        "mechanism": mechanism,
-        "target": target,
-        "blockers": blockers[:12],
-        "snapshot_probe_counts": {
-            key: len(value or [])
-            for key, value in payload["snapshot_state_templates"].items()
-        },
-        "objective_templates": payload["objective_templates"],
-        "compose_sequence_experiment_args": compose_args,
-        "next_steps": payload["next_steps"],
-    }
-    if model_guidance:
-        response["model_guidance"] = model_guidance
-    return json.dumps(response, indent=2, sort_keys=True)
 
 
 def _coverage_normalize_text(value: str) -> str:
@@ -26355,9 +32585,39 @@ def _coverage_normalize_text(value: str) -> str:
 
 
 def _coverage_action_key(entry: dict) -> str:
+    definition_key = str(entry.get("action_definition_key") or "").strip()
+    if definition_key:
+        return definition_key
     contract = str(entry.get("contract") or "").strip()
     function = str(entry.get("function") or "").strip()
-    return f"{contract}::{function}" if contract else function
+    source = entry.get("source") if isinstance(entry.get("source"), dict) else {}
+    signature = str(
+        entry.get("signature") or source.get("signature") or ""
+    ).strip()
+    if signature:
+        signature = re.sub(r"\s+", "", signature)
+    action = signature or function
+    return f"{contract}::{action}" if contract else action
+
+
+def _coverage_definition_key(entry: dict) -> str:
+    action_key = _coverage_action_key(entry)
+    source_file = str(entry.get("file") or "").strip()
+    if not action_key or not source_file:
+        return action_key
+    return f"{action_key}@{posixpath.normpath(source_file)}"
+
+
+def _coverage_action_family_key(entry: dict) -> str:
+    """Definition-scoped semantic family for an explicit coverage decision."""
+    action_key = _coverage_action_key(entry)
+    if not action_key:
+        return ""
+    family = _action_family_from_action_key(action_key)
+    source_file = str(entry.get("file") or "").strip()
+    if source_file:
+        return f"coverage:{family}@{posixpath.normpath(source_file)}"
+    return f"coverage:{family}"
 
 
 def _campaign_decided_action_keys(state: dict) -> set[str]:
@@ -26368,7 +32628,24 @@ def _campaign_decided_action_keys(state: dict) -> set[str]:
         if text:
             keys.add(text)
     for entry in state.get("sections", {}).get("decision", []):
+        if entry.get("coverage_keys"):
+            continue
         for item in entry.get("action_keys") or []:
+            text = str(item).strip()
+            if text:
+                keys.add(text)
+    return keys
+
+
+def _campaign_decided_coverage_keys(state: dict) -> set[str]:
+    keys = set()
+    attack_search = state.get("attack_search") or {}
+    for item in attack_search.get("decided_coverage_keys") or []:
+        text = str(item).strip()
+        if text:
+            keys.add(text)
+    for entry in state.get("sections", {}).get("decision", []):
+        for item in entry.get("coverage_keys") or []:
             text = str(item).strip()
             if text:
                 keys.add(text)
@@ -26383,33 +32660,166 @@ def _coverage_action_type(entry: dict) -> str:
     return "action"
 
 
-def _coverage_action_referenced(entry: dict, text: str, normalized: str) -> bool:
+_COVERAGE_RAW_IDENTIFIER_RE = re.compile(r"[a-z0-9_$]+")
+
+
+def _coverage_action_reference_context(entry: dict) -> dict:
+    """Precompute action constants shared by every campaign-record match."""
     contract = str(entry.get("contract") or "").strip().lower()
     function = str(entry.get("function") or "").strip().lower()
+    overloaded = int(entry.get("overload_count") or 0) > 1
+    signature = str(entry.get("signature") or "").strip().lower()
+    exact_variants = []
+    raw_identifier_prefixes = {function} if function else set()
+    if function:
+        if contract:
+            if not overloaded:
+                exact_variants.extend([
+                    f"{contract}::{function}",
+                    f"{contract}.{function}",
+                    f"{contract} {function}",
+                ])
+            if signature:
+                exact_variants.extend([
+                    f"{contract}::{signature}",
+                    f"{contract}.{signature}",
+                ])
+                signature_function = signature.split("(", 1)[0].strip()
+                if signature_function:
+                    raw_identifier_prefixes.add(signature_function)
+        else:
+            exact_variants.append(f"{function}(")
+    return {
+        "action_key": _coverage_action_key(entry),
+        "coverage_key": _coverage_definition_key(entry),
+        "legacy_key": (
+            f"{entry.get('contract')}::{entry.get('function')}"
+            if entry.get("contract")
+            else str(entry.get("function") or "")
+        ),
+        "contract": contract,
+        "function": function,
+        "overloaded": overloaded,
+        "exact_variants": tuple(exact_variants),
+        "function_token": _coverage_normalize_text(function),
+        "contract_token": _coverage_normalize_text(contract),
+        "raw_identifier_prefixes": tuple(sorted(raw_identifier_prefixes)),
+        "raw_prefixes_are_identifiers": all(
+            _COVERAGE_RAW_IDENTIFIER_RE.fullmatch(prefix)
+            for prefix in raw_identifier_prefixes
+        ),
+    }
+
+
+def _coverage_action_referenced(
+    entry: dict,
+    text: str,
+    normalized: str,
+    *,
+    allow_fuzzy: bool = True,
+    context: dict | None = None,
+    raw_lower: str | None = None,
+    normalized_tokens: set[str] | frozenset[str] | None = None,
+) -> bool:
+    context = context or _coverage_action_reference_context(entry)
+    contract = context["contract"]
+    function = context["function"]
     if not function:
         return False
 
-    exact_variants = []
-    if contract:
-        exact_variants.extend([
-            f"{contract}::{function}",
-            f"{contract}.{function}",
-            f"{contract} {function}",
-        ])
-    else:
-        exact_variants.append(f"{function}(")
-    raw = text.lower()
-    if any(variant in raw for variant in exact_variants):
+    raw = text.lower() if raw_lower is None else raw_lower
+    if any(variant in raw for variant in context["exact_variants"]):
         return True
+    if not allow_fuzzy or context["overloaded"]:
+        return False
 
-    normalized_tokens = set(normalized.split())
-    function_token = _coverage_normalize_text(function)
+    if normalized_tokens is None:
+        normalized_tokens = set(normalized.split())
+    function_token = context["function_token"]
     if not function_token or function_token not in normalized_tokens:
         return False
     if not contract:
         return True
-    contract_token = _coverage_normalize_text(contract)
+    contract_token = context["contract_token"]
     return bool(contract_token and contract_token in normalized_tokens)
+
+
+_COVERAGE_EXECUTION_EVIDENCE_PREFIXES = (
+    "/workspace/campaign/results/",
+    "/workspace/campaign/fuzz-runs/",
+    "/workspace/campaign/evaluations/",
+    "/workspace/campaign/objective-evaluations/",
+    "/workspace/campaign/comparisons/",
+    "/workspace/campaign/snapshot-comparisons/",
+    "/workspace/campaign/snapshots/",
+    "/workspace/campaign/traces/",
+    "/workspace/campaign/trace-summaries/",
+    "/workspace/campaign/minimizations/",
+)
+
+
+def _coverage_record_section(section: str, entry: dict) -> str:
+    """Keep planning/result artifacts from masquerading as execution coverage."""
+    if section != "result":
+        return section
+    run_classification = entry.get("run_classification")
+    if (
+        isinstance(run_classification, dict)
+        and not run_classification.get("satisfies_experiment_run")
+    ):
+        return "modeled_context"
+    evidence = [posixpath.normpath(str(item)) for item in _entry_evidence(entry)]
+    if any(path.startswith(_COVERAGE_EXECUTION_EVIDENCE_PREFIXES) for path in evidence):
+        return section
+    content = str(entry.get("content") or "").lower()
+    if any(marker in content for marker in (
+        "run classification:",
+        "forge test",
+        "objective evaluation:",
+        "snapshot comparison:",
+        "fuzz outcome:",
+    )):
+        return section
+    return "modeled_context"
+
+
+def _coverage_lineage_keys_by_entry(
+    state: dict,
+    field: str,
+) -> dict[str, list[str]]:
+    """Propagate structured coverage identity through bounded lineage."""
+    entries_by_id = {
+        str(entry.get("id")): entry
+        for entries in state.get("sections", {}).values()
+        for entry in entries
+        if entry.get("id")
+    }
+    keys_by_id = {
+        entry_id: {
+            str(item).strip()
+            for item in entry.get(field) or []
+            if str(item).strip()
+        }
+        for entry_id, entry in entries_by_id.items()
+    }
+    # Two hops cover experiment -> result -> review/decision without turning
+    # this into an unbounded graph walk over contaminated campaign history.
+    for _ in range(2):
+        changed = False
+        for entry_id, entry in entries_by_id.items():
+            inherited = set(keys_by_id.get(entry_id) or set())
+            for related_id in _entry_related_ids(entry):
+                inherited.update(keys_by_id.get(str(related_id)) or set())
+            if inherited != keys_by_id.get(entry_id, set()):
+                keys_by_id[entry_id] = inherited
+                changed = True
+        if not changed:
+            break
+    return {
+        entry_id: sorted(keys)
+        for entry_id, keys in keys_by_id.items()
+        if keys
+    }
 
 
 async def _coverage_campaign_records(
@@ -26418,15 +32828,23 @@ async def _coverage_campaign_records(
 ) -> list[dict]:
     records = []
     evidence_cache: dict[str, str] = {}
+    action_keys_by_entry = _coverage_lineage_keys_by_entry(state, "action_keys")
+    coverage_keys_by_entry = _coverage_lineage_keys_by_entry(state, "coverage_keys")
     for section, entries in state.get("sections", {}).items():
         for entry in entries:
+            effective_section = _coverage_record_section(section, entry)
+            action_keys = action_keys_by_entry.get(str(entry.get("id") or ""), [])
+            coverage_keys = coverage_keys_by_entry.get(
+                str(entry.get("id") or ""), []
+            )
             text_parts = [
                 str(entry.get("id") or ""),
                 str(entry.get("title") or ""),
                 str(entry.get("content") or ""),
                 str(entry.get("status") or ""),
                 str(entry.get("priority") or ""),
-                " ".join(str(item) for item in entry.get("action_keys") or []),
+                " ".join(action_keys),
+                " ".join(coverage_keys),
                 " ".join(str(item) for item in entry.get("attack_keys") or []),
                 " ".join(_entry_related_ids(entry)),
                 " ".join(_entry_evidence(entry)),
@@ -26449,26 +32867,223 @@ async def _coverage_campaign_records(
                     text_parts.append(evidence_cache[path])
             text = "\n".join(text_parts)
             records.append({
-                "section": section,
+                "section": effective_section,
                 "id": entry.get("id"),
                 "title": entry.get("title"),
                 "status": entry.get("status"),
                 "priority": entry.get("priority"),
+                "action_keys": action_keys,
+                "coverage_keys": coverage_keys,
                 "text": text,
                 "normalized": _coverage_normalize_text(text),
             })
     return records
 
 
-def _coverage_references_for_action(entry: dict, records: list[dict]) -> list[dict]:
+def _coverage_record_index(records: list[dict]) -> dict:
+    """Index campaign coverage records once for all action-space definitions.
+
+    Definition-scoped coverage lineage is authoritative. Records without it
+    remain eligible for the legacy action-key and text fallback paths, so the
+    final matcher still decides every candidate and preserves prior semantics.
+    """
+    by_coverage_key: dict[object, list[int]] = {}
+    by_action_key: dict[object, list[int]] = {}
+    text_by_token: dict[str, list[int]] = {}
+    text_by_raw_identifier: dict[str, list[int]] = {}
+    record_coverage_keys = []
+    record_action_keys = []
+    normalized_token_sets = []
+    lower_texts = []
+    text_fallback_indices = []
+
+    for position, record in enumerate(records):
+        coverage_keys = frozenset(record.get("coverage_keys", []))
+        action_keys = frozenset(record.get("action_keys", []))
+        record_coverage_keys.append(coverage_keys)
+        record_action_keys.append(action_keys)
+
+        if coverage_keys:
+            # Definition-scoped records can only match by coverage key. Do not
+            # tokenize or index their prose at all.
+            normalized_token_sets.append(frozenset())
+            lower_texts.append("")
+            for coverage_key in coverage_keys:
+                by_coverage_key.setdefault(coverage_key, []).append(position)
+            continue
+
+        text = record["text"]
+        normalized = record["normalized"]
+        lower_text = text.lower()
+        normalized_tokens = frozenset(normalized.split())
+        normalized_token_sets.append(normalized_tokens)
+        lower_texts.append(lower_text)
+        for action_key in action_keys:
+            by_action_key.setdefault(action_key, []).append(position)
+        text_fallback_indices.append(position)
+
+        for token in normalized_tokens:
+            text_by_token.setdefault(token, []).append(position)
+        for identifier in set(_COVERAGE_RAW_IDENTIFIER_RE.findall(lower_text)):
+            text_by_raw_identifier.setdefault(identifier, []).append(position)
+
+    return {
+        "records": records,
+        "by_coverage_key": by_coverage_key,
+        "by_action_key": by_action_key,
+        "record_coverage_keys": tuple(record_coverage_keys),
+        "record_action_keys": tuple(record_action_keys),
+        "normalized_token_sets": tuple(normalized_token_sets),
+        "lower_texts": tuple(lower_texts),
+        "text_by_token": text_by_token,
+        "text_by_raw_identifier": text_by_raw_identifier,
+        "raw_identifiers": tuple(sorted(text_by_raw_identifier)),
+        "text_fallback_indices": tuple(text_fallback_indices),
+        "text_candidates_by_identity": {},
+    }
+
+
+def _coverage_text_candidate_indices(
+    context: dict,
+    record_index: dict,
+) -> tuple[int, ...]:
+    """Return a conservative text-match posting list for one action identity."""
+    identity = (
+        context["contract"],
+        context["function"],
+        context["overloaded"],
+        bool(context["exact_variants"]),
+        context["raw_identifier_prefixes"],
+    )
+    cached = record_index["text_candidates_by_identity"].get(identity)
+    if cached is not None:
+        return cached
+
+    candidates: set[int] = set()
+    function_token = context["function_token"]
+    contract_token = context["contract_token"]
+    if not context["overloaded"] and function_token:
+        fuzzy_candidates = set(record_index["text_by_token"].get(function_token, []))
+        if context["contract"]:
+            if contract_token:
+                fuzzy_candidates.intersection_update(
+                    record_index["text_by_token"].get(contract_token, [])
+                )
+            else:
+                fuzzy_candidates.clear()
+        candidates.update(fuzzy_candidates)
+
+    # Raw exact matching intentionally uses substring semantics. Locate all
+    # identifier postings with the function as a prefix, then let the legacy
+    # matcher verify the full Contract::function / signature variant. The
+    # sorted-key lookup avoids scanning every record and preserves odd legacy
+    # prefix matches such as ``Contract::functionVariant``.
+    if context["exact_variants"]:
+        if context["raw_prefixes_are_identifiers"]:
+            identifiers = record_index["raw_identifiers"]
+            for prefix in context["raw_identifier_prefixes"]:
+                start = bisect.bisect_left(identifiers, prefix)
+                stop = bisect.bisect_left(
+                    identifiers,
+                    prefix + chr(0x10FFFF),
+                )
+                for identifier in identifiers[start:stop]:
+                    if not identifier.startswith(prefix):
+                        break
+                    candidates.update(
+                        record_index["text_by_raw_identifier"][identifier]
+                    )
+        else:
+            # This is not expected for Solidity identifiers, but retaining the
+            # full fallback keeps matching semantics safe for legacy artifacts.
+            candidates.update(record_index["text_fallback_indices"])
+
+    result = tuple(sorted(candidates))
+    record_index["text_candidates_by_identity"][identity] = result
+    return result
+
+
+def _coverage_references_for_action(
+    entry: dict,
+    records: list[dict],
+    *,
+    text_identity_is_ambiguous: bool = False,
+    record_index: dict | None = None,
+) -> list[dict]:
+    """Return campaign references without treating ambiguous prose as lineage.
+
+    A legacy text mention such as ``Vault::withdraw`` remains useful context,
+    but it cannot identify which source definition was exercised when the
+    action space contains that same contract/function identity in multiple
+    files. Structured action/coverage lineage still takes precedence and may
+    close coverage for those definitions.
+    """
+    context = _coverage_action_reference_context(entry)
+    if record_index is not None and record_index.get("records") is not records:
+        record_index = _coverage_record_index(records)
+    if record_index is None:
+        candidate_indices = range(len(records))
+    else:
+        candidate_set = set(
+            record_index["by_coverage_key"].get(context["coverage_key"], [])
+        )
+        candidate_set.update(
+            record_index["by_action_key"].get(context["action_key"], [])
+        )
+        if not context["overloaded"]:
+            candidate_set.update(
+                record_index["by_action_key"].get(context["legacy_key"], [])
+            )
+        candidate_set.update(_coverage_text_candidate_indices(context, record_index))
+        candidate_indices = sorted(candidate_set)
+
     references = []
     seen = set()
-    for record in records:
-        if not _coverage_action_referenced(
-            entry,
-            record["text"],
-            record["normalized"],
+    for candidate_index in candidate_indices:
+        record = records[candidate_index]
+        record_coverage_keys = (
+            record.get("coverage_keys", [])
+            if record_index is None
+            else record_index["record_coverage_keys"][candidate_index]
+        )
+        record_action_keys = (
+            record.get("action_keys", [])
+            if record_index is None
+            else record_index["record_action_keys"][candidate_index]
+        )
+        if record_coverage_keys:
+            matched = context["coverage_key"] in record_coverage_keys
+            match_kind = "coverage_key" if matched else ""
+        elif context["action_key"] in record_action_keys or (
+            not context["overloaded"]
+            and context["legacy_key"] in record_action_keys
         ):
+            matched = True
+            match_kind = "action_key"
+        else:
+            matched = _coverage_action_referenced(
+                entry,
+                record["text"],
+                record["normalized"],
+                allow_fuzzy=record.get("section") not in {"experiment", "result"},
+                context=context,
+                raw_lower=(
+                    None
+                    if record_index is None
+                    else record_index["lower_texts"][candidate_index]
+                ),
+                normalized_tokens=(
+                    None
+                    if record_index is None
+                    else record_index["normalized_token_sets"][candidate_index]
+                ),
+            )
+            match_kind = (
+                "text_context"
+                if matched and text_identity_is_ambiguous
+                else "text" if matched else ""
+            )
+        if not matched:
             continue
         key = (record["section"], record.get("id"))
         if key in seen:
@@ -26480,12 +33095,17 @@ def _coverage_references_for_action(entry: dict, records: list[dict]) -> list[di
             "title": record.get("title"),
             "status": record.get("status"),
             "priority": record.get("priority"),
+            "match_kind": match_kind,
         })
     return references
 
 
 def _coverage_level(references: list[dict]) -> str:
-    sections = {str(item.get("section") or "") for item in references}
+    sections = {
+        str(item.get("section") or "")
+        for item in references
+        if item.get("match_kind") != "text_context"
+    }
     if "result" in sections:
         return "result_observed"
     if "experiment" in sections:
@@ -26554,8 +33174,11 @@ def _coverage_action_summary(entry: dict, references: list[dict]) -> dict:
     score, reasons = _coverage_attention(entry)
     return {
         "key": _coverage_action_key(entry),
+        "coverage_key": _coverage_definition_key(entry),
         "contract": entry.get("contract"),
         "function": entry.get("function"),
+        "signature": entry.get("signature"),
+        "parameters": entry.get("parameters") or [],
         "type": _coverage_action_type(entry),
         "file": entry.get("file"),
         "line": entry.get("line"),
@@ -26569,263 +33192,93 @@ def _coverage_action_summary(entry: dict, references: list[dict]) -> dict:
     }
 
 
-def _coverage_contract_stats(items: list[dict]) -> list[dict]:
-    stats: dict[str, dict] = {}
-    for item in items:
-        contract = str(item.get("contract") or "unknown")
-        contract_stats = stats.setdefault(contract, {
-            "contract": contract,
-            "total": 0,
-            "with_hypothesis": 0,
-            "with_experiment": 0,
-            "with_result": 0,
-            "decided": 0,
-            "open_gaps": 0,
-            "high_attention_gaps": 0,
-        })
-        contract_stats["total"] += 1
-        coverage = item["coverage"]
-        if coverage == "hypothesized":
-            contract_stats["with_hypothesis"] += 1
-        elif coverage == "experiment_planned":
-            contract_stats["with_experiment"] += 1
-        elif coverage == "result_observed":
-            contract_stats["with_result"] += 1
-        elif coverage == "decided":
-            contract_stats["decided"] += 1
-        if item.get("is_open_gap"):
-            contract_stats["open_gaps"] += 1
-        if item.get("is_high_attention_gap"):
-            contract_stats["high_attention_gaps"] += 1
-    return sorted(
-        stats.values(),
-        key=lambda item: (
-            -item["high_attention_gaps"],
-            -item["open_gaps"],
-            item["contract"],
-        ),
-    )
+def _coverage_text_identity(entry: dict) -> str:
+    contract = str(entry.get("contract") or "").strip().lower()
+    function = str(entry.get("function") or "").strip().lower()
+    if not function:
+        return ""
+    return f"{contract}::{function}" if contract else function
 
 
-def _coverage_affordance_stats(items: list[dict]) -> list[dict]:
-    stats: dict[str, dict] = {}
-    for item in items:
-        labels = item.get("affordances") or ["unlabeled"]
-        for label in labels:
-            label_stats = stats.setdefault(label, {
-                "affordance": label,
-                "total": 0,
-                "open_gaps": 0,
-                "high_attention_gaps": 0,
-                "with_experiment_or_result": 0,
-            })
-            label_stats["total"] += 1
-            if item.get("is_open_gap"):
-                label_stats["open_gaps"] += 1
-            if item.get("is_high_attention_gap"):
-                label_stats["high_attention_gaps"] += 1
-            if item["coverage"] in {"experiment_planned", "result_observed"}:
-                label_stats["with_experiment_or_result"] += 1
-    return sorted(
-        stats.values(),
-        key=lambda item: (
-            -item["high_attention_gaps"],
-            -item["open_gaps"],
-            -item["total"],
-            item["affordance"],
-        ),
-    )
+def _coverage_text_identity_definitions(action_spaces: list[dict]) -> dict[str, set[str]]:
+    definitions: dict[str, set[str]] = {}
+    for action_space in action_spaces:
+        for entry in action_space.get("actions") or []:
+            identity = _coverage_text_identity(entry)
+            definition_key = _coverage_definition_key(entry)
+            if identity and definition_key:
+                definitions.setdefault(identity, set()).add(definition_key)
+    return definitions
 
 
-def _coverage_next_actions(review: dict) -> list[str]:
-    actions = []
-    if review["high_attention_gaps"]:
-        actions.append(
-            "Pick one high-attention uncovered lever, state the invariant it might falsify, then compose a sequence or invariant experiment."
-        )
-    if review["hypothesized_not_experimented"]:
-        actions.append(
-            "Turn hypothesized-but-unexperimented levers into concrete PoCs or reject them with a decision."
-        )
-    if review["open_gaps"] and not review["high_attention_gaps"]:
-        actions.append(
-            "Use the open gaps as prompts for the next LLM-chosen action grammar; prioritize by value flow and reachable attacker control."
-        )
-    if not actions:
-        actions.append(
-            "No major coverage gaps found in this action space; map another subsystem or deepen parameter/order exploration."
-        )
-    return actions
-
-
-async def _review_attack_surface_coverage(
+async def _derive_attack_surface_gaps(
     container: AuditContainer,
-    args: dict,
-) -> str:
-    try:
-        action_space_path, action_space = await _load_action_space(
-            container,
-            str(args.get("action_space") or ""),
-        )
-        focus_contracts = {
-            str(item).strip().lower()
-            for item in _require_list(args.get("focus_contracts"), "focus_contracts")
-            if str(item).strip()
-        }
-        affordance_filter = {
-            str(item).strip()
-            for item in _require_list(args.get("affordance_filter"), "affordance_filter")
-            if str(item).strip()
-        }
-    except (FileNotFoundError, ValueError) as exc:
-        return f"Error: {exc}"
-
-    max_items = min(max(int(args.get("max_items", 25)), 1), 100)
-    threshold = max(int(args.get("attention_threshold", 3)), 0)
-    include_observations = bool(args.get("include_observations", False))
-    state = await _load_campaign_state(container)
-    records = await _coverage_campaign_records(container, state)
+    state: dict,
+    action_space: dict,
+    *,
+    attention_threshold: int = 3,
+    records: list[dict] | None = None,
+    record_index: dict | None = None,
+    text_identity_definitions: dict[str, set[str]] | None = None,
+    max_items: int | None = None,
+) -> list[dict]:
+    """Return current high-attention gaps without creating review artifacts."""
+    if records is None:
+        records = await _coverage_campaign_records(container, state)
+    if record_index is None or record_index.get("records") is not records:
+        record_index = _coverage_record_index(records)
     decided_action_keys = _campaign_decided_action_keys(state)
-
-    candidate_entries = list(action_space.get("actions") or [])
-    if include_observations:
-        candidate_entries.extend(action_space.get("observations") or [])
-
-    skipped = {
-        "focus_contracts": 0,
-        "affordance_filter": 0,
-    }
-    reviewed = []
-    for entry in candidate_entries:
-        contract = str(entry.get("contract") or "").strip().lower()
-        affordances = {str(item) for item in entry.get("affordances") or []}
-        if focus_contracts and contract not in focus_contracts:
-            skipped["focus_contracts"] += 1
-            continue
-        if affordance_filter and not affordances.intersection(affordance_filter):
-            skipped["affordance_filter"] += 1
-            continue
-        references = _coverage_references_for_action(entry, records)
+    decided_coverage_keys = _campaign_decided_coverage_keys(state)
+    decided_action_family_keys = set(
+        (state.get("attack_search") or {}).get("decided_action_family_keys") or []
+    )
+    if text_identity_definitions is None:
+        text_identity_definitions = _coverage_text_identity_definitions([action_space])
+    gaps = []
+    for entry in action_space.get("actions") or []:
+        text_identity = _coverage_text_identity(entry)
+        references = _coverage_references_for_action(
+            entry,
+            records,
+            text_identity_is_ambiguous=(
+                len(text_identity_definitions.get(text_identity, set())) > 1
+            ),
+            record_index=record_index,
+        )
         summary = _coverage_action_summary(entry, references)
         action_key = str(summary.get("key") or "")
-        if action_key in decided_action_keys:
-            references = [
-                *references,
-                {
-                    "section": "decision",
-                    "id": "decided_action_key",
-                    "title": f"Decision recorded for {action_key}",
-                    "status": "observed",
-                    "priority": None,
-                },
-            ]
-            summary = _coverage_action_summary(entry, references)
-        sections = {str(item.get("section") or "") for item in references}
-        summary["is_open_gap"] = not sections.intersection({
-            "experiment",
-            "result",
-            "decision",
-        })
-        summary["is_hypothesized_not_experimented"] = (
-            "hypothesis" in sections
-            and not sections.intersection({"experiment", "result", "decision"})
+        coverage_key = _coverage_definition_key(entry)
+        coverage_family_key = _coverage_action_family_key(entry)
+        if (
+            action_key in decided_action_keys
+            or coverage_key in decided_coverage_keys
+            or coverage_family_key in decided_action_family_keys
+        ):
+            continue
+        sections = {
+            str(item.get("section") or "")
+            for item in references
+            if item.get("match_kind") != "text_context"
+        }
+        structured_hypothesis = any(
+            item.get("section") == "hypothesis"
+            and item.get("match_kind") in {"coverage_key", "action_key"}
+            for item in references
         )
-        summary["is_high_attention_gap"] = (
-            summary["is_open_gap"]
-            and summary["attention_score"] >= threshold
+        is_open = (
+            not sections.intersection({"experiment", "result", "decision"})
+            and not structured_hypothesis
         )
-        reviewed.append(summary)
-
-    reviewed.sort(key=lambda item: (
-        not item["is_high_attention_gap"],
-        not item["is_open_gap"],
-        -item["attention_score"],
+        if is_open and int(summary.get("attention_score") or 0) >= attention_threshold:
+            summary["is_open_gap"] = True
+            summary["is_high_attention_gap"] = True
+            gaps.append(summary)
+    gaps.sort(key=lambda item: (
+        -int(item.get("attention_score") or 0),
         str(item.get("contract") or ""),
         str(item.get("function") or ""),
     ))
-    open_gaps = [item for item in reviewed if item["is_open_gap"]]
-    high_attention_gaps = [
-        item for item in reviewed if item["is_high_attention_gap"]
-    ]
-    hypothesized_not_experimented = [
-        item for item in reviewed if item["is_hypothesized_not_experimented"]
-    ]
-    covered = [
-        item for item in reviewed
-        if item["coverage"] in {"experiment_planned", "result_observed", "decided"}
-    ]
-
-    review_id = _next_campaign_id(state, "coverage_review")
-    title = str(args.get("title") or "Attack surface coverage review").strip()
-    review = {
-        "id": review_id,
-        "title": title,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "action_space": action_space.get("id"),
-        "action_space_path": action_space_path,
-        "filters": {
-            "focus_contracts": sorted(focus_contracts),
-            "affordance_filter": sorted(affordance_filter),
-            "include_observations": include_observations,
-            "attention_threshold": threshold,
-        },
-        "source_summary": action_space.get("summary") or {},
-        "summary": {
-            "reviewed": len(reviewed),
-            "covered": len(covered),
-            "open_gaps": len(open_gaps),
-            "high_attention_gaps": len(high_attention_gaps),
-            "hypothesized_not_experimented": len(hypothesized_not_experimented),
-            "skipped": skipped,
-        },
-        "contract_coverage": _coverage_contract_stats(reviewed)[:max_items],
-        "affordance_coverage": _coverage_affordance_stats(reviewed)[:max_items],
-        "high_attention_gaps": high_attention_gaps[:max_items],
-        "hypothesized_not_experimented": hypothesized_not_experimented[:max_items],
-        "open_gaps": open_gaps[:max_items],
-        "covered_actions": covered[:max_items],
-    }
-    review["next_actions"] = _coverage_next_actions(review)
-
-    review_path = f"/workspace/campaign/coverage-reviews/{review_id}.json"
-    await container.write_file(
-        review_path,
-        json.dumps(review, indent=2, sort_keys=True) + "\n",
-    )
-    await _save_campaign_state(container, state)
-
-    result_id = ""
-    if args.get("record_result", True):
-        action_space_id = str(action_space.get("id") or "")
-        result_id = await _record_result_artifact(
-            container,
-            title=f"Attack-surface coverage review: {title}",
-            content=(
-                f"Coverage review: {review_id}\n"
-                f"Path: {review_path}\n"
-                f"Action space: {action_space.get('id')} ({action_space_path})\n"
-                f"Reviewed actions: {review['summary']['reviewed']}\n"
-                f"Open gaps: {review['summary']['open_gaps']}\n"
-                f"High-attention gaps: {review['summary']['high_attention_gaps']}\n"
-                "Use these gaps to choose the next protocol-specific action "
-                "grammar; do not treat them as findings."
-            ),
-            evidence=[review_path, action_space_path],
-            related_ids=[action_space_id] if action_space_id else [],
-            status="observed",
-        )
-
-    response = {
-        "coverage_review_id": review_id,
-        "path": review_path,
-        "result_id": result_id or None,
-        "summary": review["summary"],
-        "next_actions": review["next_actions"],
-        "high_attention_gaps": review["high_attention_gaps"],
-        "hypothesized_not_experimented": review["hypothesized_not_experimented"],
-        "contract_coverage": review["contract_coverage"],
-    }
-    return json.dumps(response, indent=2, sort_keys=True)
+    return gaps[:max_items] if max_items is not None else gaps
 
 
 def _campaign_artifact_path(
@@ -26862,7 +33315,7 @@ async def _load_campaign_artifact(
         return None
 
 
-async def _load_plan_artifacts(
+async def _load_campaign_artifacts(
     container: AuditContainer,
     state: dict,
     *,
@@ -26895,31 +33348,6 @@ async def _load_plan_artifacts(
     return artifacts
 
 
-async def _load_plan_action_spaces(
-    container: AuditContainer,
-    state: dict,
-    explicit: str,
-) -> list[dict]:
-    paths = []
-    if explicit:
-        paths.append(_action_space_path(explicit))
-    for path in _progress_evidence_paths(
-        state,
-        "/workspace/campaign/action-spaces/",
-    ):
-        if path not in paths:
-            paths.append(path)
-
-    artifacts = []
-    for path in paths:
-        payload = await _load_campaign_artifact(container, path)
-        if payload:
-            artifacts.append({"path": path, "payload": payload})
-    artifacts.sort(
-        key=lambda item: str(item["payload"].get("created_at") or ""),
-        reverse=True,
-    )
-    return artifacts
 
 
 def _plan_priority(score: int) -> str:
@@ -27333,506 +33761,6 @@ def _plan_liquidation_route_checks(affordances: list[str]) -> list[str]:
     ]
 
 
-def _plan_attach_branch_context(
-    branch: dict,
-    affordances: list[str],
-    economics_context: dict | None,
-) -> dict:
-    branch_context = _plan_branch_economics_context(
-        affordances,
-        economics_context,
-    )
-    if branch_context:
-        branch["economics_context"] = branch_context
-    oracle_checks = _plan_oracle_window_checks(affordances)
-    if oracle_checks:
-        branch["oracle_window_checks"] = oracle_checks
-    liquidation_checks = _plan_liquidation_route_checks(affordances)
-    if liquidation_checks:
-        branch["liquidation_route_checks"] = liquidation_checks
-    flash_checks = _plan_flash_loan_checks(affordances)
-    if flash_checks:
-        branch["flash_loan_checks"] = flash_checks
-    flash_context = _plan_flash_loan_context(affordances, economics_context)
-    if flash_context:
-        branch["flash_loan_context"] = flash_context
-    return branch
-
-
-def _plan_invariant_prompt(affordances: list[str], action_key: str) -> str:
-    labels = set(affordances)
-    if labels.intersection({"value_out_or_burn", "token_or_native_transfer"}):
-        return f"{action_key} must not release more value than the actor is entitled to receive."
-    if labels.intersection({"credit_or_liquidation"}):
-        return f"{action_key} must not create bad debt, excess collateral value, or unfair liquidation outcomes."
-    if labels.intersection({"valuation_dependency", "market_or_router"}):
-        return f"{action_key} must not let attacker-controlled market state distort protocol valuation for profit."
-    if labels.intersection({"generic_execution", "external_call", "delegatecall"}):
-        return f"{action_key} must not route execution or callbacks into unauthorized value movement."
-    if labels.intersection({"signed_authorization", "signature_gate", "signature_input"}):
-        return f"{action_key} must commit authorization to every execution-critical field."
-    if labels.intersection({"cross_domain_or_message"}):
-        return f"{action_key} must not release or mint value without a valid source-domain state transition."
-    return f"{action_key} must preserve the protocol's stated solvency and authorization invariants."
-
-
-def _plan_experiment_shape(affordances: list[str]) -> str:
-    labels = set(affordances)
-    if labels.intersection({"valuation_dependency", "market_or_router", "credit_or_liquidation"}):
-        return "fork-aware sequence experiment with state snapshots"
-    if labels.intersection({"generic_execution", "external_call", "callback_or_flashloan_surface", "delegatecall"}):
-        return "multi-actor sequence experiment with malicious counterparty or callback"
-    if labels.intersection({"value_out_or_burn", "value_in_or_mint", "token_or_native_transfer"}):
-        return "sequence experiment with before/after balance and accounting probes"
-    if labels.intersection({"signed_authorization", "signature_gate", "signature_input", "cross_domain_or_message"}):
-        return "sequence experiment with replay/parameter-binding checks"
-    return "small sequence or invariant experiment chosen by the LLM"
-
-
-def _plan_next_tool(affordances: list[str], *, source: str) -> str:
-    labels = set(affordances)
-    if source == "action_space_without_coverage":
-        return "review_attack_surface_coverage"
-    if source == "failed_evaluation":
-        return "mutate_hypothesis"
-    if source == "experiment_without_result":
-        return "run_experiment"
-    if labels.intersection({"callback_or_flashloan_surface", "credit_or_liquidation"}):
-        return "compose_invariant_harness with handler actions or compose_sequence_experiment with explicit actions"
-    return "compose_sequence_experiment with explicit actions or compose_invariant_harness with handler actions"
-
-
-def _plan_required_setup(
-    affordances: list[str],
-    economics_context: dict | None = None,
-) -> list[str]:
-    labels = set(affordances)
-    setup = [
-        "state the exact actor, target contract, and starting balances",
-        "bind the target addresses or mocks needed by the harness",
-    ]
-    if labels.intersection({"valuation_dependency", "market_or_router"}):
-        setup.append("record fork context and pool/oracle state before testing")
-        setup.append("estimate AMM economics for any price-moving step")
-    setup.extend(_plan_oracle_window_checks(affordances)[:2])
-    if labels.intersection({"credit_or_liquidation"}):
-        setup.append("model collateral, debt, health factor, and liquidation thresholds")
-        if economics_context and economics_context.get("has_lending_health"):
-            setup.append(
-                "review linked lending health estimate and choose fork states "
-                "that cross the liquidation or bad-debt threshold"
-            )
-        else:
-            setup.append(
-                "run estimate_lending_health with explicit collateral, debt, "
-                "threshold, and price-shift assumptions"
-            )
-        setup.extend(_plan_liquidation_route_checks(affordances)[:2])
-    if labels.intersection({"callback_or_flashloan_surface"}):
-        if economics_context and economics_context.get("has_flash_loan"):
-            setup.append(
-                "review linked flash-loan estimate and validate callback plus "
-                "repayment behavior on fork"
-            )
-        else:
-            setup.append(
-                "run estimate_flash_loan if borrowed capital or flash callback "
-                "reachability is part of the branch"
-            )
-    setup.extend(_plan_flash_loan_checks(affordances)[:1])
-    if labels.intersection({"generic_execution", "external_call", "callback_or_flashloan_surface"}):
-        setup.append("add attacker-controlled callee/callback behavior")
-    if labels.intersection({"signed_authorization", "signature_gate", "signature_input"}):
-        setup.append("construct valid and mutated authorization payloads")
-    if labels.intersection({"cross_domain_or_message"}):
-        setup.append("model the source-domain commitment and replay/mismatch cases")
-    return setup
-
-
-def _plan_evidence_needed(affordances: list[str]) -> list[str]:
-    labels = set(affordances)
-    evidence = [
-        "run_experiment output linked to the hypothesis and experiment",
-        "before/after snapshot_state and compare_snapshots for the invariant",
-        "evaluate_objective for profit, loss, debt, shares, or authorization outcome",
-        "summarize_trace or extract_call_sequence if the run emits a verbose trace",
-    ]
-    if labels.intersection({"valuation_dependency", "market_or_router"}):
-        evidence.append("AMM/oracle liquidity and price-impact assumptions")
-    if labels.intersection({"valuation_dependency"}):
-        evidence.append(
-            "oracle answer/freshness/window snapshots before and after manipulation"
-        )
-    if labels.intersection({"credit_or_liquidation"}):
-        evidence.append(
-            "lending health estimate plus fork-validated collateral, debt, "
-            "health-factor, and liquidation-route deltas"
-        )
-    if labels.intersection({"callback_or_flashloan_surface"}):
-        evidence.append(
-            "flash-loan liquidity, fee, callback, repayment, and post-unwind balance evidence"
-        )
-    if labels.intersection({"generic_execution", "external_call", "callback_or_flashloan_surface"}):
-        evidence.append("trace proof of the external call/callback path")
-    return evidence
-
-
-def _plan_blockers(
-    affordances: list[str],
-    *,
-    state: dict,
-    has_fork_context: bool,
-    has_economics: bool,
-    economics_context: dict | None = None,
-) -> list[str]:
-    labels = set(affordances)
-    blockers = []
-    if not state["sections"].get("invariant"):
-        blockers.append("missing invariant artifact")
-    if not state["sections"].get("value_flow"):
-        blockers.append("missing value-flow artifact")
-    if labels.intersection({"valuation_dependency", "market_or_router", "credit_or_liquidation"}) and not has_fork_context:
-        blockers.append("missing fork context for market/oracle-dependent branch")
-    has_market_economics = (
-        economics_context.get("has_market_economics")
-        if economics_context
-        else has_economics
-    )
-    if labels.intersection({"valuation_dependency", "market_or_router"}) and not has_market_economics:
-        blockers.append("missing AMM/economics estimate for price-moving branch")
-    if labels.intersection({"credit_or_liquidation"}) and not (
-        economics_context and economics_context.get("has_lending_health")
-    ):
-        blockers.append("missing lending health estimate for credit/liquidation branch")
-    if labels.intersection({"callback_or_flashloan_surface"}):
-        flash = (economics_context or {}).get("flash_loan") or {}
-        if _plan_int_value(flash.get("insufficient_liquidity")):
-            blockers.append(
-                "linked flash-loan estimate has insufficient liquidity; adjust amount or provider"
-            )
-    return blockers
-
-
-def _plan_stop_or_mutate(affordances: list[str]) -> str:
-    labels = set(affordances)
-    if labels.intersection({"valuation_dependency", "market_or_router"}):
-        return "If the price move is uneconomic or ignored by the protocol, mutate toward oracle cadence, alternate markets, stale data, or route assumptions."
-    if labels.intersection({"generic_execution", "external_call", "callback_or_flashloan_surface"}):
-        return "If callbacks cannot affect protected state, mutate toward ordering, reentry timing, or attacker-controlled dependency assumptions."
-    if labels.intersection({"value_out_or_burn", "token_or_native_transfer"}):
-        return "If balances remain proportional, mutate toward rounding, donation, fee-on-transfer, share accounting, or multi-actor ordering assumptions."
-    if labels.intersection({"credit_or_liquidation"}):
-        return "If no bad debt or unfair liquidation appears, mutate toward collateral valuation, timing, rounding, or liquidation incentive assumptions."
-    return "If the objective does not move, record the failed assumption and mutate to the nearest untested invariant or reject with a decision."
-
-
-def _plan_branch_from_action_gap(
-    item: dict,
-    *,
-    source: str,
-    source_path: str,
-    focus: str,
-    state: dict,
-    has_fork_context: bool,
-    has_economics: bool,
-    economics_context: dict | None,
-    base_score: int,
-    decided_action_keys: set[str] | None = None,
-) -> dict | None:
-    affordances = [str(label) for label in item.get("affordances") or []]
-    action_key = str(item.get("key") or _coverage_action_key(item))
-    # Skip levers the agent already decided on (rejected/blocked/objective-failed/
-    # superseded) so the planner does not regenerate resolved branches each call.
-    if action_key and decided_action_keys and action_key in decided_action_keys:
-        return None
-    relevant_economics = _plan_relevant_economics_artifacts(
-        affordances,
-        economics_context,
-    )
-    score = (
-        base_score
-        + int(item.get("attention_score", 0) or 0)
-        + _plan_focus_bonus(focus, action_key, affordances)
-        + _plan_economics_bonus(affordances, economics_context)
-    )
-    branch = {
-        "_dedupe_key": f"action:{action_key}",
-        "source": source,
-        "source_artifacts": [
-            source_path,
-            *[
-                str(artifact.get("path"))
-                for artifact in relevant_economics
-                if artifact.get("path")
-            ],
-        ],
-        "source_ids": [
-            ref.get("id") for ref in item.get("references", [])
-            if ref.get("id")
-        ] + [
-            artifact.get("id")
-            for artifact in relevant_economics
-            if artifact.get("id")
-        ],
-        "title": f"Test {action_key} as an attacker-controlled lever",
-        "priority_score": score,
-        "target_actions": [{
-            "key": action_key,
-            "contract": item.get("contract"),
-            "function": item.get("function"),
-            "file": item.get("file"),
-            "line": item.get("line"),
-            "affordances": affordances,
-            "coverage": item.get("coverage"),
-        }],
-        "hypothesis_prompt": (
-            f"Can an unprivileged actor combine {action_key} with setup, "
-            "ordering, external state, or repeated calls to falsify the "
-            "selected invariant?"
-        ),
-        "candidate_invariant": _plan_invariant_prompt(affordances, action_key),
-        "experiment_shape": _plan_experiment_shape(affordances),
-        "recommended_next_tool": _plan_next_tool(affordances, source=source),
-        "required_setup": _plan_required_setup(
-            affordances,
-            economics_context=economics_context,
-        ),
-        "evidence_to_capture": _plan_evidence_needed(affordances),
-        "stop_or_mutate_condition": _plan_stop_or_mutate(affordances),
-        "blockers": _plan_blockers(
-            affordances,
-            state=state,
-            has_fork_context=has_fork_context,
-            has_economics=has_economics,
-            economics_context=economics_context,
-        ),
-        "rationale": (
-            "Mapped callable surface has little or no linked experiment/result "
-            "coverage. Affordance labels are used only to choose evidence and "
-            "experiment shape."
-        ),
-    }
-    return _plan_attach_branch_context(branch, affordances, economics_context)
-
-
-def _plan_branch_from_protocol_hotspot(
-    item: dict,
-    *,
-    source_path: str,
-    graph_id: str | None,
-    focus: str,
-    state: dict,
-    has_fork_context: bool,
-    has_economics: bool,
-    economics_context: dict | None,
-    decided_action_keys: set[str] | None = None,
-) -> dict | None:
-    affordances = [str(label) for label in item.get("affordances") or []]
-    action_key = str(item.get("key") or "")
-    # A decided action should not resurface as a graph-hotspot lever either.
-    if action_key and decided_action_keys and action_key in decided_action_keys:
-        return None
-    relevant_economics = _plan_relevant_economics_artifacts(
-        affordances,
-        economics_context,
-    )
-    score = (
-        3
-        + int(item.get("score", 0) or 0)
-        + _plan_focus_bonus(focus, action_key, item.get("connected") or [])
-        + _plan_economics_bonus(affordances, economics_context)
-    )
-    connected = [
-        f"{edge.get('edge')} -> {edge.get('label') or edge.get('target')}"
-        for edge in item.get("connected") or []
-        if edge.get("edge") or edge.get("label") or edge.get("target")
-    ]
-    branch = {
-        "_dedupe_key": f"protocol_graph:{source_path}:{action_key}",
-        "source": "protocol_graph_hotspot",
-        "source_artifacts": [
-            source_path,
-            *[
-                str(artifact.get("path"))
-                for artifact in relevant_economics
-                if artifact.get("path")
-            ],
-        ],
-        "source_ids": [
-            *([graph_id] if graph_id else []),
-            *[
-                artifact.get("id")
-                for artifact in relevant_economics
-                if artifact.get("id")
-            ],
-        ],
-        "title": f"Investigate graph hotspot {action_key}",
-        "priority_score": score,
-        "target_actions": [{
-            "key": action_key,
-            "contract": item.get("contract"),
-            "function": item.get("function"),
-            "file": item.get("file"),
-            "line": item.get("line"),
-            "affordances": affordances,
-        }],
-        "hypothesis_prompt": (
-            f"What protocol invariant connects {action_key} to the mapped "
-            "value-flow or trust-boundary nodes, and how could an unprivileged "
-            "actor falsify it through ordering, parameters, or external state?"
-        ),
-        "candidate_invariant": _plan_invariant_prompt(affordances, action_key),
-        "experiment_shape": _plan_experiment_shape(affordances),
-        "recommended_next_tool": "update_campaign then compose_sequence_experiment with explicit actions or compose_invariant_harness with handler actions",
-        "required_setup": [
-            "record the specific invariant and hypothesis in campaign state",
-            "use mapped connected nodes as setup/evidence prompts",
-            *_plan_required_setup(
-                affordances,
-                economics_context=economics_context,
-            ),
-        ],
-        "evidence_to_capture": [
-            "campaign invariant/hypothesis linked to the protocol graph",
-            *_plan_evidence_needed(affordances),
-        ],
-        "stop_or_mutate_condition": _plan_stop_or_mutate(affordances),
-        "blockers": _plan_blockers(
-            affordances,
-            state=state,
-            has_fork_context=has_fork_context,
-            has_economics=has_economics,
-            economics_context=economics_context,
-        ),
-        "rationale": (
-            "Protocol graph links this entrypoint to value-flow or "
-            "trust-boundary context. The graph is a planning prompt, not proof "
-            f"of a bug. Connected nodes: {', '.join(connected[:5]) or 'none'}."
-        ),
-    }
-    return _plan_attach_branch_context(branch, affordances, economics_context)
-
-
-def _plan_add_branch(branches: dict, branch: dict | None) -> None:
-    if not branch:
-        return
-    key = str(branch.pop("_dedupe_key", branch.get("title")))
-    existing = branches.get(key)
-    if not existing or branch["priority_score"] > existing["priority_score"]:
-        branches[key] = branch
-        return
-    for field in ("source_artifacts", "source_ids"):
-        merged = list(existing.get(field) or [])
-        for item in branch.get(field) or []:
-            if item and item not in merged:
-                merged.append(item)
-        existing[field] = merged
-
-
-def _plan_entry_branch(
-    entry: dict,
-    *,
-    source: str,
-    focus: str,
-    base_score: int,
-    recommended_next_tool: str,
-    title_prefix: str,
-) -> dict:
-    title = str(entry.get("title") or entry.get("id") or source)
-    entry_id = str(entry.get("id") or "")
-    score = (
-        base_score
-        + _plan_priority_score(entry.get("priority"))
-        + _plan_focus_bonus(focus, title, entry.get("content", ""))
-    )
-    return {
-        "_dedupe_key": f"{source}:{entry_id or title}",
-        "source": source,
-        "source_artifacts": _entry_evidence(entry),
-        "source_ids": [entry_id] if entry_id else [],
-        "title": f"{title_prefix}: {title}",
-        "priority_score": score,
-        "target_actions": [],
-        "hypothesis_prompt": str(entry.get("content") or title),
-        "candidate_invariant": "Use the linked campaign invariant or state a new invariant before running the next experiment.",
-        "experiment_shape": "campaign-state follow-up",
-        "recommended_next_tool": recommended_next_tool,
-        "required_setup": [
-            "read the linked campaign artifact",
-            "identify exact attacker actor, setup state, transaction sequence, and success condition",
-        ],
-        "evidence_to_capture": [
-            "linked command output or decision artifact",
-            "state deltas and objective evaluation where numeric impact matters",
-        ],
-        "stop_or_mutate_condition": "If the branch cannot be validated, record the failed assumption and call mutate_hypothesis or add a rejection decision.",
-        "blockers": [],
-        "rationale": f"Campaign process signal from {source}.",
-    }
-
-
-def _plan_branch_from_blocked_result(entry: dict, *, focus: str) -> dict:
-    diagnosis = entry.get("failure_diagnosis") or {}
-    kind = str(diagnosis.get("kind") or "blocked_result")
-    repairs = [
-        str(item) for item in diagnosis.get("suggested_repairs") or []
-        if str(item).strip()
-    ]
-    recommended_tool = str(
-        diagnosis.get("recommended_next_tool")
-        or "mutate_hypothesis or update_campaign decision"
-    )
-    title = str(entry.get("title") or entry.get("id") or "blocked result")
-    required_setup = [
-        "read the blocked result log and any result follow-up diagnosis",
-        "fix the earliest concrete blocker before mutating the exploit hypothesis",
-    ]
-    required_setup.extend(repairs[:3])
-    if not repairs:
-        required_setup.append(
-            "summarize the full log and identify compile, setup, revert, or assertion cause"
-        )
-    evidence_to_capture = [
-        "rerun log after exactly one repair or an explicit rejection/mutation decision",
-        "updated objective snapshots/evaluation if the repaired run executes",
-    ]
-    evidence_lines = [
-        str(item) for item in diagnosis.get("evidence_lines") or []
-        if str(item).strip()
-    ][:5]
-    if evidence_lines:
-        evidence_to_capture.append("explain the diagnostic line(s) that changed")
-    return {
-        "_dedupe_key": f"blocked_result:{entry.get('id') or title}",
-        "source": "blocked_result",
-        "source_artifacts": entry.get("evidence") or [],
-        "source_ids": [entry.get("id")] if entry.get("id") else [],
-        "title": f"Repair blocked result {entry.get('id') or title}: {kind}",
-        "priority_score": 8 + _plan_focus_bonus(focus, title, diagnosis),
-        "target_actions": [],
-        "hypothesis_prompt": (
-            "What exact blocker prevented this experiment from testing the "
-            "hypothesis, and does the branch need repair or mutation?"
-        ),
-        "candidate_invariant": (
-            "Keep the original candidate invariant unless the repaired run "
-            "shows the setup or objective assumption is false."
-        ),
-        "experiment_shape": f"experiment repair for {kind}",
-        "recommended_next_tool": recommended_tool,
-        "required_setup": _dedupe_text(required_setup),
-        "evidence_to_capture": _dedupe_text(evidence_to_capture),
-        "stop_or_mutate_condition": (
-            "If the same blocker remains after one focused repair, record the "
-            "failed assumption and mutate_hypothesis or reject the branch."
-        ),
-        "blockers": [diagnosis.get("summary")] if diagnosis.get("summary") else [],
-        "failure_diagnosis": diagnosis,
-        "rationale": (
-            "A recorded experiment is blocked. The diagnosis is only a repair "
-            "prompt; it is not evidence for or against the exploit hypothesis."
-        ),
-    }
 
 
 def _plan_route_gap_applies(route: dict, gap: str) -> bool:
@@ -27874,7 +33802,7 @@ def _plan_route_review_tool(review_kind: str, route: dict, sequence_path: str) -
         return "update report draft then review_report_quality"
     if sequence_path:
         return "run_experiment"
-    return "compose_sequence_experiment with explicit actions or compose_invariant_harness with handler actions"
+    return "compose_sequence_experiment with explicit actions"
 
 
 def _plan_route_review_setup(route: dict, sequence_path: str) -> list[str]:
@@ -28065,663 +33993,6 @@ def _plan_branch_from_route_review(
     }
 
 
-def _plan_finalize_branches(branches: dict, max_branches: int) -> list[dict]:
-    ordered = sorted(
-        branches.values(),
-        key=lambda item: (
-            -int(item.get("priority_score", 0) or 0),
-            str(item.get("title") or ""),
-        ),
-    )[:max_branches]
-    for index, branch in enumerate(ordered, start=1):
-        branch["id"] = f"branch-{index:03d}"
-        branch["priority"] = _plan_priority(int(branch.get("priority_score", 0) or 0))
-    return ordered
-
-
-_PLAN_CONTROLLER_NOTE = (
-    "Use attack_search for authoritative next_action and branch transitions."
-)
-
-
-def _plan_candidate_next_steps(plan: dict) -> list[str]:
-    branches = plan.get("branches") or []
-    if not branches:
-        return [
-            "Candidate: record protocol model, value-flow, invariant, action-space, or coverage artifacts before planning deeper experiments. attack_search schedules the next action.",
-        ]
-    top = branches[0]
-    candidate = (
-        f"Candidate branch {top['id']}: {top['title']} "
-        f"(suggested tool {top['recommended_next_tool']})."
-    )
-    blockers = top.get("blockers") or []
-    if blockers:
-        candidate += " Blockers to resolve first: " + "; ".join(blockers) + "."
-    return [
-        candidate,
-        "These are advisory candidates; call attack_search for the authoritative next_action and to record branch transitions.",
-    ]
-
-
-async def _plan_attack_campaign(container: AuditContainer, args: dict) -> str:
-    max_branches = min(max(int(args.get("max_branches", 6)), 1), 20)
-    focus = str(args.get("focus") or "").strip()
-    state = await _load_campaign_state(container)
-    try:
-        action_spaces = await _load_plan_action_spaces(
-            container,
-            state,
-            str(args.get("action_space") or "").strip(),
-        )
-        protocol_graphs = await _load_plan_artifacts(
-            container,
-            state,
-            explicit=str(args.get("protocol_graph") or "").strip(),
-            directory="/workspace/campaign/protocol-graphs/",
-            id_prefix="pg",
-            name="protocol_graph",
-        )
-        coverage_reviews = await _load_plan_artifacts(
-            container,
-            state,
-            explicit=str(args.get("coverage_review") or "").strip(),
-            directory="/workspace/campaign/coverage-reviews/",
-            id_prefix="cov",
-            name="coverage_review",
-        )
-        progress_reviews = await _load_plan_artifacts(
-            container,
-            state,
-            explicit=str(args.get("progress_review") or "").strip(),
-            directory="/workspace/campaign/progress-reviews/",
-            id_prefix="prg",
-            name="progress_review",
-        )
-        economics_artifacts = await _load_plan_artifacts(
-            container,
-            state,
-            explicit="",
-            directory="/workspace/campaign/economics/",
-            id_prefix="econ",
-            name="economics",
-        )
-    except ValueError as exc:
-        return f"Error: {exc}"
-
-    failed_evaluations = await _progress_evaluations(container, state)
-    sequence_minimizations_without_review = (
-        await _progress_sequence_minimizations_without_review(container, state)
-    )
-    candidate_fuzz_failures = await _progress_candidate_fuzz_runs(container, state)
-    action_spaces_without_coverage = await _progress_action_spaces_without_coverage(
-        container,
-        state,
-    )
-    covered_action_space_paths = {
-        item["payload"].get("action_space_path")
-        for item in coverage_reviews
-        if item["payload"].get("action_space_path")
-    }
-    if covered_action_space_paths:
-        action_spaces_without_coverage = [
-            item for item in action_spaces_without_coverage
-            if item.get("path") not in covered_action_space_paths
-        ]
-    known_action_space_paths = {
-        item.get("path") for item in action_spaces_without_coverage
-    }
-    for artifact in action_spaces:
-        path = artifact["path"]
-        if path in covered_action_space_paths or path in known_action_space_paths:
-            continue
-        payload = artifact["payload"]
-        action_spaces_without_coverage.append({
-            "id": payload.get("id"),
-            "path": path,
-            "summary": payload.get("summary") or {},
-            "suggested_action": "call review_attack_surface_coverage before choosing the next action grammar",
-        })
-        known_action_space_paths.add(path)
-    hypotheses_without_experiments = _progress_hypotheses_without_experiments(state)
-    experiments_without_results = _progress_unrun_experiments(state)
-    blocked_results = await _progress_blocked_results(container, state)
-    ready_finding_reviews = await _progress_ready_reviews(
-        container,
-        state,
-        prefix="/workspace/campaign/finding-reviews/",
-        kind="finding_evidence",
-    )
-    ready_report_reviews = await _progress_ready_reviews(
-        container,
-        state,
-        prefix="/workspace/campaign/report-reviews/",
-        kind="report_quality",
-    )
-    blocked_finding_reviews = await _progress_blocked_reviews(
-        container,
-        state,
-        prefix="/workspace/campaign/finding-reviews/",
-        kind="finding_evidence",
-    )
-    blocked_report_reviews = await _progress_blocked_reviews(
-        container,
-        state,
-        prefix="/workspace/campaign/report-reviews/",
-        kind="report_quality",
-    )
-
-    has_fork_context = bool(
-        _progress_evidence_paths(state, "/workspace/campaign/fork-contexts/")
-        or int(state.get("counters", {}).get("fork_context", 0) or 0)
-    )
-    has_economics = bool(
-        _progress_evidence_paths(state, "/workspace/campaign/economics/")
-        or int(state.get("counters", {}).get("economics", 0) or 0)
-        or int(state.get("counters", {}).get("flash_loan", 0) or 0)
-    )
-    economics_context = _plan_economics_context(economics_artifacts, state)
-    decided_action_keys = _campaign_decided_action_keys(state)
-
-    branch_map: dict[str, dict] = {}
-    for artifact in protocol_graphs:
-        payload = artifact["payload"]
-        path = artifact["path"]
-        for item in (payload.get("hotspots") or [])[:8]:
-            _plan_add_branch(branch_map, _plan_branch_from_protocol_hotspot(
-                item,
-                source_path=path,
-                graph_id=payload.get("id"),
-                focus=focus,
-                state=state,
-                has_fork_context=has_fork_context,
-                has_economics=has_economics,
-                economics_context=economics_context,
-                decided_action_keys=decided_action_keys,
-            ))
-
-    for artifact in coverage_reviews:
-        payload = artifact["payload"]
-        path = artifact["path"]
-        for item in payload.get("high_attention_gaps") or []:
-            _plan_add_branch(branch_map, _plan_branch_from_action_gap(
-                item,
-                source="coverage_high_attention_gap",
-                source_path=path,
-                focus=focus,
-                state=state,
-                has_fork_context=has_fork_context,
-                has_economics=has_economics,
-                economics_context=economics_context,
-                base_score=6,
-                decided_action_keys=decided_action_keys,
-            ))
-        for item in payload.get("hypothesized_not_experimented") or []:
-            _plan_add_branch(branch_map, _plan_branch_from_action_gap(
-                item,
-                source="hypothesized_not_experimented",
-                source_path=path,
-                focus=focus,
-                state=state,
-                has_fork_context=has_fork_context,
-                has_economics=has_economics,
-                economics_context=economics_context,
-                base_score=4,
-                decided_action_keys=decided_action_keys,
-            ))
-        if not payload.get("high_attention_gaps"):
-            for item in (payload.get("open_gaps") or [])[:5]:
-                _plan_add_branch(branch_map, _plan_branch_from_action_gap(
-                    item,
-                    source="coverage_open_gap",
-                    source_path=path,
-                    focus=focus,
-                    state=state,
-                    has_fork_context=has_fork_context,
-                    has_economics=has_economics,
-                    economics_context=economics_context,
-                    base_score=2,
-                    decided_action_keys=decided_action_keys,
-                ))
-
-    for item in action_spaces_without_coverage:
-        score = 7 + _plan_focus_bonus(focus, item.get("id"), item.get("path"))
-        _plan_add_branch(branch_map, {
-            "_dedupe_key": f"coverage:{item.get('path')}",
-            "source": "action_space_without_coverage",
-            "source_artifacts": [item.get("path")],
-            "source_ids": [item.get("id")] if item.get("id") else [],
-            "title": f"Review callable-surface coverage for {item.get('id') or item.get('path')}",
-            "priority_score": score,
-            "target_actions": [],
-            "hypothesis_prompt": "Before choosing the next attack grammar, identify high-value mapped actions with no linked experiments or decisions.",
-            "candidate_invariant": "Coverage review should select protocol-specific invariants from value flows and trust boundaries.",
-            "experiment_shape": "process review before experiment composition",
-            "recommended_next_tool": "review_attack_surface_coverage",
-            "required_setup": ["load the mapped action-space artifact"],
-            "evidence_to_capture": ["coverage review artifact linked to the action-space map"],
-            "stop_or_mutate_condition": "If no high-value gaps remain, map another subsystem or deepen parameter/order exploration.",
-            "blockers": [],
-            "rationale": "An action-space map exists but has not been compared with campaign evidence.",
-        })
-
-    for item in failed_evaluations:
-        summary = item.get("summary") or {}
-        _plan_add_branch(branch_map, {
-            "_dedupe_key": f"failed_eval:{item.get('id') or item.get('path')}",
-            "source": "failed_evaluation",
-            "source_artifacts": [item.get("path")],
-            "source_ids": [item.get("id")] if item.get("id") else [],
-            "title": f"Interpret and mutate failed objective {item.get('id') or item.get('title')}",
-            "priority_score": 10 + _plan_focus_bonus(focus, item.get("title"), summary),
-            "target_actions": [],
-            "hypothesis_prompt": "What assumption failed, and what adjacent invariant or setup should be tested next?",
-            "candidate_invariant": "Use the failed objective to choose the nearest still-plausible invariant.",
-            "experiment_shape": "hypothesis mutation followed by sequence or invariant experiment",
-            "recommended_next_tool": "mutate_hypothesis",
-            "required_setup": ["read the failed evaluation and linked comparison/result"],
-            "evidence_to_capture": ["mutation artifact and next experiment-plan artifact"],
-            "stop_or_mutate_condition": "If no adjacent hypothesis remains plausible, record a rejection decision.",
-            "blockers": [],
-            "rationale": "Objective evidence contradicted or failed to validate the current branch.",
-        })
-
-    for item in sequence_minimizations_without_review:
-        summary = item.get("summary") or {}
-        variant_id = (
-            summary.get("best_variant_id")
-            or summary.get("minimal_preserved_variant")
-            or "preserved variant"
-        )
-        retained_setup = [
-            setup for setup in summary.get("retained_setup_assumptions") or []
-            if isinstance(setup, dict)
-        ]
-        reduced_setup = [
-            setup for setup in summary.get("reduced_setup_assumptions") or []
-            if isinstance(setup, dict)
-        ]
-        retained_labels = [
-            str(setup.get("label") or setup.get("kind") or setup.get("target"))
-            for setup in retained_setup[:3]
-            if setup.get("label") or setup.get("kind") or setup.get("target")
-        ]
-        required_setup = [
-            "read the minimization artifact and best variant log",
-            f"confirm {variant_id} still preserves the intended objective",
-        ]
-        evidence_to_capture = [
-            "finding evidence review linked to the minimization artifact",
-            "objective evaluation and replay logs for the minimized variant",
-        ]
-        stop_or_mutate = (
-            "If the minimized replay only preserves a marker without proving "
-            "impact, capture objective deltas or mutate the hypothesis."
-        )
-        if retained_labels:
-            required_setup.append(
-                "challenge retained setup assumptions: "
-                + ", ".join(retained_labels)
-            )
-            evidence_to_capture.append(
-                "decision on whether retained setup assumptions are realistic "
-                "protocol preconditions"
-            )
-            stop_or_mutate = (
-                "If retained setup assumptions are unrealistic, privileged, or "
-                "bounty-ineligible, mutate_hypothesis toward the nearest "
-                "protocol-realistic setup or record a rejection decision."
-            )
-        if int(summary.get("untested_plan_variants", 0) or 0) > 0:
-            required_setup.append(
-                "review untested minimization variants before relying on this "
-                "as the final minimal replay"
-            )
-            evidence_to_capture.append(
-                "decision explaining why untested minimization variants are "
-                "irrelevant, or logs from running them"
-            )
-        _plan_add_branch(branch_map, {
-            "_dedupe_key": f"unreviewed_min:{item.get('id') or item.get('path')}",
-            "source": "unreviewed_sequence_minimization",
-            "source_artifacts": [item.get("path")],
-            "source_ids": [item.get("id")] if item.get("id") else [],
-            "title": f"Review minimized replay evidence {item.get('id') or item.get('title')}",
-            "priority_score": 10 + _plan_focus_bonus(
-                focus,
-                item.get("title"),
-                summary,
-            ),
-            "target_actions": [],
-            "hypothesis_prompt": (
-                "Does the preserved minimized replay prove a bug-bounty-ready "
-                "candidate, or should the hypothesis mutate?"
-            ),
-            "candidate_invariant": (
-                "Use the minimized replay's objective marker as evidence for the "
-                "same invariant tested by the baseline sequence."
-            ),
-            "experiment_shape": "evidence review for minimized sequence replay",
-            "recommended_next_tool": "review_finding_evidence",
-            "required_setup": required_setup,
-            "evidence_to_capture": evidence_to_capture,
-            "stop_or_mutate_condition": stop_or_mutate,
-            "blockers": [],
-            "setup_reduction_context": {
-                "setup_checks_executed": summary.get("setup_checks_executed"),
-                "setup_checks_retained": summary.get("setup_checks_retained"),
-                "retained_setup_assumptions": retained_setup[:6],
-                "reduced_setup_assumptions": reduced_setup[:6],
-            },
-            "minimization_plan_context": {
-                "available_plan_variants": summary.get("available_plan_variants"),
-                "requested_plan_variants": summary.get("requested_plan_variants"),
-                "untested_plan_variants": summary.get("untested_plan_variants"),
-                "unplanned_requested_variants": summary.get(
-                    "unplanned_requested_variants"
-                ),
-            },
-            "rationale": (
-                "A sequence minimization preserved objective evidence but has not "
-                "been promoted into a finding evidence review."
-            ),
-        })
-
-    for item in candidate_fuzz_failures:
-        _plan_add_branch(branch_map, {
-            "_dedupe_key": f"candidate_fuzz:{item.get('id') or item.get('path')}",
-            "source": "candidate_fuzz_failure",
-            "source_artifacts": [item.get("path"), item.get("log_path")],
-            "source_ids": [item.get("id")] if item.get("id") else [],
-            "title": f"Reduce candidate fuzz failure {item.get('id') or item.get('title')}",
-            "priority_score": 11 + _plan_focus_bonus(
-                focus,
-                item.get("title"),
-                item.get("summary"),
-            ),
-            "target_actions": [],
-            "hypothesis_prompt": (
-                "What concrete transaction sequence and state delta does this "
-                "fuzz/invariant failure imply?"
-            ),
-            "candidate_invariant": (
-                "Use the failing property or invariant run to select the exact "
-                "protocol invariant that needs objective validation."
-            ),
-            "experiment_shape": "failure reduction followed by sequence PoC",
-            "recommended_next_tool": "summarize_trace or extract_call_sequence",
-            "required_setup": [
-                "read the fuzz run JSON and full log",
-                "extract the minimal failing call sequence and actors",
-            ],
-            "evidence_to_capture": [
-                "trace summary or extracted call sequence linked to the fuzz run",
-                "before/after snapshots and objective evaluation for the reduced sequence",
-            ],
-            "stop_or_mutate_condition": (
-                "If the failure is an expected revert or harness issue, record "
-                "a rejection decision or mutate the harness assumption."
-            ),
-            "blockers": [],
-            "rationale": (
-                "A property campaign produced a candidate failure. It still "
-                "needs reduction and objective evidence before it can become a finding."
-            ),
-        })
-
-    for review in [*blocked_finding_reviews, *blocked_report_reviews]:
-        for summary in review.get("route_compositions") or []:
-            if not isinstance(summary, dict):
-                continue
-            for route in summary.get("routes") or []:
-                if not isinstance(route, dict):
-                    continue
-                branch = _plan_branch_from_route_review(
-                    review,
-                    summary,
-                    route,
-                    focus=focus,
-                )
-                if branch:
-                    _plan_add_branch(branch_map, branch)
-
-    for entry in hypotheses_without_experiments:
-        _plan_add_branch(branch_map, _plan_entry_branch(
-            entry,
-            source="hypothesis_without_experiment",
-            focus=focus,
-            base_score=2,
-            recommended_next_tool="compose_sequence_experiment with explicit actions or compose_invariant_harness with handler actions",
-            title_prefix="Design experiment for hypothesis",
-        ))
-
-    for entry in experiments_without_results:
-        _plan_add_branch(branch_map, _plan_entry_branch(
-            entry,
-            source="experiment_without_result",
-            focus=focus,
-            base_score=3,
-            recommended_next_tool="run_experiment",
-            title_prefix="Run open experiment",
-        ))
-
-    for entry in blocked_results:
-        _plan_add_branch(branch_map, _plan_branch_from_blocked_result(
-            entry,
-            focus=focus,
-        ))
-
-    for item in ready_report_reviews:
-        _plan_add_branch(branch_map, {
-            "_dedupe_key": f"ready_report:{item.get('id')}",
-            "source": "ready_report_review",
-            "source_artifacts": [item.get("path")],
-            "source_ids": [item.get("id")] if item.get("id") else [],
-            "title": f"Submit ready reviewed finding {item.get('id')}",
-            "priority_score": 12,
-            "target_actions": [],
-            "hypothesis_prompt": "Confirm the finding is still in scope and submit with linked campaign evidence.",
-            "candidate_invariant": "Already validated in linked report review.",
-            "experiment_shape": "submission readiness",
-            "recommended_next_tool": "submit_finding",
-            "required_setup": ["read linked report-quality review and finding evidence review"],
-            "evidence_to_capture": ["final submitted finding with campaign ids and evidence paths"],
-            "stop_or_mutate_condition": "If scope or evidence has changed, update the report review before submitting.",
-            "blockers": [],
-            "rationale": "A report-quality review marked the finding ready.",
-        })
-
-    for item in ready_finding_reviews:
-        _plan_add_branch(branch_map, {
-            "_dedupe_key": f"ready_finding:{item.get('id')}",
-            "source": "ready_finding_review",
-            "source_artifacts": [item.get("path")],
-            "source_ids": [item.get("id")] if item.get("id") else [],
-            "title": f"Run report-quality review for ready evidence {item.get('id')}",
-            "priority_score": 9,
-            "target_actions": [],
-            "hypothesis_prompt": "Convert ready evidence into a reviewer-reproducible bug-bounty report.",
-            "candidate_invariant": "Already validated in linked evidence review.",
-            "experiment_shape": "report readiness",
-            "recommended_next_tool": "review_report_quality",
-            "required_setup": ["read linked finding evidence review"],
-            "evidence_to_capture": ["report-quality review artifact"],
-            "stop_or_mutate_condition": "If the writeup has gaps, fill reproduction, economics, assumptions, and remediation before submitting.",
-            "blockers": [],
-            "rationale": "Evidence review is ready, but final report quality has not been checked.",
-        })
-
-    if not branch_map:
-        for section in ("protocol_model", "value_flow", "invariant", "hypothesis"):
-            if state["sections"].get(section):
-                continue
-            _plan_add_branch(branch_map, {
-                "_dedupe_key": f"missing:{section}",
-                "source": "missing_foundation",
-                "source_artifacts": [],
-                "source_ids": [],
-                "title": f"Record missing campaign foundation: {section}",
-                "priority_score": 5,
-                "target_actions": [],
-                "hypothesis_prompt": "Build the minimum campaign foundation needed before designing deeper exploit experiments.",
-                "candidate_invariant": "Not available until foundation artifacts are recorded.",
-                "experiment_shape": "campaign orientation",
-                "recommended_next_tool": "update_campaign",
-                "required_setup": ["read target source and document value flow/trust boundaries"],
-                "evidence_to_capture": ["campaign artifact with source references"],
-                "stop_or_mutate_condition": "Once foundation exists, map action space and plan attack branches.",
-                "blockers": [],
-                "rationale": "Planner needs campaign context before proposing meaningful experiments.",
-            })
-
-    branches = _plan_finalize_branches(branch_map, max_branches)
-    plan_id = _next_campaign_id(state, "campaign_plan")
-    title = str(args.get("title") or "Attack campaign plan").strip()
-    source_paths = []
-    for collection in (
-        protocol_graphs,
-        action_spaces,
-        coverage_reviews,
-        progress_reviews,
-        economics_artifacts,
-    ):
-        for artifact in collection:
-            path = artifact["path"]
-            if path not in source_paths:
-                source_paths.append(path)
-    for branch in branches:
-        for path in branch.get("source_artifacts") or []:
-            if path and path not in source_paths:
-                source_paths.append(path)
-
-    plan = {
-        "id": plan_id,
-        "title": title,
-        "focus": focus,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "campaign_counts": {
-            section: len(state["sections"].get(section, []))
-            for section in _CAMPAIGN_SECTIONS
-        },
-        "source_artifacts": {
-            "protocol_graphs": [
-                {
-                    "id": item["payload"].get("id"),
-                    "path": item["path"],
-                    "summary": item["payload"].get("summary") or {},
-                }
-                for item in protocol_graphs
-            ],
-            "action_spaces": [
-                {
-                    "id": item["payload"].get("id"),
-                    "path": item["path"],
-                    "summary": item["payload"].get("summary") or {},
-                }
-                for item in action_spaces
-            ],
-            "coverage_reviews": [
-                {
-                    "id": item["payload"].get("id"),
-                    "path": item["path"],
-                    "summary": item["payload"].get("summary") or {},
-                }
-                for item in coverage_reviews
-            ],
-            "progress_reviews": [
-                {
-                    "id": item["payload"].get("id"),
-                    "path": item["path"],
-                    "summary": item["payload"].get("summary") or {},
-                }
-                for item in progress_reviews
-            ],
-            "economics": [
-                {
-                    "id": item["payload"].get("id"),
-                    "path": item["path"],
-                    "kind": _plan_economics_kind(item["payload"]),
-                    "summary": item["payload"].get("summary") or {},
-                }
-                for item in economics_artifacts
-            ],
-            "sequence_minimizations_without_review": sequence_minimizations_without_review,
-            "blocked_route_reviews": [
-                {
-                    "id": item.get("id"),
-                    "kind": item.get("kind"),
-                    "path": item.get("path"),
-                    "route_blocking_gaps": item.get("route_blocking_gaps") or [],
-                }
-                for item in [*blocked_finding_reviews, *blocked_report_reviews]
-            ],
-        },
-        "context": {
-            "has_protocol_graph": bool(protocol_graphs),
-            "has_fork_context": has_fork_context,
-            "has_economics": has_economics,
-            "economics": economics_context,
-            "open_hypotheses": len(hypotheses_without_experiments),
-            "open_experiments": len(experiments_without_results),
-            "failed_evaluations": len(failed_evaluations),
-            "sequence_minimizations_without_review": (
-                len(sequence_minimizations_without_review)
-            ),
-            "candidate_fuzz_failures": len(candidate_fuzz_failures),
-            "ready_finding_reviews": len(ready_finding_reviews),
-            "ready_report_reviews": len(ready_report_reviews),
-            "blocked_route_reviews": (
-                len(blocked_finding_reviews) + len(blocked_report_reviews)
-            ),
-            "blocked_results": len(blocked_results),
-        },
-        "branches": branches,
-        "summary": {
-            "branches": len(branches),
-            "critical": sum(1 for branch in branches if branch["priority"] == "critical"),
-            "high": sum(1 for branch in branches if branch["priority"] == "high"),
-            "medium": sum(1 for branch in branches if branch["priority"] == "medium"),
-            "low": sum(1 for branch in branches if branch["priority"] == "low"),
-        },
-    }
-    plan["candidate_next_steps"] = _plan_candidate_next_steps(plan)
-    plan["controller_note"] = _PLAN_CONTROLLER_NOTE
-
-    plan_path = f"/workspace/campaign/plans/{plan_id}.json"
-    await container.write_file(
-        plan_path,
-        json.dumps(plan, indent=2, sort_keys=True) + "\n",
-    )
-    await _save_campaign_state(container, state)
-
-    result_id = ""
-    if args.get("record_result", True):
-        result_id = await _record_result_artifact(
-            container,
-            title=f"Attack campaign plan: {title}",
-            content=(
-                f"Campaign plan: {plan_id}\n"
-                f"Path: {plan_path}\n"
-                f"Branches: {plan['summary']['branches']}\n"
-                f"Critical: {plan['summary']['critical']}\n"
-                f"High: {plan['summary']['high']}\n"
-                f"Top branch: {branches[0]['title'] if branches else 'none'}"
-            ),
-            evidence=[plan_path, *source_paths[:20]],
-            related_ids=[plan_id],
-            status="observed",
-        )
-
-    response = {
-        "plan_id": plan_id,
-        "path": plan_path,
-        "result_id": result_id or None,
-        "summary": plan["summary"],
-        "candidate_next_steps": plan["candidate_next_steps"],
-        "controller_note": plan["controller_note"],
-        "branches": branches,
-    }
-    return json.dumps(response, indent=2, sort_keys=True)
 
 
 def _action_space_call_indexes(action_space: dict | None) -> tuple[dict, dict]:
@@ -28737,6 +34008,8 @@ def _action_space_call_indexes(action_space: dict | None) -> tuple[dict, dict]:
         compact = {
             "contract": contract,
             "function": function,
+            "signature": entry.get("signature") or _action_signature(entry),
+            "action_key": _coverage_action_key(entry),
             "file": entry.get("file"),
             "line": entry.get("line"),
             "mutability": entry.get("mutability"),
@@ -28750,8 +34023,10 @@ def _action_space_call_indexes(action_space: dict | None) -> tuple[dict, dict]:
             },
         }
         if contract:
-            exact_index[_action_match_key(contract, function)] = compact
-        function_index.setdefault(function.lower(), compact)
+            exact_index.setdefault(
+                _action_match_key(contract, function), []
+            ).append(compact)
+        function_index.setdefault(function.lower(), []).append(compact)
     return exact_index, function_index
 
 
@@ -28761,13 +34036,15 @@ def _match_action_space_call(
     exact_index: dict,
     function_index: dict,
 ) -> dict | None:
+    candidates = []
     if contract and function:
-        match = exact_index.get(_action_match_key(contract, function))
-        if match:
-            return match
-    if function:
-        return function_index.get(function.lower())
-    return None
+        candidates = exact_index.get(_action_match_key(contract, function)) or []
+    if not candidates and function:
+        candidates = function_index.get(function.lower()) or []
+    # Raw traces contain values, not ABI parameter types. If multiple overloads
+    # share this name, leave the trace step unmatched rather than binding the
+    # first definition inserted into a dict.
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _extract_trace_call_steps(
@@ -29196,6 +34473,8 @@ def _match_sequence_actions(
             "contract": contract,
             "contract_kind": entry.get("contract_kind"),
             "function": function,
+            "signature": entry.get("signature") or _action_signature(entry),
+            "action_key": _coverage_action_key(entry),
             "file": entry.get("file"),
             "line": entry.get("line"),
             "visibility": entry.get("visibility"),
@@ -29210,8 +34489,10 @@ def _match_sequence_actions(
             },
         }
         if contract:
-            exact_index[_action_match_key(contract, function)] = compact
-        function_index.setdefault(function.lower(), compact)
+            exact_index.setdefault(
+                _action_match_key(contract, function), []
+            ).append(compact)
+        function_index.setdefault(function.lower(), []).append(compact)
 
     matched = []
     unmatched = []
@@ -29225,11 +34506,32 @@ def _match_sequence_actions(
                 "raw": step,
             })
             continue
-        match = None
+        candidates = []
         if contract and function:
-            match = exact_index.get(_action_match_key(contract, function))
-        if not match and function:
-            match = function_index.get(function.lower())
+            candidates = exact_index.get(_action_match_key(contract, function)) or []
+        if not candidates and function:
+            candidates = function_index.get(function.lower()) or []
+        signature_hint = _explicit_action_signature_hint(step)
+        if signature_hint:
+            candidates = [
+                item for item in candidates
+                if _action_signature_hint(item) == signature_hint
+            ]
+        source_file = str(
+            step.get("file")
+            or (
+                (step.get("source") or {}).get("file")
+                if isinstance(step.get("source"), dict) else ""
+            )
+            or ""
+        ).strip()
+        if source_file and len(candidates) > 1:
+            candidates = [
+                item for item in candidates
+                if posixpath.normpath(str(item.get("file") or ""))
+                == posixpath.normpath(source_file)
+            ]
+        match = candidates[0] if len(candidates) == 1 else None
         if match:
             matched.append({"step": index, **match})
         else:
@@ -29264,6 +34566,50 @@ def _compact_graph_connection(edge: dict, nodes_by_id: dict[str, dict]) -> dict:
     }
 
 
+def _graph_definition_file(item: dict) -> str:
+    if item.get("file"):
+        return str(item["file"])
+    return _graph_node_source_file(item)
+
+
+def _normalized_graph_signature(value: object) -> str:
+    return re.sub(r"\s+", "", str(value or "")).lower()
+
+
+def _filter_graph_definition_matches(
+    candidates: list[dict],
+    step: dict,
+) -> list[dict]:
+    """Use explicit source/signature hints without breaking legacy artifacts."""
+    selected = list(candidates)
+    signature = _normalized_graph_signature(step.get("signature"))
+    if signature:
+        with_signature = [
+            item for item in selected if item.get("signature")
+        ]
+        if with_signature:
+            selected = [
+                item
+                for item in with_signature
+                if _normalized_graph_signature(item.get("signature")) == signature
+            ]
+
+    source_file = str(
+        step.get("file") or step.get("source_file") or ""
+    ).strip()
+    if source_file:
+        with_file = [item for item in selected if _graph_definition_file(item)]
+        if with_file:
+            normalized_source = posixpath.normpath(source_file)
+            selected = [
+                item
+                for item in with_file
+                if posixpath.normpath(_graph_definition_file(item))
+                == normalized_source
+            ]
+    return sorted(selected, key=lambda item: str(item.get("id") or item.get("key") or ""))
+
+
 def _match_protocol_graph_context(
     protocol_graph: dict | None,
     actions: list[dict],
@@ -29282,42 +34628,81 @@ def _match_protocol_graph_context(
         if source:
             outgoing.setdefault(source, []).append(edge)
 
-    hotspot_exact: dict[str, dict] = {}
-    hotspot_by_function: dict[str, dict] = {}
+    action_nodes_exact: dict[tuple[str, str], list[dict]] = {}
+    action_nodes_by_function: dict[str, list[dict]] = {}
+    for node in nodes_by_id.values():
+        if node.get("kind") not in {"entrypoint", "observation"}:
+            continue
+        contract = str(node.get("contract") or "").strip()
+        function = str(node.get("function") or "").strip()
+        if not function:
+            continue
+        if contract:
+            action_nodes_exact.setdefault(
+                (contract.lower(), function.lower()), []
+            ).append(node)
+        action_nodes_by_function.setdefault(function.lower(), []).append(node)
+
+    hotspot_exact: dict[str, list[dict]] = {}
+    hotspot_by_function: dict[str, list[dict]] = {}
     for hotspot in protocol_graph.get("hotspots") or []:
         contract = str(hotspot.get("contract") or "").strip()
         function = str(hotspot.get("function") or "").strip()
         key = str(hotspot.get("key") or "").strip()
         for variant in _graph_action_key_variants(contract, function):
-            hotspot_exact.setdefault(variant, hotspot)
+            hotspot_exact.setdefault(variant, []).append(hotspot)
         if key:
-            hotspot_exact.setdefault(key.lower(), hotspot)
+            hotspot_exact.setdefault(key.lower(), []).append(hotspot)
         if function:
-            hotspot_by_function.setdefault(function.lower(), hotspot)
+            hotspot_by_function.setdefault(function.lower(), []).append(hotspot)
 
     contexts = []
     for index, step in enumerate(actions, start=1):
         contract, function = _step_contract_function(step)
         variants = _graph_action_key_variants(contract, function)
-        hotspot = next(
-            (hotspot_exact[variant] for variant in variants if variant in hotspot_exact),
-            None,
+        hotspot_candidates = []
+        for variant in sorted(variants):
+            hotspot_candidates.extend(hotspot_exact.get(variant) or [])
+        if not hotspot_candidates and function:
+            hotspot_candidates.extend(
+                hotspot_by_function.get(function.lower()) or []
+            )
+        hotspots = _filter_graph_definition_matches(
+            list({id(item): item for item in hotspot_candidates}.values()),
+            step,
         )
-        if not hotspot and function:
-            hotspot = hotspot_by_function.get(function.lower())
 
-        node_id = f"action:{contract}.{function}" if contract and function else ""
-        node = nodes_by_id.get(node_id)
+        node_candidates = []
+        if contract and function:
+            node_candidates.extend(
+                action_nodes_exact.get((contract.lower(), function.lower())) or []
+            )
+        elif function:
+            node_candidates.extend(
+                action_nodes_by_function.get(function.lower()) or []
+            )
+        # Backward compatibility for old hand-authored graphs without action
+        # metadata; newly generated suffixed IDs are found through the index.
+        legacy_node_id = (
+            _graph_action_node_id(contract, function)
+            if contract and function
+            else ""
+        )
+        if not node_candidates and legacy_node_id in nodes_by_id:
+            node_candidates.append(nodes_by_id[legacy_node_id])
+        matched_nodes = _filter_graph_definition_matches(node_candidates, step)
+        node = matched_nodes[0] if matched_nodes else None
+        hotspot = hotspots[0] if hotspots else None
         connections = []
-        if hotspot:
-            connections.extend(hotspot.get("connected") or [])
-        if node:
+        for matched_hotspot in hotspots:
+            connections.extend(matched_hotspot.get("connected") or [])
+        for matched_node in matched_nodes:
             connections.extend(
                 _compact_graph_connection(edge, nodes_by_id)
-                for edge in outgoing.get(node_id, [])
+                for edge in outgoing.get(str(matched_node.get("id") or ""), [])
             )
 
-        if not hotspot and not node and not connections:
+        if not hotspots and not matched_nodes and not connections:
             continue
 
         deduped_connections = []
@@ -29333,6 +34718,16 @@ def _match_protocol_graph_context(
             seen_connections.add(key)
             deduped_connections.append(item)
 
+        hotspot_scores = [
+            int(item["score"])
+            for item in hotspots
+            if isinstance(item.get("score"), (int, float))
+        ]
+        affordances = _dedupe_text([
+            str(value)
+            for item in [*hotspots, *matched_nodes]
+            for value in (item.get("affordances") or item.get("tags") or [])
+        ])
         contexts.append({
             "step": index,
             "contract": contract or (hotspot or {}).get("contract"),
@@ -29347,12 +34742,11 @@ def _match_protocol_graph_context(
                 "kind": (node or {}).get("kind"),
                 "tags": (node or {}).get("tags") or [],
             },
-            "hotspot_score": (hotspot or {}).get("score"),
-            "affordances": (
-                (hotspot or {}).get("affordances")
-                or (node or {}).get("tags")
-                or []
-            ),
+            "matched_node_ids": [
+                item.get("id") for item in matched_nodes if item.get("id")
+            ],
+            "hotspot_score": max(hotspot_scores) if hotspot_scores else None,
+            "affordances": affordances,
             "connections": deduped_connections[:10],
         })
     return contexts
@@ -30146,11 +35540,9 @@ def _sequence_route_targets(fork_context: dict | None, collection: str) -> list[
 
 
 def _sequence_action_source_key(item: dict) -> str:
-    contract = str(item.get("contract") or "").strip()
-    function = str(item.get("function") or "").strip()
-    if contract and function:
-        return f"{contract}::{function}"
-    return function
+    # Sequence hints belong to a definition, not just a display name.  This
+    # prevents hints from two overloads being merged under ``Contract::name``.
+    return _coverage_action_key(item)
 
 
 def _sequence_source_hints(
@@ -32333,6 +37725,7 @@ def _sequence_experiment_readme(
     route_composition: dict,
     sequence_minimization: dict,
     target_addresses: dict,
+    mechanism_validation_plan: dict | None = None,
     call_context_plan: dict | None = None,
     callback_attacker_plan: dict | None = None,
 ) -> str:
@@ -32378,6 +37771,9 @@ def _sequence_experiment_readme(
     attack_candidate_lines = _format_attack_graph_candidate_context(
         attack_graph_candidate,
     )
+    mechanism_validation_lines = _format_mechanism_validation_plan(
+        mechanism_validation_plan,
+    )
 
     return f"""# {title}
 
@@ -32410,6 +37806,10 @@ Related campaign artifacts: {related}
 ## Attack Graph Candidate
 
 {attack_candidate_lines}
+
+## Mechanism Validation Plan
+
+{mechanism_validation_lines}
 
 ## Transaction Sequence
 
@@ -35249,9 +40649,9 @@ def _sequence_reconcile_matched_actions(
 
     When a completion replaces or patches the action list, a stored
     ``matched_actions`` entry whose step now points at a different
-    contract/function would bind the wrong typed call. Such entries are dropped
-    so the generator falls back to a manual interface for that step; aligned
-    entries (same contract+function, or arg-only edits) are preserved.
+    contract/function/signature would bind the wrong typed call. Such entries
+    are dropped so the generator falls back to a manual interface for that
+    step; aligned entries are preserved.
     """
     kept = []
     for entry in matched_actions or []:
@@ -35272,8 +40672,55 @@ def _sequence_reconcile_matched_actions(
             continue
         if action_function and entry_function and action_function != entry_function:
             continue
+        action_signature = _explicit_action_signature_hint(action)
+        entry_signature = _explicit_action_signature_hint(entry)
+        if (
+            action_signature
+            and entry_signature
+            and action_signature != entry_signature
+        ):
+            continue
+        action_file = str(
+            action.get("file")
+            or (
+                (action.get("source") or {}).get("file")
+                if isinstance(action.get("source"), dict) else ""
+            )
+            or ""
+        ).strip()
+        entry_file = str(entry.get("file") or "").strip()
+        if (
+            action_file
+            and entry_file
+            and posixpath.normpath(action_file) != posixpath.normpath(entry_file)
+        ):
+            continue
         kept.append(entry)
     return kept
+
+
+def _sequence_unmatched_actions(
+    actions: list[dict],
+    matched_actions: list[dict],
+) -> list[dict]:
+    """Build current unmatched-step metadata after an action replacement."""
+    matched_steps = {
+        int(item.get("step"))
+        for item in matched_actions
+        if isinstance(item, dict) and str(item.get("step") or "").isdigit()
+    }
+    unmatched = []
+    for index, action in enumerate(actions, start=1):
+        if index in matched_steps:
+            continue
+        contract, function = _step_contract_function(action)
+        unmatched.append({
+            "step": index,
+            "contract": contract,
+            "function": function,
+            "raw": action,
+        })
+    return unmatched
 
 
 def _sequence_experiment_contract(
@@ -35757,6 +41204,7 @@ def _sequence_payload(
     route_composition: dict,
     sequence_minimization: dict,
     target_addresses: dict,
+    mechanism_validation_plan: dict | None = None,
     call_context_plan: dict | None = None,
     callback_attacker_plan: dict | None = None,
     solidity_pragma: str = _DEFAULT_SOLIDITY_PRAGMA,
@@ -35859,6 +41307,7 @@ def _sequence_payload(
         "fork_probe_templates": fork_probe_templates,
         "attack_graph_path": attack_graph_path or None,
         "attack_graph_candidate": attack_graph_candidate or None,
+        "mechanism_validation_plan": mechanism_validation_plan or None,
         "call_sequence_path": call_sequence_path or None,
         "fuzz_context": fuzz_context,
         "replay_validation": replay_validation,
@@ -35892,6 +41341,10 @@ def _sequence_payload(
                 "attack_graph_candidate": bool(attack_graph_candidate),
                 "attack_graph_blockers": len(
                     attack_graph_candidate.get("blockers") or []
+                ),
+                "mechanism_validation": bool(mechanism_validation_plan),
+                "mechanism_validation_blockers": len(
+                    (mechanism_validation_plan or {}).get("blockers") or []
                 ),
                 "fork_setup_tasks": (
                     (fork_setup_guide or {}).get("summary", {}).get("tasks", 0)
@@ -36127,25 +41580,77 @@ async def _compose_sequence_experiment(container: AuditContainer, args: dict) ->
     fork_context_ref = str(args.get("fork_context") or "").strip()
     fork_context_path = ""
     fork_context = None
+    live_reachability = (
+        await _attack_candidate_live_reachability(
+            container,
+            selected_attack_candidate,
+        )
+        if selected_attack_candidate else None
+    )
     if fork_context_ref:
         try:
             fork_context_path, fork_context = await _load_fork_context(
                 container,
                 fork_context_ref,
             )
+            if selected_attack_candidate:
+                _validate_explicit_attack_candidate_fork_context(
+                    candidate=selected_attack_candidate,
+                    actions=actions,
+                    fork_context=fork_context,
+                    live_reachability=live_reachability,
+                )
         except (FileNotFoundError, ValueError) as exc:
             return f"Error: {exc}"
     elif selected_attack_candidate:
-        fork_context = _attack_candidate_fork_context(
-            attack_graph=attack_graph or {},
-            candidate=selected_attack_candidate,
-            fork_block=args.get("fork_block"),
-        ) or None
+        try:
+            fork_context = _attack_candidate_fork_context(
+                attack_graph=attack_graph or {},
+                candidate=selected_attack_candidate,
+                fork_block=args.get("fork_block"),
+                live_reachability=live_reachability,
+            ) or None
+        except ValueError as exc:
+            return f"Error: {exc}"
 
     if fork_context:
         merged_targets = dict(fork_context.get("target_addresses") or {})
         merged_targets.update(target_addresses)
         target_addresses = merged_targets
+
+    mechanism_validation_plan = {}
+    validation_invariant_id = ""
+    if selected_attack_candidate:
+        try:
+            (
+                mechanism_validation_plan,
+                model_observations,
+                invariant_statement,
+                validation_invariant_id,
+            ) = await _sequence_mechanism_validation_plan(
+                container,
+                args,
+                attack_graph_path=attack_graph_path,
+                attack_graph=attack_graph or {},
+                candidate=selected_attack_candidate,
+                fork_context_path=fork_context_path,
+                fork_context=fork_context,
+                target_addresses=target_addresses,
+            )
+        except ValueError as exc:
+            return f"Error: {exc}"
+        observation_markers = {
+            json.dumps(item, sort_keys=True, default=str) for item in observations
+        }
+        for observation in model_observations:
+            marker = json.dumps(observation, sort_keys=True, default=str)
+            if marker not in observation_markers:
+                observation_markers.add(marker)
+                observations.append(observation)
+        if invariant_statement and invariant_statement not in objective:
+            objective = (
+                f"{objective} Invariant under test: {invariant_statement}".strip()
+            )
 
     matched_actions, unmatched_actions = _match_sequence_actions(action_space, actions)
     graph_context = _match_protocol_graph_context(protocol_graph, actions)
@@ -36168,8 +41673,18 @@ async def _compose_sequence_experiment(container: AuditContainer, args: dict) ->
         )
         if item
     ]
-    setup = args.get("setup", "").strip()
-    success_condition = args.get("success_condition", "").strip()
+    if validation_invariant_id and validation_invariant_id not in related_ids:
+        related_ids.append(validation_invariant_id)
+    setup = (
+        args.get("setup", "").strip()
+        or str(mechanism_validation_plan.get("default_setup") or "").strip()
+    )
+    success_condition = (
+        args.get("success_condition", "").strip()
+        or str(
+            mechanism_validation_plan.get("default_success_condition") or ""
+        ).strip()
+    )
     replay_validation = _sequence_replay_validation_plan(
         objective=objective,
         success_condition=success_condition,
@@ -36204,7 +41719,7 @@ async def _compose_sequence_experiment(container: AuditContainer, args: dict) ->
     )
 
     state = await _load_campaign_state(container)
-    economics_artifacts = await _load_plan_artifacts(
+    economics_artifacts = await _load_campaign_artifacts(
         container,
         state,
         explicit="",
@@ -36279,6 +41794,7 @@ async def _compose_sequence_experiment(container: AuditContainer, args: dict) ->
         route_composition=route_composition,
         sequence_minimization=sequence_minimization,
         target_addresses=target_addresses,
+        mechanism_validation_plan=mechanism_validation_plan,
         call_context_plan=call_context_plan,
         callback_attacker_plan=callback_attacker_plan,
         solidity_pragma=solidity_pragma,
@@ -36311,6 +41827,7 @@ async def _compose_sequence_experiment(container: AuditContainer, args: dict) ->
             route_composition=route_composition,
             sequence_minimization=sequence_minimization,
             target_addresses=target_addresses,
+            mechanism_validation_plan=mechanism_validation_plan,
             call_context_plan=call_context_plan,
             callback_attacker_plan=callback_attacker_plan,
         ),
@@ -36377,6 +41894,26 @@ async def _compose_sequence_experiment(container: AuditContainer, args: dict) ->
             f"{', '.join(callback_attacker_plan.get('kinds') or [])} "
             "(reentry payload still required)"
         )
+    if mechanism_validation_plan:
+        content += (
+            "\nMechanism validation: "
+            f"{mechanism_validation_plan.get('mechanism')} "
+            f"({len(mechanism_validation_plan.get('blockers') or [])} checks)"
+        )
+
+    experiment_action_keys = []
+    experiment_coverage_keys = []
+    for matched_action in matched_actions:
+        action_key = _coverage_action_key(matched_action)
+        if action_key and action_key not in experiment_action_keys:
+            experiment_action_keys.append(action_key)
+        coverage_key = _coverage_definition_key(matched_action)
+        if coverage_key and coverage_key not in experiment_coverage_keys:
+            experiment_coverage_keys.append(coverage_key)
+    if attack_graph_candidate and attack_graph_candidate.get("action_key"):
+        candidate_action_key = str(attack_graph_candidate["action_key"])
+        if candidate_action_key not in experiment_action_keys:
+            experiment_action_keys.append(candidate_action_key)
 
     state["sections"]["experiment"].append({
         "id": artifact_id,
@@ -36395,11 +41932,8 @@ async def _compose_sequence_experiment(container: AuditContainer, args: dict) ->
             + ([fuzz_run_path] if fuzz_run_path else [])
         ),
         "related_ids": related_ids,
-        "action_keys": (
-            [str(attack_graph_candidate.get("action_key"))]
-            if attack_graph_candidate and attack_graph_candidate.get("action_key")
-            else []
-        ),
+        "action_keys": experiment_action_keys,
+        "coverage_keys": experiment_coverage_keys,
         "attack_keys": (
             [str(attack_graph_candidate.get("attack_key"))]
             if attack_graph_candidate and attack_graph_candidate.get("attack_key")
@@ -36433,6 +41967,22 @@ async def _compose_sequence_experiment(container: AuditContainer, args: dict) ->
         "steps": payload["steps"],
         "scaffold_quality": scaffold_quality,
         "callback_attacker_plan": callback_attacker_plan,
+        "mechanism_validation": {
+            "mechanism": mechanism_validation_plan.get("mechanism"),
+            "target": mechanism_validation_plan.get("target"),
+            "blockers": (mechanism_validation_plan.get("blockers") or [])[:12],
+            "snapshot_probe_counts": {
+                key: len(value or [])
+                for key, value in (
+                    mechanism_validation_plan.get("snapshot_state_templates") or {}
+                ).items()
+                if isinstance(value, list)
+            },
+            "objective_templates": (
+                mechanism_validation_plan.get("objective_templates") or []
+            )[:8],
+            "model_guidance": mechanism_validation_plan.get("model_guidance"),
+        } if mechanism_validation_plan else None,
     }
     return json.dumps(response, indent=2, sort_keys=True)
 
@@ -36875,6 +42425,7 @@ async def _complete_sequence_experiment(
     ]
     target_addresses = dict(payload.get("target_addresses") or {})
     matched_actions = list(payload.get("matched_actions") or [])
+    unmatched_actions = list(payload.get("unmatched_actions") or [])
     success_condition = str(payload.get("success_condition") or "").strip()
     scenario_assignments = [
         item for item in (payload.get("scenario_assignments") or [])
@@ -36895,6 +42446,40 @@ async def _complete_sequence_experiment(
             return "Error: actions, when provided, must be a non-empty list"
         actions_replaced = True
         applied_changes.append(f"replaced action list ({len(actions)} steps)")
+
+    if actions_replaced:
+        action_space = None
+        action_space_ref = str(payload.get("action_space_path") or "").strip()
+        if action_space_ref:
+            try:
+                _action_space_path_value, action_space = await _load_action_space(
+                    container,
+                    action_space_ref,
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                remaining_blockers.append(
+                    "stored action space could not be reloaded after action "
+                    f"replacement: {exc}"
+                )
+        if action_space is not None:
+            matched_actions, unmatched_actions = _match_sequence_actions(
+                action_space,
+                actions,
+            )
+            applied_changes.append(
+                "re-resolved exact action-space matches "
+                f"({len(matched_actions)} matched, "
+                f"{len(unmatched_actions)} unmatched)"
+            )
+        else:
+            matched_actions = _sequence_reconcile_matched_actions(
+                actions,
+                matched_actions,
+            )
+            unmatched_actions = _sequence_unmatched_actions(
+                actions,
+                matched_actions,
+            )
 
     if target_addresses_arg:
         target_addresses.update(
@@ -36956,9 +42541,6 @@ async def _complete_sequence_experiment(
     if args.get("success_condition") is not None:
         success_condition = str(args.get("success_condition") or "").strip()
         applied_changes.append("updated success_condition")
-
-    if actions_replaced:
-        matched_actions = _sequence_reconcile_matched_actions(actions, matched_actions)
 
     fork_context = (
         payload.get("fork") if isinstance(payload.get("fork"), dict) else None
@@ -37060,7 +42642,7 @@ async def _complete_sequence_experiment(
         actions=actions,
         observations=observations,
         matched_actions=matched_actions,
-        unmatched_actions=payload.get("unmatched_actions") or [],
+        unmatched_actions=unmatched_actions,
         related_ids=payload.get("related_ids") or [],
         action_space_path=str(payload.get("action_space_path") or ""),
         protocol_graph_path=str(payload.get("protocol_graph_path") or ""),
@@ -37075,6 +42657,11 @@ async def _complete_sequence_experiment(
         route_composition=route_composition,
         sequence_minimization=sequence_minimization,
         target_addresses=target_addresses,
+        mechanism_validation_plan=(
+            payload.get("mechanism_validation_plan")
+            if isinstance(payload.get("mechanism_validation_plan"), dict)
+            else None
+        ),
         call_context_plan=call_context_plan,
         callback_attacker_plan=callback_attacker_plan,
         solidity_pragma=solidity_pragma,
@@ -37187,6 +42774,25 @@ async def _complete_sequence_experiment(
             if path not in evidence:
                 evidence.append(path)
         experiment_entry["evidence"] = evidence
+        completed_action_keys = []
+        completed_coverage_keys = []
+        for matched_action in matched_actions:
+            action_key = _coverage_action_key(matched_action)
+            if action_key and action_key not in completed_action_keys:
+                completed_action_keys.append(action_key)
+            coverage_key = _coverage_definition_key(matched_action)
+            if coverage_key and coverage_key not in completed_coverage_keys:
+                completed_coverage_keys.append(coverage_key)
+        if (
+            not actions_replaced
+            and attack_graph_candidate
+            and attack_graph_candidate.get("action_key")
+        ):
+            candidate_action_key = str(attack_graph_candidate["action_key"])
+            if candidate_action_key not in completed_action_keys:
+                completed_action_keys.append(candidate_action_key)
+        experiment_entry["action_keys"] = completed_action_keys
+        experiment_entry["coverage_keys"] = completed_coverage_keys
         experiment_entry["sequence_quality"] = scaffold_quality
         experiment_entry["updated_at"] = now
         note = (
@@ -39447,9 +45053,29 @@ async def _compose_invariant_harness(container: AuditContainer, args: dict) -> s
             "\"args\":[\"amount\"],\"bounds\":\"amount between 1 and "
             "available balance\",\"expected_effect\":\"shares minted and "
             "accounting invariant remains solvent\"}. If you only have a broad "
-            "property, read source/map_action_space first or create a README-only "
-            "experiment with create_experiment(write_scaffold_contract=false)."
+            "property, read source/map_action_space first and record the missing "
+            "facts as a hypothesis card or open question. This harness is a "
+            "manual-only advanced escape hatch."
         )
+    for index, action in enumerate(actions):
+        missing = [
+            field
+            for field in ("actor", "contract", "function", "expected_effect")
+            if not str(action.get(field) or "").strip()
+        ]
+        if missing:
+            return (
+                f"Error: actions[{index}] must be concrete; missing "
+                + ", ".join(missing)
+            )
+        has_args = "args" in action
+        if has_args and not isinstance(action.get("args"), list):
+            return f"Error: actions[{index}].args must be a list"
+        if not has_args and not str(action.get("bounds") or "").strip():
+            return (
+                f"Error: actions[{index}] requires an explicit args list "
+                "(empty is valid for a no-argument function) or concrete bounds"
+            )
     priority = args.get("priority")
     if priority is not None and priority not in _CAMPAIGN_PRIORITIES:
         return f"Error: unknown campaign priority '{priority}'"
@@ -39550,6 +45176,8 @@ async def _compose_invariant_harness(container: AuditContainer, args: dict) -> s
         "target_addresses": target_addresses,
         "solidity_pragma": solidity_pragma,
         "scaffold_quality": scaffold_quality,
+        "manual_only": True,
+        "manual_completion_required": True,
         "scaffold": {
             "version": 2,
             "entrypoints": scaffold_entrypoints,
@@ -39636,6 +45264,8 @@ async def _compose_invariant_harness(container: AuditContainer, args: dict) -> s
         "content": content,
         "status": "open",
         "priority": priority,
+        "manual_only": True,
+        "manual_completion_required": True,
         "evidence": (
             written_paths
             + ([action_space_path] if action_space_path else [])
@@ -39661,6 +45291,8 @@ async def _compose_invariant_harness(container: AuditContainer, args: dict) -> s
         "related_ids": related_ids,
         "target_addresses": target_addresses,
         "solidity_pragma": solidity_pragma,
+        "manual_only": True,
+        "manual_completion_required": True,
     }
     return json.dumps(response, indent=2, sort_keys=True)
 
@@ -39718,9 +45350,18 @@ async def _mutate_hypothesis(container: AuditContainer, args: dict) -> str:
         return "Error: 'failed_assumption' is required"
     if not interpretation:
         return "Error: 'interpretation' is required"
+    if args.get("create_experiments"):
+        return (
+            "Error: create_experiments was removed. mutate_hypothesis records "
+            "adjacent hypotheses only; use compose_sequence_experiment after a "
+            "child hypothesis passes structured readiness."
+        )
 
     try:
-        evidence = [str(item) for item in _require_list(args.get("evidence"), "evidence")]
+        raw_evidence = _require_list(args.get("evidence"), "evidence")
+        if any(not isinstance(item, str) for item in raw_evidence):
+            raise ValueError("evidence must be a list of strings")
+        evidence = [item.strip() for item in raw_evidence if item.strip()]
         related_ids = [
             str(item) for item in _require_list(args.get("related_ids"), "related_ids")
         ]
@@ -39752,25 +45393,32 @@ async def _mutate_hypothesis(container: AuditContainer, args: dict) -> str:
     now = datetime.now(timezone.utc).isoformat()
     base_related = _unique_strings([source_hypothesis_id, mutation_id, related_ids])
 
-    source_found = False
-    if args.get("update_source", True):
-        for entry in state["sections"]["hypothesis"]:
-            if entry.get("id") != source_hypothesis_id:
-                continue
-            source_found = True
-            entry["status"] = source_status
-            entry["updated_at"] = now
-            entry["evidence"] = _merge_unique_strings(entry.get("evidence"), evidence)
-            entry["related_ids"] = _merge_unique_strings(
-                entry.get("related_ids"),
-                [mutation_id, *related_ids],
-            )
-            entry["content"] = (
-                f"{entry.get('content', '').rstrip()}\n\n"
-                f"Mutation {mutation_id}: {interpretation}\n"
-                f"Failed assumption: {failed_assumption}"
-            ).strip()
-            break
+    source_entry = next(
+        (
+            entry
+            for entry in state["sections"]["hypothesis"]
+            if entry.get("id") == source_hypothesis_id
+        ),
+        None,
+    )
+    source_found = source_entry is not None
+    source_action_keys = list((source_entry or {}).get("action_keys") or [])
+    source_coverage_keys = list((source_entry or {}).get("coverage_keys") or [])
+    if args.get("update_source", True) and source_entry is not None:
+        source_entry["status"] = source_status
+        source_entry["updated_at"] = now
+        source_entry["evidence"] = _merge_unique_strings(
+            source_entry.get("evidence"), evidence
+        )
+        source_entry["related_ids"] = _merge_unique_strings(
+            source_entry.get("related_ids"),
+            [mutation_id, *related_ids],
+        )
+        source_entry["content"] = (
+            f"{source_entry.get('content', '').rstrip()}\n\n"
+            f"Mutation {mutation_id}: {interpretation}\n"
+            f"Failed assumption: {failed_assumption}"
+        ).strip()
 
     decision_id = ""
     if args.get("record_decision", True):
@@ -39792,10 +45440,11 @@ async def _mutate_hypothesis(container: AuditContainer, args: dict) -> str:
             "priority": None,
             "evidence": evidence,
             "related_ids": _unique_strings([base_related]),
+            "action_keys": source_action_keys,
+            "coverage_keys": source_coverage_keys,
         })
 
     created_mutations = []
-    create_experiments = args.get("create_experiments", True)
     for item in mutations:
         try:
             title = _mutation_text(item, "title", "title")
@@ -39804,14 +45453,22 @@ async def _mutate_hypothesis(container: AuditContainer, args: dict) -> str:
             experiment = _mutation_text(item, "experiment", "experiment")
             priority = _mutation_priority(item.get("priority"))
             status = _mutation_status(item.get("status"), "open")
+            raw_item_evidence = _require_list(
+                item.get("evidence"),
+                "mutation evidence",
+            )
+            if any(not isinstance(value, str) for value in raw_item_evidence):
+                raise ValueError("mutation evidence must be a list of strings")
             item_evidence = [
-                str(value)
-                for value in _require_list(item.get("evidence"), "mutation evidence")
+                value.strip() for value in raw_item_evidence if value.strip()
             ]
             item_related = [
                 str(value)
                 for value in _require_list(item.get("related_ids"), "mutation related_ids")
             ]
+            hypothesis_card = _normalize_hypothesis_card(
+                item.get("hypothesis_card")
+            )
         except ValueError as exc:
             return f"Error: {exc}"
 
@@ -39822,7 +45479,7 @@ async def _mutate_hypothesis(container: AuditContainer, args: dict) -> str:
             item_related,
         ])
         item_evidence_all = _unique_strings([evidence, item_evidence])
-        state["sections"]["hypothesis"].append({
+        hypothesis_entry = {
             "id": hypothesis_id,
             "created_at": now,
             "updated_at": now,
@@ -39838,38 +45495,32 @@ async def _mutate_hypothesis(container: AuditContainer, args: dict) -> str:
             "priority": priority,
             "evidence": item_evidence_all,
             "related_ids": item_related_ids,
-        })
-
-        experiment_id = ""
-        if create_experiments:
-            experiment_id = _next_campaign_id(state, "experiment")
-            state["sections"]["experiment"].append({
-                "id": experiment_id,
-                "created_at": now,
-                "updated_at": now,
-                "title": item.get("experiment_title") or f"Test mutation: {title}",
-                "content": (
-                    f"Source hypothesis: {source_hypothesis_id}\n"
-                    f"Mutation hypothesis: {hypothesis_id}\n"
-                    f"Mutation artifact: {mutation_id}\n\n"
-                    f"Experiment plan:\n{experiment}\n\n"
-                    f"Expected observation:\n"
-                    f"{str(item.get('expected_observation') or 'TODO').strip()}"
-                ),
-                "status": "open",
-                "priority": priority,
-                "evidence": item_evidence_all,
-                "related_ids": _unique_strings([item_related_ids, hypothesis_id]),
-            })
+            "mutated_from": source_hypothesis_id,
+            "mutation_id": mutation_id,
+            "action_keys": source_action_keys,
+            "coverage_keys": source_coverage_keys,
+        }
+        if hypothesis_card:
+            hypothesis_entry["hypothesis_card"] = hypothesis_card
+        state["sections"]["hypothesis"].append(hypothesis_entry)
 
         created_mutations.append({
             "title": title,
             "hypothesis_id": hypothesis_id,
-            "experiment_id": experiment_id or None,
             "priority": priority,
             "status": status,
             "rationale": rationale,
+            "hypothesis_card": hypothesis_card or None,
         })
+
+    if source_entry is not None and args.get("update_source", True):
+        child_ids = [item["hypothesis_id"] for item in created_mutations]
+        source_entry["mutation_children"] = _merge_unique_strings(
+            source_entry.get("mutation_children"), child_ids
+        )
+        source_entry["mutation_ids"] = _merge_unique_strings(
+            source_entry.get("mutation_ids"), [mutation_id]
+        )
 
     created_questions = []
     for item in open_questions:
@@ -39878,9 +45529,14 @@ async def _mutate_hypothesis(container: AuditContainer, args: dict) -> str:
             return "Error: open_questions entries require 'question'"
         try:
             priority = _mutation_priority(item.get("priority"))
+            raw_item_evidence = _require_list(
+                item.get("evidence"),
+                "open_question evidence",
+            )
+            if any(not isinstance(value, str) for value in raw_item_evidence):
+                raise ValueError("open_question evidence must be a list of strings")
             item_evidence = [
-                str(value)
-                for value in _require_list(item.get("evidence"), "open_question evidence")
+                value.strip() for value in raw_item_evidence if value.strip()
             ]
         except ValueError as exc:
             return f"Error: {exc}"
@@ -40042,16 +45698,16 @@ _SCOPE_PRIORITY_RULES = (
     ("swap", 3, "swap"),
     ("farm", 3, "farm"),
 )
-_SCOPE_INFRA_RULES = (
-    ("proxy", -4, "proxy/infrastructure"),
-    ("proxyadmin", -5, "proxy admin"),
-    ("timelock", -4, "timelock/governance"),
-    ("ownership", -4, "ownership"),
-    ("aclmanager", -3, "access-control"),
-    ("emergencyspell", -4, "emergency spell"),
-    ("pausesingle", -4, "pause spell"),
-    ("pauseall", -4, "pause spell"),
-    ("freeze", -3, "freeze spell"),
+_SCOPE_INFRA_TAG_RULES = (
+    ("proxy", "proxy/infrastructure"),
+    ("proxyadmin", "proxy admin"),
+    ("timelock", "timelock/governance"),
+    ("ownership", "ownership"),
+    ("aclmanager", "access-control"),
+    ("emergencyspell", "emergency spell"),
+    ("pausesingle", "pause spell"),
+    ("pauseall", "pause spell"),
+    ("freeze", "freeze spell"),
 )
 
 
@@ -40068,9 +45724,11 @@ def _score_scope_profile(profile: dict) -> tuple[int, list[str]]:
             score += weight
             if tag not in tags:
                 tags.append(tag)
-    for needle, weight, tag in _SCOPE_INFRA_RULES:
+    # Infrastructure labels are useful attention metadata, but they are never a
+    # scope boundary. Proxies, registries, authorities, and otherwise bland
+    # transitive contracts can be the only deployed route to assets or rights.
+    for needle, tag in _SCOPE_INFRA_TAG_RULES:
         if needle in haystack:
-            score += weight
             if tag not in tags:
                 tags.append(tag)
     if profile.get("address"):
@@ -40133,7 +45791,9 @@ async def _inspect_scope(container: AuditContainer, args: dict) -> str:
     except ValueError as exc:
         return f"Error: {exc}"
     max_profiles = min(max(int(args.get("max_profiles", 40)), 1), 120)
-    include_low_priority = bool(args.get("include_low_priority", False))
+    # Retained as a compatibility no-op. All parsed profiles are in scope and
+    # persisted; max_profiles controls only the compact response below.
+    _include_low_priority = bool(args.get("include_low_priority", False))
 
     foundry_path = posixpath.join(root, "foundry.toml")
     try:
@@ -40167,15 +45827,12 @@ async def _inspect_scope(container: AuditContainer, args: dict) -> str:
             ),
         })
     ranked.sort(key=lambda item: (
+        -int(bool(item.get("address"))),
+        -int(int(item.get("source_files") or 0) > 0),
         -int(item.get("priority_score") or 0),
         str(item.get("contract") or ""),
         str(item.get("profile") or ""),
     ))
-    if include_low_priority:
-        shown = ranked[:max_profiles]
-    else:
-        shown = [item for item in ranked if int(item.get("priority_score") or 0) > 0]
-        shown = (shown or ranked)[:max_profiles]
 
     manifest = {
         "path": root,
@@ -40183,16 +45840,23 @@ async def _inspect_scope(container: AuditContainer, args: dict) -> str:
         "source_roots_for_default_scans": source_roots,
         "solidity_files_in_default_source_roots": len(sol_files),
         "foundry_profiles": len(profiles),
-        "ranked_profiles": shown,
+        "ranked_profiles": ranked,
+        "scope_policy": {
+            "profiles_retained": len(ranked),
+            "profiles_excluded_by_priority": 0,
+            "lexical_ranking_is_advisory": True,
+            "bounded_results_are_response_or_batch_limits": True,
+        },
         "ignored_artifact_dirs_sample": artifacts,
         "warnings": [
             "Default list/search/map tools ignore generated build output, prior findings, and stale PoC folders.",
             "Treat existing findings, prior campaign state, and PoC files inside the target tree as contamination unless the user explicitly asks for regression comparison.",
             "For Instascope-style projects, prefer each profile's build_command; broad forge build can compile stale tests or unrelated profiles.",
+            "Lexical tags and priority scores are attention hints only; every parsed profile remains in scope, including infrastructure and bland names.",
         ],
         "recommended_start": [
             "Record the scope manifest in campaign state.",
-            "Pick 2-4 high-value profiles from ranked_profiles and map/read those explicit src paths.",
+            "Start with 2-4 high-attention profiles, then preserve and batch the remaining ranked_profiles rather than treating them as excluded scope.",
             "Run the ranked profile build_command before writing PoCs or broader tests.",
             "Only inspect ignored artifact directories when checking whether a candidate was already attempted; never treat them as source truth.",
         ],
@@ -40233,13 +45897,16 @@ async def _inspect_scope(container: AuditContainer, args: dict) -> str:
         _SCOPE_MANIFEST_PATH,
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
     )
-    response_profiles = min(len(shown), 12)
+    response_profiles = min(len(ranked), max_profiles)
     response = {
         **manifest,
-        "ranked_profiles": shown[:response_profiles],
+        "ranked_profiles": ranked[:response_profiles],
         "omitted_from_response": {
-            "ranked_profiles": max(0, len(shown) - response_profiles),
-            "note": "Open manifest_path for the full ranked scope manifest.",
+            "ranked_profiles": max(0, len(ranked) - response_profiles),
+            "note": (
+                "Response-only compaction: every parsed profile is retained in "
+                "the manifest at manifest_path and remains in scope."
+            ),
         },
     }
     return json.dumps(response, indent=2, sort_keys=True)
@@ -40340,7 +46007,10 @@ def _campaign_id_counter_key(artifact_id: str) -> tuple[str, int] | None:
     if not match:
         return None
     prefix, number = match.groups()
-    for key, known_prefix in _CAMPAIGN_ID_PREFIXES.items():
+    for key, known_prefix in {
+        **_CAMPAIGN_ID_PREFIXES,
+        **_LEGACY_CAMPAIGN_ID_PREFIXES,
+    }.items():
         if known_prefix == prefix:
             return key, int(number)
     return None
@@ -40359,17 +46029,15 @@ def _campaign_id_known(state: dict, artifact_id: str) -> bool:
 
 def _finding_review_path(value: str) -> str:
     text = value.strip()
-    if text.startswith("/"):
-        normalized = posixpath.normpath(text)
-        if not normalized.startswith("/workspace/campaign/finding-reviews/"):
+    review_id = _finding_review_reference_id(text)
+    if not review_id:
+        if text.startswith("/"):
             raise ValueError(
-                "absolute evidence_review paths must be under "
-                "/workspace/campaign/finding-reviews/"
+                "absolute evidence_review paths must name an fr-NNN.json file "
+                "directly under /workspace/campaign/finding-reviews/"
             )
-        return normalized
-    if not re.fullmatch(r"fr-\d{3,}", text):
         raise ValueError("evidence_review must be an id like fr-001 or a review path")
-    return f"/workspace/campaign/finding-reviews/{text}.json"
+    return f"/workspace/campaign/finding-reviews/{review_id}.json"
 
 
 def _sequence_minimization_path(value: str) -> str:
@@ -40859,7 +46527,11 @@ def _finding_route_review_text(
         args.get("production_reachability", ""),
         args.get("funds_at_risk", ""),
         args.get("negative_controls") or [],
-        args.get("objective_evaluation", ""),
+        (
+            args.get("objective_evaluation", "")
+            if _objective_evaluation_alt_path_active(args)
+            else ""
+        ),
         args.get("proof_of_concept", ""),
         args.get("test_output", ""),
         args.get("capital_required", ""),
@@ -41378,10 +47050,15 @@ def _finding_exploitability_review(
             "exposure is later proven"
         )
     else:
+        objective_evaluation_signal = (
+            str(args.get("objective_evaluation") or "")
+            if _objective_evaluation_alt_path_active(args)
+            else ""
+        )
         review["exposure_status"] = (
             "measured_nonzero"
             if _report_contains_any_term(
-                "\n".join([funds_at_risk, str(args.get("objective_evaluation") or "")]),
+                "\n".join([funds_at_risk, objective_evaluation_signal]),
                 ("nonzero", "profit", "loss", "eval-", "$", "usd", "eth", "token"),
             )
             else "plausible_unmeasured"
@@ -41569,7 +47246,7 @@ def _finding_review_gap_summary(
     if "exp" not in prefixes:
         warnings.append(
             "no linked experiment id — add the exp-NNN id from "
-            "create_experiment or compose_sequence_experiment"
+            "compose_sequence_experiment or an explicit manual invariant harness"
         )
     if not prefixes.intersection({"res", "eval", "cmp", "trace", "econ", "flash", "min"}):
         warnings.append(
@@ -41580,7 +47257,10 @@ def _finding_review_gap_summary(
 
     validated = bool(args.get("validated", False))
     test_output = str(args.get("test_output") or "")
-    objective_evaluation_alt_path = _objective_evaluation_alt_path_active(args)
+    objective_evaluation_alt_path = _objective_evaluation_can_override_test_output(
+        args,
+        test_output,
+    )
     if validated:
         if not test_output.strip():
             blocking.append(
@@ -41592,9 +47272,9 @@ def _finding_review_gap_summary(
         if output_warning:
             if objective_evaluation_alt_path:
                 # Linked objective_evaluation is structured validation
-                # evidence; downgrade the test_output heuristic from blocker
-                # to warning so a passing fuzz/multi-suite run with stray
-                # revert/error strings does not falsely reject the finding.
+                # evidence; downgrade only an unrecognized non-Foundry output
+                # warning. Structured failures and zero-test runs remain hard
+                # contradictions even when an evaluation passes.
                 warnings.append(output_warning)
             else:
                 blocking.append(output_warning)
@@ -41639,20 +47319,570 @@ def _finding_review_gap_summary(
     return blocking, warnings
 
 
-def _objective_evaluation_alt_path_active(args: dict) -> bool:
-    """Return True iff a non-empty objective_evaluation reference is supplied.
+_OBJECTIVE_EVALUATION_VALIDATION_KEY = "_objective_evaluation_validation"
+_OBJECTIVE_EVALUATION_LINEAGE_PREFIXES = frozenset({"res"})
 
-    When the agent has linked an objective_evaluation artifact, the test_output
-    keyword heuristic should not be allowed to BLOCK the finding — the
-    objective evaluation itself is structured validation evidence (it carries
-    measured before/after deltas vs. a stated objective). The same liberal
-    treatment is used by ``_high_impact_objective_warnings`` for high/critical
-    findings, so this keeps review behaviour consistent across severity levels.
 
-    Note: this only matters when ``_check_test_output`` returned a warning.
-    When the test output is unambiguously passing, this helper is irrelevant.
+@dataclasses.dataclass(frozen=True)
+class _ObjectiveEvaluationValidation:
+    """Trusted runtime result for one objective-evaluation reference.
+
+    The model cannot manufacture an instance through JSON tool arguments. Gate
+    helpers therefore consume this marker instead of trusting raw argument
+    truthiness after the async artifact and lineage checks have run.
     """
-    return bool(str(args.get("objective_evaluation") or "").strip())
+
+    reference: str
+    active: bool = False
+    evaluation_id: str = ""
+    path: str = ""
+    comparison_id: str = ""
+    comparison_path: str = ""
+    lineage_ids: tuple[str, ...] = ()
+    scope_campaign_ids: tuple[str, ...] = ()
+    scope_evidence: tuple[str, ...] = ()
+    errors: tuple[str, ...] = ()
+    legacy_derived_status: bool = False
+
+    def public_summary(self) -> dict:
+        return {
+            "reference": self.reference,
+            "active": self.active,
+            "evaluation_id": self.evaluation_id or None,
+            "path": self.path or None,
+            "comparison_id": self.comparison_id or None,
+            "comparison_path": self.comparison_path or None,
+            "lineage_ids": list(self.lineage_ids),
+            "legacy_derived_status": self.legacy_derived_status,
+            "errors": list(self.errors),
+        }
+
+
+def _objective_evaluation_path(reference: str) -> tuple[str, str]:
+    value = str(reference or "").strip()
+    if re.fullmatch(r"eval-\d{3,}", value):
+        return value, f"/workspace/campaign/evaluations/{value}.json"
+    if not value.startswith("/"):
+        raise ValueError(
+            "objective_evaluation must be an id like eval-001 or its absolute "
+            "campaign evaluation path"
+        )
+    normalized = posixpath.normpath(value)
+    if normalized != value:
+        raise ValueError("objective_evaluation path must be normalized")
+    directory, filename = posixpath.split(normalized)
+    match = re.fullmatch(r"(eval-\d{3,})\.json", filename)
+    if directory != "/workspace/campaign/evaluations" or not match:
+        raise ValueError(
+            "absolute objective_evaluation paths must be direct eval-NNN.json "
+            "files under /workspace/campaign/evaluations/"
+        )
+    return match.group(1), normalized
+
+
+def _strict_artifact_count(value: object, field: str, errors: list[str]) -> int:
+    if type(value) is not int or value < 0:
+        errors.append(f"{field} must be a non-negative integer")
+        return -1
+    return value
+
+
+def _objective_match_is_grounded(
+    *,
+    objective: dict,
+    match: dict,
+    changed: list[dict],
+    label: str,
+    errors: list[str],
+) -> bool:
+    key = str(match.get("key") or "").strip()
+    if not key:
+        errors.append(f"{label} match is missing key")
+        return False
+    raw_delta = match.get("delta_raw")
+    if type(raw_delta) is not int:
+        errors.append(f"{label} match {key} is missing integer delta_raw")
+        return False
+    decimals = objective.get("decimals")
+    if type(decimals) is not int or decimals < 0 or decimals > 77:
+        errors.append(f"{label} has invalid decimals")
+        return False
+    try:
+        recorded_delta = Decimal(str(match.get("delta")))
+        min_delta = _decimal_from_value(objective.get("min_delta"), "0")
+        expected_delta = _scaled_delta(raw_delta, decimals)
+        computed_pass = _direction_passes(
+            expected_delta,
+            str(objective.get("direction") or "").strip().lower(),
+            min_delta,
+        )
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        errors.append(f"{label} match {key} has invalid objective math: {exc}")
+        return False
+    if recorded_delta != expected_delta:
+        errors.append(f"{label} match {key} has inconsistent scaled delta")
+        return False
+    if match.get("passed") is not computed_pass:
+        errors.append(f"{label} match {key} has inconsistent pass status")
+        return False
+    grounded = any(
+        isinstance(entry, dict)
+        and str(entry.get("key") or "") == key
+        and entry.get("before") == match.get("before")
+        and entry.get("after") == match.get("after")
+        and type(entry.get("delta")) is int
+        and entry.get("delta") == raw_delta
+        for entry in changed
+    )
+    if not grounded:
+        errors.append(
+            f"{label} match {key} does not match the referenced comparison"
+        )
+        return False
+    return computed_pass
+
+
+async def _validate_objective_evaluation(
+    container: AuditContainer,
+    *,
+    reference: object,
+    campaign_ids: list[str],
+    evidence: list[str],
+    state: dict | None = None,
+) -> _ObjectiveEvaluationValidation:
+    raw_reference = str(reference or "").strip()
+    scope_campaign_ids = tuple(sorted({
+        str(item).strip() for item in campaign_ids if str(item).strip()
+    }))
+    scope_evidence = tuple(sorted({
+        posixpath.normpath(str(item).strip())
+        for item in evidence
+        if str(item).strip().startswith("/")
+    }))
+    if not raw_reference:
+        return _ObjectiveEvaluationValidation(reference="")
+
+    errors: list[str] = []
+    evaluation_id = ""
+    path = ""
+    comparison_id = ""
+    comparison_path = ""
+    lineage_ids: tuple[str, ...] = ()
+    legacy_derived_status = False
+    try:
+        evaluation_id, path = _objective_evaluation_path(raw_reference)
+    except ValueError as exc:
+        return _ObjectiveEvaluationValidation(
+            reference=raw_reference,
+            errors=(str(exc),),
+        )
+
+    try:
+        raw = await container.read_file(path)
+    except FileNotFoundError:
+        errors.append(f"evaluation artifact does not exist: {path}")
+        return _ObjectiveEvaluationValidation(
+            reference=raw_reference,
+            evaluation_id=evaluation_id,
+            path=path,
+            scope_campaign_ids=scope_campaign_ids,
+            scope_evidence=scope_evidence,
+            errors=tuple(errors),
+        )
+    try:
+        evaluation = json.loads(raw)
+    except json.JSONDecodeError:
+        errors.append(f"evaluation artifact is not valid JSON: {path}")
+        evaluation = None
+    if not isinstance(evaluation, dict):
+        if evaluation is not None:
+            errors.append("evaluation artifact root must be an object")
+        return _ObjectiveEvaluationValidation(
+            reference=raw_reference,
+            evaluation_id=evaluation_id,
+            path=path,
+            scope_campaign_ids=scope_campaign_ids,
+            scope_evidence=scope_evidence,
+            errors=tuple(errors),
+        )
+
+    if evaluation.get("id") != evaluation_id:
+        errors.append("evaluation id does not match its reference and filename")
+    if not str(evaluation.get("title") or "").strip():
+        errors.append("evaluation artifact is missing title")
+    if not str(evaluation.get("created_at") or "").strip():
+        errors.append("evaluation artifact is missing created_at")
+
+    comparison = evaluation.get("comparison")
+    if not isinstance(comparison, dict):
+        errors.append("evaluation artifact is missing comparison metadata")
+        comparison = {}
+    comparison_id = str(comparison.get("id") or "").strip()
+    declared_comparison_path = str(comparison.get("path") or "").strip()
+    if not re.fullmatch(r"cmp-\d{3,}", comparison_id):
+        errors.append("evaluation comparison id must be cmp-NNN")
+    else:
+        comparison_path = f"/workspace/campaign/comparisons/{comparison_id}.json"
+        if declared_comparison_path != comparison_path:
+            errors.append(
+                "evaluation comparison path does not match its comparison id"
+            )
+
+    comparison_payload: dict = {}
+    if comparison_path and declared_comparison_path == comparison_path:
+        try:
+            comparison_raw = await container.read_file(comparison_path)
+        except FileNotFoundError:
+            errors.append(
+                f"referenced comparison artifact does not exist: {comparison_path}"
+            )
+        else:
+            try:
+                loaded_comparison = json.loads(comparison_raw)
+            except json.JSONDecodeError:
+                errors.append(
+                    f"referenced comparison is not valid JSON: {comparison_path}"
+                )
+            else:
+                if not isinstance(loaded_comparison, dict):
+                    errors.append("referenced comparison root must be an object")
+                else:
+                    comparison_payload = loaded_comparison
+                    if comparison_payload.get("id") != comparison_id:
+                        errors.append(
+                            "referenced comparison id does not match evaluation"
+                        )
+    changed = comparison_payload.get("changed")
+    if not isinstance(changed, list) or not changed:
+        errors.append("referenced comparison must contain changed observations")
+        changed = []
+
+    objectives = evaluation.get("objectives")
+    if not isinstance(objectives, list) or not objectives:
+        errors.append("evaluation artifact must contain at least one objective")
+        objectives = []
+    derived_passed = 0
+    derived_unmatched = 0
+    for index, objective in enumerate(objectives, start=1):
+        label = f"objective {index}"
+        if not isinstance(objective, dict):
+            errors.append(f"{label} must be an object")
+            continue
+        matches = objective.get("matches")
+        if not isinstance(matches, list):
+            errors.append(f"{label} matches must be a list")
+            matches = []
+        matched = _strict_artifact_count(
+            objective.get("matched"),
+            f"{label} matched",
+            errors,
+        )
+        if matched != len(matches):
+            errors.append(f"{label} matched count is inconsistent")
+        if not matches:
+            derived_unmatched += 1
+        grounded_passes = [
+            _objective_match_is_grounded(
+                objective=objective,
+                match=match,
+                changed=changed,
+                label=label,
+                errors=errors,
+            )
+            if isinstance(match, dict)
+            else False
+            for match in matches
+        ]
+        if any(not isinstance(match, dict) for match in matches):
+            errors.append(f"{label} contains a non-object match")
+        derived_objective_pass = bool(matches) and any(grounded_passes)
+        if objective.get("passed") is not derived_objective_pass:
+            errors.append(f"{label} pass status is inconsistent")
+        if derived_objective_pass:
+            derived_passed += 1
+
+    summary = evaluation.get("summary")
+    if not isinstance(summary, dict):
+        errors.append("evaluation artifact is missing summary")
+        summary = {}
+    summary_objectives = _strict_artifact_count(
+        summary.get("objectives"), "summary.objectives", errors
+    )
+    summary_passed = _strict_artifact_count(
+        summary.get("passed"), "summary.passed", errors
+    )
+    summary_failed = _strict_artifact_count(
+        summary.get("failed"), "summary.failed", errors
+    )
+    summary_unmatched = _strict_artifact_count(
+        summary.get("unmatched"), "summary.unmatched", errors
+    )
+    derived_failed = len(objectives) - derived_passed
+    if summary_objectives != len(objectives):
+        errors.append("summary objective count is inconsistent")
+    if summary_passed != derived_passed:
+        errors.append("summary passed count is inconsistent")
+    if summary_failed != derived_failed:
+        errors.append("summary failed count is inconsistent")
+    if summary_unmatched != derived_unmatched:
+        errors.append("summary unmatched count is inconsistent")
+    derived_achieved = (
+        bool(objectives)
+        and derived_failed == 0
+        and derived_unmatched == 0
+    )
+    declared_achieved = evaluation.get("objective_achieved")
+    if declared_achieved is None:
+        legacy_derived_status = True
+    elif type(declared_achieved) is not bool:
+        errors.append("objective_achieved must be a boolean")
+    elif declared_achieved is not derived_achieved:
+        errors.append("objective_achieved is inconsistent with objective results")
+    if not derived_achieved:
+        errors.append("objective evaluation did not achieve every objective")
+
+    related_ids = evaluation.get("related_ids")
+    if not isinstance(related_ids, list) or not all(
+        isinstance(item, str) and item.strip() for item in related_ids
+    ):
+        errors.append("evaluation related_ids must be a list of campaign ids")
+        related_ids = []
+    normalized_related_ids = tuple(dict.fromkeys(
+        str(item).strip() for item in related_ids if str(item).strip()
+    ))
+    lineage_ids = normalized_related_ids
+    if comparison_id and comparison_id not in normalized_related_ids:
+        errors.append("evaluation related_ids do not include its comparison id")
+
+    linked_campaign_ids = {
+        str(item).strip() for item in campaign_ids if str(item).strip()
+    }
+    if evaluation_id not in linked_campaign_ids:
+        errors.append("campaign_ids do not link the objective evaluation id")
+    normalized_evidence = {
+        posixpath.normpath(str(item).strip())
+        for item in evidence
+        if str(item).strip().startswith("/")
+    }
+    if path not in normalized_evidence:
+        errors.append("evidence does not link the objective evaluation path")
+
+    shared_lineage = linked_campaign_ids.intersection(normalized_related_ids)
+    execution_lineage = sorted(
+        item for item in shared_lineage
+        if item.split("-", 1)[0] in _OBJECTIVE_EVALUATION_LINEAGE_PREFIXES
+    )
+    if not execution_lineage:
+        errors.append(
+            "objective evaluation has no shared executed result lineage with "
+            "the candidate"
+        )
+    if state is None:
+        state = await _load_campaign_state(container)
+    if not _campaign_id_known(state, evaluation_id):
+        errors.append("objective evaluation id is not present in campaign state")
+    unknown_lineage = [
+        item for item in execution_lineage if not _campaign_id_known(state, item)
+    ]
+    if unknown_lineage:
+        errors.append(
+            "objective evaluation references unknown execution lineage: "
+            + ", ".join(unknown_lineage)
+        )
+    valid_execution_lineage: list[str] = []
+    related_id_set = set(normalized_related_ids)
+    for result_id in execution_lineage:
+        result = next(
+            (
+                entry
+                for entry in state.get("sections", {}).get("result", [])
+                if str(entry.get("id") or "") == result_id
+            ),
+            None,
+        )
+        if not isinstance(result, dict):
+            continue
+        classification = _attack_search_result_classification(result)
+        if (
+            classification.get("run_kind") not in _EXPERIMENT_OBJECTIVE_RUN_KINDS
+            or classification.get("evidence_grade") != "objective_candidate"
+            or not classification.get("satisfies_experiment_run")
+        ):
+            continue
+        if str(result.get("status") or "") in {
+            "blocked",
+            "rejected",
+            "inconclusive",
+        }:
+            continue
+        expected_log_path = f"/workspace/campaign/results/{result_id}.log"
+        if expected_log_path not in _entry_evidence(result):
+            continue
+        try:
+            result_log = await container.read_file(expected_log_path)
+        except FileNotFoundError:
+            continue
+        _metadata, separator, captured_output = result_log.partition("\n\n")
+        if (
+            not separator
+            or not captured_output.strip()
+            or _parse_result_exit_code(
+                str(result.get("content") or ""),
+                str(result.get("status") or ""),
+            ) != 0
+        ):
+            continue
+        run_summary = _parse_forge_test_summary(captured_output)
+        if run_summary is not None:
+            if run_summary["suite_failed"] or run_summary["passed"] == 0:
+                continue
+        elif not _test_output_warning_allows_objective_evaluation(captured_output):
+            continue
+        result_experiments = {
+            item
+            for item in _entry_related_ids(result)
+            if item.startswith("exp-")
+        }
+        candidate_experiments = {
+            item
+            for item in linked_campaign_ids.intersection(related_id_set)
+            if item.startswith("exp-")
+        }
+        if not result_experiments.intersection(candidate_experiments):
+            continue
+        valid_execution_lineage.append(result_id)
+    if execution_lineage and not valid_execution_lineage:
+        errors.append(
+            "shared result lineage is not a successful objective-capable run "
+            "of the linked experiment"
+        )
+
+    return _ObjectiveEvaluationValidation(
+        reference=raw_reference,
+        active=not errors,
+        evaluation_id=evaluation_id,
+        path=path,
+        comparison_id=comparison_id,
+        comparison_path=comparison_path,
+        lineage_ids=lineage_ids,
+        scope_campaign_ids=scope_campaign_ids,
+        scope_evidence=scope_evidence,
+        errors=tuple(dict.fromkeys(errors)),
+        legacy_derived_status=legacy_derived_status,
+    )
+
+
+async def _prepare_objective_evaluation_validation(
+    container: AuditContainer,
+    args: dict,
+    *,
+    campaign_ids: list[str],
+    evidence: list[str],
+    state: dict | None = None,
+) -> tuple[dict, _ObjectiveEvaluationValidation]:
+    validation = await _validate_objective_evaluation(
+        container,
+        reference=args.get("objective_evaluation"),
+        campaign_ids=campaign_ids,
+        evidence=evidence,
+        state=state,
+    )
+    prepared = dict(args)
+    prepared[_OBJECTIVE_EVALUATION_VALIDATION_KEY] = validation
+    return prepared, validation
+
+
+def _objective_evaluation_validation_is_current(args: dict) -> bool:
+    validation = args.get(_OBJECTIVE_EVALUATION_VALIDATION_KEY)
+    reference = str(args.get("objective_evaluation") or "").strip()
+    campaign_ids = args.get("campaign_ids") or []
+    evidence = args.get("evidence") or []
+    if not isinstance(campaign_ids, list) or not isinstance(evidence, list):
+        return False
+    scope_campaign_ids = tuple(sorted({
+        str(item).strip() for item in campaign_ids if str(item).strip()
+    }))
+    scope_evidence = tuple(sorted({
+        posixpath.normpath(str(item).strip())
+        for item in evidence
+        if str(item).strip().startswith("/")
+    }))
+    return (
+        isinstance(validation, _ObjectiveEvaluationValidation)
+        and validation.reference == reference
+        and validation.scope_campaign_ids == scope_campaign_ids
+        and validation.scope_evidence == scope_evidence
+    )
+
+
+def _objective_evaluation_alt_path_active(args: dict) -> bool:
+    """Return whether runtime validation approved the linked evaluation.
+
+    Raw model-supplied text is never enough. The trusted marker is created only
+    after the evaluation, its comparison, objective math, campaign links, and
+    execution lineage have been checked inside the container.
+    """
+    validation = args.get(_OBJECTIVE_EVALUATION_VALIDATION_KEY)
+    return (
+        _objective_evaluation_validation_is_current(args)
+        and isinstance(validation, _ObjectiveEvaluationValidation)
+        and validation.active
+    )
+
+
+def _test_output_warning_allows_objective_evaluation(test_output: str) -> bool:
+    """Allow an eval alternate only for nonempty, unrecognized runner output.
+
+    A structured Foundry failure/zero-test result, explicit failed count, or
+    failure-only output contradicts validation and cannot be rescued by a
+    separate delta artifact. The alternate exists solely for legitimate custom
+    runners whose text has no recognized pass marker and no failure signal.
+    """
+    if not str(test_output or "").strip():
+        return False
+    if _parse_forge_test_summary(test_output) is not None:
+        return False
+    lowered = test_output.lower()
+    if any(
+        int(count) > 0
+        for count in re.findall(r"\b(\d+)\s+failed\b", lowered)
+    ):
+        return False
+    if re.search(r"\bsuite result:\s*(fail|failed)\b", lowered) or "[fail" in lowered:
+        return False
+    failure_text = re.sub(
+        r"\b0\s+(?:failed|failing|failures?)\b",
+        "",
+        lowered,
+    )
+    return not any(
+        indicator in failure_text
+        for indicator in ("fail", "error", "revert", "panic")
+    )
+
+
+def _objective_evaluation_can_override_test_output(
+    args: dict,
+    test_output: str,
+) -> bool:
+    return (
+        _objective_evaluation_alt_path_active(args)
+        and _test_output_warning_allows_objective_evaluation(test_output)
+    )
+
+
+def _objective_evaluation_validation_warning(
+    validation: _ObjectiveEvaluationValidation,
+) -> str | None:
+    if not validation.reference or validation.active:
+        return None
+    details = "; ".join(validation.errors[:6])
+    if len(validation.errors) > 6:
+        details += f"; ... {len(validation.errors) - 6} more"
+    return (
+        "invalid objective_evaluation cannot provide alternate validation or "
+        f"clear proof-strength caveats: {details}"
+    )
 
 
 def _has_preserved_sequence_minimization(sequence_minimizations: list[dict]) -> bool:
@@ -41673,7 +47903,7 @@ def _high_impact_objective_warnings(
 ) -> list[str]:
     if severity not in {"critical", "high"}:
         return []
-    if str(args.get("objective_evaluation") or "").strip():
+    if _objective_evaluation_alt_path_active(args):
         return []
     has_preserved_minimization = _has_preserved_sequence_minimization(
         sequence_minimizations
@@ -41733,7 +47963,7 @@ def _finding_partial_probe_only_warnings(
     """
     if severity not in {"critical", "high", "medium"}:
         return []
-    if str(args.get("objective_evaluation") or "").strip():
+    if _objective_evaluation_alt_path_active(args):
         return []
     if _has_preserved_sequence_minimization(sequence_minimizations):
         return []
@@ -41797,7 +48027,7 @@ def _finding_generic_probe_only_warnings(
     """
     if severity not in {"critical", "high", "medium"}:
         return []
-    if str(args.get("objective_evaluation") or "").strip():
+    if _objective_evaluation_alt_path_active(args):
         return []
     if _has_preserved_sequence_minimization(sequence_minimizations):
         return []
@@ -41876,6 +48106,15 @@ async def _review_finding_evidence(container: AuditContainer, args: dict) -> str
 
     state = await _load_campaign_state(container)
     checked_paths, missing_paths = await _check_evidence_paths(container, evidence)
+    args, objective_evaluation_validation = (
+        await _prepare_objective_evaluation_validation(
+            container,
+            args,
+            campaign_ids=campaign_ids,
+            evidence=evidence,
+            state=state,
+        )
+    )
     (
         minimization_evidence,
         minimization_paths,
@@ -41921,6 +48160,11 @@ async def _review_finding_evidence(container: AuditContainer, args: dict) -> str
         return f"Error: {exc}"
     blocking.extend(minimization_blocking)
     warnings.extend(minimization_warnings)
+    objective_evaluation_warning = _objective_evaluation_validation_warning(
+        objective_evaluation_validation
+    )
+    if objective_evaluation_warning:
+        warnings.append(objective_evaluation_warning)
     warnings.extend(_high_impact_objective_warnings(
         severity=severity,
         args=args,
@@ -41986,6 +48230,9 @@ async def _review_finding_evidence(container: AuditContainer, args: dict) -> str
             "campaign_ids": campaign_ids,
             "evidence": evidence,
             "objective_evaluation": args.get("objective_evaluation", ""),
+            "objective_evaluation_validation": (
+                objective_evaluation_validation.public_summary()
+            ),
             "sequence_minimization": args.get("sequence_minimization", ""),
             "capital_required": args.get("capital_required", ""),
             "preconditions": args.get("preconditions") or [],
@@ -42190,7 +48437,11 @@ def _report_review_text(
         args.get("test_output", ""),
         args.get("economic_analysis", ""),
         args.get("remediation", ""),
-        args.get("objective_evaluation", ""),
+        (
+            args.get("objective_evaluation", "")
+            if _objective_evaluation_alt_path_active(args)
+            else ""
+        ),
         args.get("precondition_provenance") or [],
         args.get("production_reachability", ""),
         args.get("funds_at_risk", ""),
@@ -42397,7 +48648,7 @@ def _report_non_economic_impact_gaps(
     economic_analysis: str,
     evidence: list[str],
     campaign_ids: list[str],
-    objective_evaluation: str,
+    objective_evaluation_active: bool,
     sequence_minimizations: list[dict],
     high_impact: bool,
 ) -> list[str]:
@@ -42420,7 +48671,7 @@ def _report_non_economic_impact_gaps(
 
     evidence_text = "\n".join([report_text, *evidence, *campaign_ids])
     has_replay_evidence = (
-        bool(objective_evaluation.strip())
+        objective_evaluation_active
         or _has_preserved_sequence_minimization(sequence_minimizations)
         or _report_contains_any_term(evidence_text, _REPORT_REPLAY_EVIDENCE_TERMS)
     )
@@ -42505,6 +48756,15 @@ async def _review_report_quality(container: AuditContainer, args: dict) -> str:
 
     state = await _load_campaign_state(container)
     checked_paths, missing_paths = await _check_evidence_paths(container, evidence)
+    args, objective_evaluation_validation = (
+        await _prepare_objective_evaluation_validation(
+            container,
+            args,
+            campaign_ids=campaign_ids,
+            evidence=evidence,
+            state=state,
+        )
+    )
     (
         direct_minimizations,
         minimization_paths,
@@ -42528,7 +48788,13 @@ async def _review_report_quality(container: AuditContainer, args: dict) -> str:
     warnings = []
     warnings.extend(minimization_blocking)
     warnings.extend(minimization_warnings)
+    objective_evaluation_warning = _objective_evaluation_validation_warning(
+        objective_evaluation_validation
+    )
+    if objective_evaluation_warning:
+        warnings.append(objective_evaluation_warning)
     evidence_review_ref = str(args.get("evidence_review") or "").strip()
+    evidence_review_id = _finding_review_reference_id(evidence_review_ref)
     evidence_review_path = ""
     evidence_review = None
     review_minimizations = []
@@ -42542,6 +48808,7 @@ async def _review_report_quality(container: AuditContainer, args: dict) -> str:
         except (FileNotFoundError, ValueError) as exc:
             warnings.append(f"missing or invalid evidence review: {exc}")
         else:
+            evidence_review_id = _finding_review_reference_id(evidence_review_path)
             checked_paths = _unique_strings([checked_paths, [evidence_review_path]])
             if not evidence_review.get("ready", False):
                 warnings.append("linked evidence review is not ready")
@@ -42619,7 +48886,7 @@ async def _review_report_quality(container: AuditContainer, args: dict) -> str:
         warnings.append("missing remediation guidance")
     elif len(remediation) < 25:
         warnings.append("remediation guidance is very short")
-    if not objective_evaluation:
+    if not _objective_evaluation_alt_path_active(args):
         warnings.append("no objective evaluation linked")
 
     unknown_ids = [
@@ -42673,7 +48940,7 @@ async def _review_report_quality(container: AuditContainer, args: dict) -> str:
         economic_analysis=economic_analysis,
         evidence=evidence,
         campaign_ids=campaign_ids,
-        objective_evaluation=objective_evaluation,
+        objective_evaluation_active=_objective_evaluation_alt_path_active(args),
         sequence_minimizations=sequence_minimizations,
         high_impact=high_impact,
     ))
@@ -42736,8 +49003,11 @@ async def _review_report_quality(container: AuditContainer, args: dict) -> str:
             "remediation": remediation,
             "campaign_ids": campaign_ids,
             "evidence": evidence,
-            "evidence_review": evidence_review_ref,
+            "evidence_review": evidence_review_id or evidence_review_ref,
             "objective_evaluation": objective_evaluation,
+            "objective_evaluation_validation": (
+                objective_evaluation_validation.public_summary()
+            ),
             "sequence_minimization": args.get("sequence_minimization", ""),
         },
         "exploitability_review": exploitability_review,
@@ -42863,16 +49133,18 @@ def _parse_forge_test_summary(test_output: str) -> dict | None:
 
 
 def _check_test_output(test_output: str) -> str | None:
-    """Check if test_output contains signs that the test actually failed.
+    """Require a recognized passing test signal in non-empty test output.
 
-    Returns a warning string if failure indicators are found, None otherwise.
-    This catches the real problem: agent claims validated but the test failed.
+    Returns ``None`` only for structured Foundry output with at least one
+    passing test and no reported failure. Empty output remains the caller's
+    responsibility because review/submission gates provide a more specific
+    missing-output error.
 
     Foundry-aware: when structured ``Test result: ok. N passed; M failed``
     lines or ``[PASS]``/``[FAIL]`` per-test markers are present, we trust them
-    over the legacy keyword heuristic. The heuristic still runs as a fallback
-    for non-Foundry test runners (Hardhat plain prints, Truffle, custom
-    scripts) so the safety net is never lost.
+    over substring keywords. Non-Foundry or otherwise unstructured output must
+    be paired with a separately runtime-validated objective-evaluation artifact
+    at the gate; arbitrary prose is never proof by itself.
     """
     if not test_output:
         return None
@@ -42927,7 +49199,12 @@ def _check_test_output(test_output: str) -> str | None:
             "your exploit actually works before treating this as validated. "
             "If the test truly fails, set validated=false and explain why."
         )
-    return None
+    return (
+        "WARNING: The test_output you provided has no recognized passing test "
+        "result. Supply runnable Foundry output with a passing Test result or "
+        "[PASS] marker. For a legitimate non-Foundry runner, also link a "
+        "passing objective_evaluation with matching campaign/evidence lineage."
+    )
 
 
 def _audit_artifact_evidence_paths(evidence: list[str]) -> list[str]:
@@ -42972,20 +49249,6 @@ def _has_clean_mirrored_poc_evidence(finding: dict) -> bool:
         if path.startswith("/workspace/experiments/generated-pocs/"):
             return True
     return False
-
-
-def _review_reference_id(reference: str, prefix: str) -> str:
-    text = str(reference or "").strip()
-    if not text:
-        return ""
-    if re.fullmatch(rf"{re.escape(prefix)}-\d{{3,}}", text):
-        return text
-    name = posixpath.basename(text)
-    if name.endswith(".json"):
-        name = name[:-5]
-    if re.fullmatch(rf"{re.escape(prefix)}-\d{{3,}}", name):
-        return name
-    return text
 
 
 _REVIEW_WARNING_CATEGORY_TERMS = (
@@ -43187,6 +49450,25 @@ def _submit_finding_blocked_response(blockers: list[str]) -> str:
     )
 
 
+def _review_matches_objective_evaluation(
+    review: dict,
+    validation: _ObjectiveEvaluationValidation,
+) -> bool:
+    candidate = review.get("candidate")
+    if not isinstance(candidate, dict):
+        return False
+    recorded = candidate.get("objective_evaluation_validation")
+    if not isinstance(recorded, dict) or recorded.get("active") is not True:
+        return False
+    return (
+        recorded.get("evaluation_id") == validation.evaluation_id
+        and recorded.get("path") == validation.path
+        and recorded.get("comparison_id") == validation.comparison_id
+        and recorded.get("comparison_path") == validation.comparison_path
+        and tuple(recorded.get("lineage_ids") or ()) == validation.lineage_ids
+    )
+
+
 async def _submission_review_blockers(
     container: AuditContainer,
     args: dict,
@@ -43194,6 +49476,25 @@ async def _submission_review_blockers(
     severity = str(args.get("severity") or "info").strip().lower()
     if severity not in {"critical", "high", "medium", "low", "info"}:
         return ["severity must be critical, high, medium, low, or info"]
+
+    try:
+        campaign_ids = [
+            str(item)
+            for item in _require_list(args.get("campaign_ids"), "campaign_ids")
+        ]
+        evidence = [
+            str(item) for item in _require_list(args.get("evidence"), "evidence")
+        ]
+    except ValueError as exc:
+        return [str(exc)]
+    if not _objective_evaluation_validation_is_current(args):
+        args, _objective_validation = await _prepare_objective_evaluation_validation(
+            container,
+            args,
+            campaign_ids=campaign_ids,
+            evidence=evidence,
+        )
+    objective_validation = args.get(_OBJECTIVE_EVALUATION_VALIDATION_KEY)
 
     requires_ready_reviews = severity in {"critical", "high", "medium"}
     evidence_review_ref = str(args.get("evidence_review") or "").strip()
@@ -43263,8 +49564,8 @@ async def _submission_review_blockers(
                 or ""
             ).strip()
             if evidence_review_ref and linked_evidence:
-                submitted_id = _review_reference_id(evidence_review_ref, "fr")
-                linked_id = _review_reference_id(linked_evidence, "fr")
+                submitted_id = _finding_review_reference_id(evidence_review_ref)
+                linked_id = _finding_review_reference_id(linked_evidence)
                 if submitted_id != linked_id:
                     blockers.append(
                         f"report review links evidence_review {linked_id}, "
@@ -43284,11 +49585,31 @@ async def _submission_review_blockers(
                 "medium/high/critical submissions require passing test_output"
             )
         output_warning = _check_test_output(test_output)
-        if output_warning and not _objective_evaluation_alt_path_active(args):
+        objective_evaluation_override = (
+            _objective_evaluation_can_override_test_output(args, test_output)
+        )
+        if output_warning and not objective_evaluation_override:
             # Linked objective_evaluation is structured validation evidence —
             # keep the heuristic warning visible (it still surfaces in the
             # finding's system_note via _submit_finding) but do not block.
             blockers.append(output_warning)
+        elif output_warning and isinstance(
+            objective_validation,
+            _ObjectiveEvaluationValidation,
+        ):
+            for label, review in (
+                ("evidence review", evidence_review),
+                ("report review", report_review),
+            ):
+                if isinstance(review, dict) and not _review_matches_objective_evaluation(
+                    review,
+                    objective_validation,
+                ):
+                    blockers.append(
+                        f"{label} does not validate the same objective_evaluation "
+                        "and execution lineage used as the alternate test-output "
+                        "evidence; rerun both reviews with the linked evaluation"
+                    )
 
     return blockers
 
@@ -43299,13 +49620,29 @@ async def _submit_finding_checked(
     findings: list[dict],
     display=None,
 ) -> str:
-    blockers = await _submission_review_blockers(container, args)
-    if blockers:
-        return _submit_finding_blocked_response(blockers)
-    enriched_args = dict(args)
-    enriched_args["_submission_review_context"] = await _submission_review_context(
+    try:
+        campaign_ids = [
+            str(item)
+            for item in _require_list(args.get("campaign_ids"), "campaign_ids")
+        ]
+        evidence = [
+            str(item) for item in _require_list(args.get("evidence"), "evidence")
+        ]
+    except ValueError as exc:
+        return _submit_finding_blocked_response([str(exc)])
+    prepared_args, _validation = await _prepare_objective_evaluation_validation(
         container,
         args,
+        campaign_ids=campaign_ids,
+        evidence=evidence,
+    )
+    blockers = await _submission_review_blockers(container, prepared_args)
+    if blockers:
+        return _submit_finding_blocked_response(blockers)
+    enriched_args = dict(prepared_args)
+    enriched_args["_submission_review_context"] = await _submission_review_context(
+        container,
+        prepared_args,
     )
     return _submit_finding(enriched_args, findings, display)
 
@@ -43370,7 +49707,7 @@ def _submit_finding(args: dict, findings: list[dict], display=None) -> str:
     if validated:
         output_warning = _check_test_output(test_output)
         if output_warning:
-            if _objective_evaluation_alt_path_active(args):
+            if _objective_evaluation_can_override_test_output(args, test_output):
                 # Linked objective_evaluation acts as structured validation
                 # evidence; keep validated=true but surface the heuristic's
                 # warning in system_note so reviewers can inspect.

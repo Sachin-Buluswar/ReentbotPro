@@ -59,13 +59,14 @@ uv tool uninstall reentbotpro
 ## Configuration
 
 CLI flags take priority over environment variables. In an interactive terminal,
-the setup wizard is shown unless `--no-chat` is used; the normal path collects
-only your Alchemy and Etherscan keys — the target chain is inferred from
-scope/deployment metadata at audit time — and offers to save them to local config
-so you do not re-enter them each run. A default chain and an explicit RPC override
-are optional advanced defaults behind a single opt-in prompt (default no). In
-non-interactive mode, the CLI uses flags, environment variables, and defaults
-without prompting.
+the setup wizard is shown unless `--no-chat` is used. Its on-chain credential
+portion collects only your Alchemy and Etherscan keys — the target chain is
+inferred from scope/deployment metadata at audit time — and offers to save them
+to local config so you do not re-enter them each run. The wizard also collects
+run settings such as model, reasoning, time limit, and verbosity. A default chain
+and an explicit RPC override are optional advanced defaults behind a single
+opt-in prompt (default no). In non-interactive mode, the CLI uses flags,
+environment variables, and defaults without prompting.
 
 ### Normal setup
 
@@ -110,7 +111,8 @@ explicitly set or recorded. Spend is governed by your Alchemy account usage limi
 
 The Etherscan key powers **verified contract source** lookups with
 `get_contract_source` (`ETHERSCAN_API_KEY` or `api_keys.etherscan`) over
-Etherscan's V2 multichain API (one key, all chains) — verified Solidity, ABI, and
+Etherscan's V2 multichain API (one key across Etherscan-supported chains) —
+verified Solidity, ABI, and
 proxy→implementation, the source-truth complement to Alchemy's runtime data.
 Mainnet verified source is free on Etherscan; some L2s may require a paid Etherscan
 plan (the tool degrades cleanly without it).
@@ -175,6 +177,9 @@ experiments do not need a manually exported `ETH_RPC_URL`: `run_experiment` (and
 experiment's fork context / chain metadata (or an explicit
 `rpc_url`/`network`/`chain_id`/`fork_context`) and inject `ETH_RPC_URL` plus
 per-chain `RPC_URL_<chain_id>`/`RPC_URL_<NETWORK>` into the run.
+Direct attack-graph sequence materialization also requires one unambiguous
+candidate/live-profile chain (or an explicit `fork_context`); an address alone
+is never assumed to mean Ethereum mainnet.
 
 Common environment variables:
 
@@ -184,7 +189,7 @@ export OPENAI_BASE_URL=https://...           # Optional; OpenAI-compatible gatew
 export ALCHEMY_API_KEY=...                   # Normal on-chain setup; derives chain-specific RPC + powers enhanced-API tools across chains
 export ETHERSCAN_API_KEY=...                 # Normal on-chain setup; verified source (get_contract_source) + in-container tools
 export ETH_RPC_URL=https://...               # Advanced; explicit RPC override for a custom/local/non-Alchemy node
-export REENTBOTPRO_MODEL=gpt-5.5          # Optional
+export REENTBOTPRO_MODEL=gpt-5.6-sol      # Optional
 export REENTBOTPRO_HOME=~/.reentbotpro # Optional; app-local config/auth directory
 ```
 
@@ -204,10 +209,10 @@ reentbotpro ./path/to/contracts
 reentbotpro ./contracts --no-chat
 
 # Choose model and wall-clock limit in minutes
-reentbotpro ./contracts --model gpt-5.5 --max-time 30
+reentbotpro ./contracts --model gpt-5.6-sol --max-time 30
 
 # Use another model; context, output, and reasoning settings are inferred
-reentbotpro ./contracts --model gpt-5.4-mini
+reentbotpro ./contracts --model gpt-5.6-terra
 
 # Advanced context overrides
 reentbotpro ./contracts --context-window 1000000
@@ -233,6 +238,7 @@ reentbotpro ./contracts --verbosity partial
 reentbotpro ./contracts --verbosity full
 
 # Reasoning effort for models that support it
+reentbotpro ./contracts --reasoning max
 reentbotpro ./contracts --reasoning xhigh
 reentbotpro ./contracts --reasoning high
 reentbotpro ./contracts --reasoning medium
@@ -244,8 +250,8 @@ reentbotpro ./contracts --reasoning low
 | Option | Default | Notes |
 | --- | --- | --- |
 | `--max-time` | `720` minutes | Wall-clock limit for audit/report/chat agent loops. |
-| `--model` | `gpt-5.5` | Model-specific context, output, and reasoning settings are inferred. |
-| `--reasoning` | model default, currently `xhigh` for `gpt-5.5` | Unsupported choices are adjusted for the selected model. |
+| `--model` | `gpt-5.6-sol` | Model-specific context, output, and reasoning settings are inferred. |
+| `--reasoning` | model default, currently `xhigh` for `gpt-5.6-sol` | Unsupported choices are adjusted for the selected model. |
 | `--context-window` | model-specific | Advanced override for the model context window used to size budgets. |
 | `--max-context` | auto | Advanced hard cap on retained history tokens; default auto-sizes per turn to the tools in use, reclaiming unused tool-schema space. |
 | Minimum audit turns | `10000` | Internal guard before the audit agent may voluntarily stop before wrap-up. |
@@ -269,8 +275,8 @@ Typical contents:
 - `report.md`: human-readable vulnerability report.
 - `findings.json`: run metadata, artifact counts, submitted findings, and any
   final incomplete-readiness status.
-- `campaign/`: saved campaign state, compact `trace.jsonl`, maps, plans,
-  result logs, evidence reviews, and report reviews.
+- `campaign/`: saved campaign state, compact `trace.jsonl`, maps, controller
+  branch dossiers, result logs, evidence reviews, and report reviews.
 - `experiments/`: generated experiment and harness workspaces.
 
 The audited source directory is bind-mounted at `/audit`, so files the agent
@@ -290,8 +296,10 @@ ReentbotPro runs in three phases:
    saved campaign context.
 3. **Chat**: optional follow-up mode for questions or `keep-auditing`.
 
-Internally, audits use a deterministic `attack_search` controller and artifact
-backed campaign state:
+Internally, audits use one deterministic `attack_search` controller and
+artifact-backed campaign state. The controller derives progress and
+attack-surface coverage during synchronization. Controller synchronization is
+the only scheduling and readiness path:
 
 ```text
 State -> Map -> Plan -> Experiment -> Evidence -> Mutate or Report
@@ -309,12 +317,23 @@ A few properties keep the output honest:
   proxies and configured/economic targets ahead of dormant
   implementation/template addresses, and queue transitive targets reached
   through proxy, provider, registry, asset, and oracle indirection.
+- **Open scope.** Lexical profile signals rank attention but never exclude
+  bland, infrastructure, proxy, provider, registry, or other parsed first-party
+  profiles from the persisted scope manifest. Large manifests are mapped through
+  controller-routed cumulative batches, so a per-call root/file bound cannot
+  silently turn into a permanent scope exclusion.
 - **Runnable scaffolds.** Generated experiment workspaces ship a small local
   Foundry config and a `forge-std/Test.sol` shim so a fresh workspace runs
-  without first repairing remappings. A `forge test` that executes no tests is
-  recorded as blocked setup, not evidence.
-- **Honest stops.** Voluntary and wall-clock stops run a readiness check; if
-  high-signal branches remain active, `findings.json` records
+  without first repairing remappings. Attack-graph candidates flow directly
+  into sequence composition with embedded mechanism/state-model guidance. A
+  `forge test` that executes no tests is recorded as blocked setup, not evidence.
+- **Honest stops.** Voluntary and wall-clock stops run a fresh controller
+  readiness check. Any nonterminal, non-parked branch blocks a clean stop;
+  ordinary parked-only campaigns may finish. A controller-derived integrity
+  limit (for example, omitted definitions at the hard map-retention bound)
+  remains explicitly parked rather than rejected but can still block readiness.
+  A failed final sync is treated as incomplete
+  rather than trusting stale readiness state. When work remains, `findings.json` records
   `audit_status: incomplete_no_validated_findings` with a readiness snapshot
   instead of presenting a clean no-findings run.
 

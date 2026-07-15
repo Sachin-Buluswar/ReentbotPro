@@ -9,6 +9,7 @@ from reentbotpro.agent import (
     DEFAULT_CONTEXT_WINDOW,
     DEFAULT_MAX_TIME_MINUTES,
     DEFAULT_MAX_TIME_SECONDS,
+    _report_visible_tools,
     calculate_max_context,
 )
 from reentbotpro.cli import (
@@ -84,6 +85,14 @@ class ResolveContextBudgetsTests(unittest.TestCase):
         # reclaim visible-tool space per turn.
         self.assertEqual(max_context, calculate_max_context(DEFAULT_CONTEXT_WINDOW))
         self.assertEqual(
+            report_max_context,
+            calculate_max_context(
+                DEFAULT_CONTEXT_WINDOW,
+                output_reserve=128_000,
+                tools=_report_visible_tools(),
+            ),
+        )
+        self.assertGreater(
             report_max_context,
             calculate_max_context(DEFAULT_CONTEXT_WINDOW, output_reserve=128_000),
         )
