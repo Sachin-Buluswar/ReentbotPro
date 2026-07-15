@@ -63,10 +63,9 @@ the setup wizard is shown unless `--no-chat` is used. Its on-chain credential
 portion collects only your Alchemy and Etherscan keys — the target chain is
 inferred from scope/deployment metadata at audit time — and offers to save them
 to local config so you do not re-enter them each run. The wizard also collects
-run settings such as model, reasoning, time limit, and verbosity. An explicit RPC
-override is available behind an advanced opt-in prompt (default no). In
-non-interactive mode, the CLI uses flags, environment variables, and defaults
-without prompting.
+run settings such as model, reasoning, time limit, and verbosity. It does not
+prompt for an RPC endpoint. In non-interactive mode, the CLI uses flags,
+environment variables, and defaults without prompting.
 
 ### Normal setup
 
@@ -123,8 +122,8 @@ plan (the tool degrades cleanly without it).
 ReentbotPro normally derives chain-specific Alchemy RPC endpoints from
 `ALCHEMY_API_KEY` and inferred chain context. Use `--rpc-url`, `ETH_RPC_URL`, or
 `rpc_urls` only for custom/local/non-Alchemy endpoints, Tenderly/Anvil, debugging,
-or unsupported networks. These explicit overrides take precedence over the derived
-URL:
+or unsupported networks. These settings are intentionally outside the setup
+wizard. Explicit overrides take precedence over the derived URL:
 
 ```bash
 # Explicit RPC endpoint for a custom/local/non-Alchemy node

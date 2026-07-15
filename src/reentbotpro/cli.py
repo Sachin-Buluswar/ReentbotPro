@@ -306,10 +306,10 @@ def _interactive_setup(
     """Prompt for missing configuration values interactively.
 
     The target chain or chains are inferred from scope/deployment metadata at
-    audit time. The normal path asks only for the Alchemy and Etherscan keys;
-    an explicit RPC URL remains available behind an opt-in advanced prompt.
-    Newly entered credentials can be persisted to local config. Key values are
-    never echoed back.
+    audit time. The setup path asks only for the Alchemy and Etherscan keys;
+    explicit RPC URLs supplied through flags, environment, or local config are
+    honored without adding another wizard prompt. Newly entered credentials can
+    be persisted to local config. Key values are never echoed back.
     """
     config: dict = {}
     persist: dict = {}
@@ -365,9 +365,10 @@ def _interactive_setup(
                 "  [dim]Skipped — get_contract_source won't be available.[/]"
             )
 
-    # Chain selection is inferred from scope/deployment metadata. An explicit RPC
-    # override remains available for custom/local nodes, but it does not select a
-    # target chain for the agent.
+    # Chain selection is inferred from scope/deployment metadata. Honor an
+    # explicit RPC override supplied outside the wizard, but do not prompt for
+    # one here: custom/local endpoints are an advanced configuration concern and
+    # do not select a target chain for the agent.
     console.print(
         "\n  [cyan]Target chain(s) will be inferred from scope/deployment "
         "metadata.[/]"
@@ -377,19 +378,6 @@ def _interactive_setup(
         console.print(
             "  [dim]Using explicit RPC override from flags/env/config.[/]"
         )
-
-    # Keep the explicit RPC override behind a default-no advanced gate.
-    if explicit_rpc_url is None:
-        answer = console.input(
-            "\n  [dim]Configure an optional explicit RPC override?[/] "
-            "\\[y/[not bold blue]N[/]]: "
-        ).strip().lower()
-        if answer in ("y", "yes"):
-            entered = console.input(
-                "\n  Explicit RPC URL override "
-                "(optional — press Enter to skip): "
-            ).strip()
-            config["rpc_url"] = entered or None
 
     # Model
     if model:

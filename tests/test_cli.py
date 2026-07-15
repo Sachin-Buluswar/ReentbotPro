@@ -516,8 +516,7 @@ class InteractiveSetupTests(unittest.TestCase):
 
     def test_normal_path_prompts_for_keys_and_infers_chains(self):
         # Normal setup with missing keys: it prompts for the Alchemy and
-        # Etherscan keys and surfaces the chain-inference message. The optional
-        # explicit RPC override is declined here (empty answer defaults to no).
+        # Etherscan keys and surfaces the chain-inference message.
         console = ScriptedConsole(answers=[])
         config = _interactive_setup(
             console,
@@ -532,22 +531,21 @@ class InteractiveSetupTests(unittest.TestCase):
         # The legacy "Ethereum RPC URL" prompt is gone from the normal path.
         self.assertFalse(any("Ethereum RPC URL" in p for p in console.prompts))
         self.assertFalse(any("Default chain" in p for p in console.prompts))
-        self.assertTrue(
-            any("explicit RPC override" in p for p in console.prompts)
+        self.assertFalse(
+            any("RPC override" in p for p in console.prompts)
         )
         # The chain-inference message is shown.
         joined = " ".join(console.outputs)
         self.assertIn("inferred from scope/deployment", joined)
-        # Nothing entered and the override declined.
+        # Nothing entered and no override supplied outside the wizard.
         self.assertIsNone(config["rpc_url"])
 
-    def test_declining_rpc_override_persists_keys(self):
+    def test_key_setup_persists_keys_without_rpc_prompt(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"REENTBOTPRO_HOME": tmp}, clear=False):
                 console = ScriptedConsole(answers=[
                     "alchemy-test-key",    # Alchemy key
                     "etherscan-test-key",  # Etherscan key
-                    "n",                   # explicit RPC override: decline
                     "",                    # max time: default
                     "",                    # persist confirmation: yes
                 ])
@@ -566,20 +564,21 @@ class InteractiveSetupTests(unittest.TestCase):
                 self.assertEqual(saved["alchemy_api_key"], "alchemy-test-key")
                 self.assertEqual(saved["etherscan_api_key"], "etherscan-test-key")
                 self.assertNotIn("rpc_url", saved)
+                self.assertFalse(
+                    any("RPC override" in p for p in console.prompts)
+                )
 
             # Key values are never echoed back to the console.
             joined = " ".join(console.outputs)
             self.assertNotIn("alchemy-test-key", joined)
             self.assertNotIn("etherscan-test-key", joined)
 
-    def test_advanced_setup_applies_rpc_override_to_current_run(self):
+    def test_existing_rpc_override_is_applied_without_prompt(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"REENTBOTPRO_HOME": tmp}, clear=False):
                 console = ScriptedConsole(answers=[
                     "alchemy-test-key",    # Alchemy key
                     "etherscan-test-key",  # Etherscan key
-                    "y",                   # explicit RPC override: opt in
-                    "https://rpc.example", # RPC override
                     "",                    # max time: default
                     "",                    # persist confirmation: yes
                 ])
@@ -587,11 +586,18 @@ class InteractiveSetupTests(unittest.TestCase):
                     console,
                     alchemy_key=None,
                     etherscan_key=None,
-                    explicit_rpc_url=None,
+                    explicit_rpc_url="https://rpc.example",
                     **self.BASE_KWARGS,
                 )
 
                 self.assertEqual(config["rpc_url"], "https://rpc.example")
+                self.assertFalse(
+                    any("RPC override" in p for p in console.prompts)
+                )
+                self.assertIn(
+                    "Using explicit RPC override from flags/env/config",
+                    " ".join(console.outputs),
+                )
 
                 saved = load_local_config()
                 self.assertEqual(saved["alchemy_api_key"], "alchemy-test-key")
@@ -604,7 +610,6 @@ class InteractiveSetupTests(unittest.TestCase):
                 console = ScriptedConsole(answers=[
                     "alchemy-test-key",  # Alchemy key
                     "",                  # Etherscan key: skip
-                    "n",                 # explicit RPC override: decline
                     "",                  # max time: default
                     "n",                 # persist confirmation: decline
                 ])
@@ -620,8 +625,8 @@ class InteractiveSetupTests(unittest.TestCase):
     def test_existing_keys_are_not_reprompted_or_persisted(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"REENTBOTPRO_HOME": tmp}, clear=False):
-                # Answers cover the explicit-RPC gate (declined) and max time.
-                console = ScriptedConsole(answers=["", ""])
+                # Only max time is prompted when credentials already exist.
+                console = ScriptedConsole(answers=[""])
                 config = _interactive_setup(
                     console,
                     alchemy_key="existing-alchemy",
