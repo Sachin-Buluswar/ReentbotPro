@@ -39,24 +39,24 @@ Responsibilities:
   required next tool to each branch, schedules exploration by expected value vs
   proof cost (with explicit non-rejection parking for hard branches), records
   transitions, and prevents silent jumps from hypothesis to finding. It is the
-  single authoritative scheduler for the campaign: every other planning tool
-  (`plan_attack_campaign`, `review_campaign_progress`, `build_campaign_brief`,
-  `review_attack_surface_coverage`) is advisory context and must not override
-  `attack_search.next_action` without an explicit `action=advance` or
-  `action=decision` transition.
-- **State**: `read_campaign`, `update_campaign`, `review_campaign_progress`,
-  and `build_campaign_brief` preserve the protocol model, value flows,
-  assumptions, hypotheses, results, decisions, and process gaps. The advisory
-  reviews surface gaps and suggestions but carry a `controller_note` deferring
-  the required next action back to `attack_search`, so their signals never
-  compete with the scheduler.
+  sole scheduler and model-facing planner. Every sync derives progress and
+  attack-surface coverage directly from durable campaign state and the current
+  maps, folds unique planning signals into the branch queue, and returns one
+  authoritative `next_action`. A branch changes course only through an explicit
+  `action=advance`, `action=decision`, mutation, or state-backed transition.
+- **State**: `read_campaign`, `update_campaign`, and `build_campaign_brief`
+  preserve the protocol model, value flows, assumptions, structured hypotheses,
+  results, decisions, and process gaps. The brief is an exact compact projection
+  of the controller's current branches and next action for recovery; it is not a
+  second planner and cannot compete with the scheduler.
 - **Map**: `inspect_scope`, `map_protocol_graph`, `map_action_space`,
   `extract_state_transition_model`, `map_live_reachability`,
-  `inventory_live_targets`, `build_attack_graph`,
-  `review_attack_surface_coverage`, `record_fork_context`,
+  `inventory_live_targets`, `build_attack_graph`, `record_fork_context`,
   `estimate_amm_economics`, `estimate_flash_loan`, and
   `estimate_lending_health` describe source surfaces, live deployments,
-  gates, dependencies, and economic assumptions.
+  gates, dependencies, and economic assumptions. Coverage is a derived
+  controller view over every valid action space and current campaign lineage,
+  not a separate model-facing workflow.
   `extract_state_transition_model` is a generic, delexicalized modeling aid
   that reuses the same per-function units as `map_action_space`/`source_slice`
   to derive what state a contract tracks (mapping/aggregate/flag/enum/
@@ -66,35 +66,46 @@ Responsibilities:
   could falsify them. It comes *before* any protocol-specific adapters: optional
   `vault_like`/`lending_like`/`queue_like` lenses are attached only when source
   evidence supports them, never default for unknown code, and never crowd out the
-  generic invariants. It writes `stm-NNN.json` (see Artifact Contract) but no
+  generic invariants. Attack graphs may combine these facts into bounded causal
+  paths across state writes/reads, external calls, authority, accounting, and
+  value movement. Models, paths, and graph candidates remain planning context,
+  never proof. The model writes `stm-NNN.json` (see Artifact Contract) but no
   evidence — it is planning context the submission gates never consult, so it is
   in `_ATTACK_SEARCH_ALWAYS_ALLOWED_TOOLS` (cognitive surface, like
   `source_slice`/`synthesize_args`).
-- **Plan**: `plan_attack_campaign` turns accumulated state, coverage, failed
-  objectives, economics, fork context, and reviews into ranked research
-  branches. It is advisory and does not decide that a finding exists, nor does
-  it schedule work: its suggestions are returned under `candidate_next_steps`
-  (not a `next_action`) alongside a `controller_note` that points back to
-  `attack_search` for the authoritative next action and branch transitions.
-- **Experiment**: `create_experiment`, `prepare_fork_exploit_workbench`,
-  `compose_sequence_experiment`, `complete_sequence_experiment`,
+  Tracked state, mutating entrypoints, and candidate invariants are deduplicated
+  or identity-normalized and deterministically ordered before the bounded
+  `max_items` retention step. The artifact and compact response record exact
+  total/retained/omitted counts for all three sections, plus bounded source and
+  identity frontiers (and omitted invariant-family counts). An omitted modeled
+  item remains unresolved planning debt, never implicit coverage or rejection.
+- **Plan**: internal controller helpers turn accumulated state, derived
+  coverage, failed objectives, economics, fork context, and review gaps into
+  ranked branches. There is no advisory plan or refresh branch beside the
+  controller. When no branch is actionable, `attack_search` returns a targeted
+  mapping action, an explicit blocker/parking decision, or `campaign_ready`.
+- **Experiment**: `compose_sequence_experiment`, `complete_sequence_experiment`,
   `compose_invariant_harness`, `synthesize_args`, `run_experiment`,
   `run_sequence_minimization`, `run_campaign_fuzz`, `diagnose_build`,
   `repair_experiment`, `extract_call_sequence`, and
-  `mutate_hypothesis` create, run, reduce, and mutate validation work.
-  `prepare_fork_exploit_workbench` infers a mechanism adapter (vault, lending,
-  amm_oracle, bridge, queue_solver, staking, generic_execution) from explicit
-  candidate metadata, an override, or candidate/fork-context text. When nothing
-  matches it falls back to a `generic_state_transition` invariant/state-transition
-  harness that makes no vault/share assumptions, instead of defaulting to vault,
-  so novel non-economic bugs still get a proof scaffold. It also accepts an
-  optional `state_transition_model` so a model-derived invariant drives the
-  generic harness's objective, observation, and setup templates (see below).
+  `mutate_hypothesis` create, run, reduce, and mutate validation work. The
+  sequence composer consumes an attack graph/candidate directly and embeds the
+  existing mechanism adapter (vault, lending, amm_oracle, bridge, queue_solver,
+  staking, generic execution), live blocker checks, snapshot/objective templates,
+  and optional state-transition-model guidance in `sequence.json`. When nothing
+  matches, it uses generic state-transition guidance without inventing vault or
+  share assumptions. `compose_invariant_harness` remains an advanced manual-only
+  escape hatch for an explicitly specified executable property and concrete
+  handler actions; the controller never recommends a TODO-only invariant
+  scaffold as progress.
   `complete_sequence_experiment` is the deterministic concretization step for a
   `needs_concretization` sequence scaffold: it reloads the workspace, applies
   target bindings, synthesized args, and minimal objective probes, then
   regenerates `sequence.json` and the `.t.sol` through the same generator so
-  `scaffold_quality` stays consistent. It never marks the experiment validated.
+  `scaffold_quality` stays consistent. When actions are replaced, completion
+  reloads the recorded action space and re-resolves exact signature/source
+  matches so stale overload metadata cannot drive interfaces, runnable status,
+  or coverage. It never marks the experiment validated.
   It materially applies a synthesized arg's per-parameter assignments: an inline
   expression goes straight into the call, a non-inline one
   (`vault.balanceOf(attacker)`, `address(vault)`, `type(uint256).max`,
@@ -127,10 +138,25 @@ Responsibilities:
   missing dependency, test discovery, or unknown) with file/line, a repair hint,
   a `first_error`, and a `suggested_next` action so the agent repairs setup
   instead of re-reading raw logs. It is a diagnostic helper, not a detector: it
-  writes only a build-diagnostic artifact under
+  accepts only a single conservative explicit diagnostic command (`forge
+  build`/`config`/`inspect`, `forge test --list`, or `slither`), rejecting shell
+  chains, state-changing commands, arbitrary redirect targets, compiler/config
+  overrides such as `--use`, and Foundry output paths outside dedicated
+  build-diagnostic, static-analysis, generated-experiment diagnostic, or output
+  diagnostic scratch roots. Authoritative campaign state, controller, evidence,
+  review, and final-report paths are never valid diagnostic destinations.
+  Slither options that execute custom builds, select arbitrary compilers,
+  generate patches or triage state, or embed API keys are also rejected; its
+  explicit output paths must stay in those scratch roots (JSON/SARIF may use
+  stdout).
+  `FOUNDRY_PROFILE` is the only accepted leading environment assignment;
+  parsing an inline `log` or sandboxed `log_path` and internally selected builds
+  remains unchanged. It writes ordinary compiler artifacts plus a
+  build-diagnostic artifact under
   `/workspace/campaign/build-diagnostics/bdiag-*.json` (with a bounded `.log`
-  carrying path/hash/line counts) and never mutates an experiment, so the
-  submission gates still require a runnable PoC for high/critical findings.
+  carrying path/hash/line counts) and never edits experiment source or
+  definitions, so the submission gates still require a runnable PoC for
+  high/critical findings.
   `repair_experiment` is the deterministic repair counterpart: given an
   experiment plus a diagnose_build reference (a `bdiag-*` id, artifact/log path,
   inline diagnostic, or raw log), it applies a small set of SAFE, surgical fixes
@@ -166,18 +192,25 @@ state, controller sync, and planning. Specialized map, experiment, evidence, and
 report helpers are exposed on demand: when the agent requests a toolset, when the
 `attack_search` controller's selected next_action requires one (only the toolsets
 that next_action needs, not the whole specialized surface), or when late wrap-up
-requires submission tools.
+requires submission tools. Explicit `request_toolset` selections are durable;
+controller-selected toolsets are ephemeral and replaced after each successful
+`attack_search` sync, so a branch transition does not leave unrelated schemas on
+every later turn.
 
 The final report generation loop is intentionally narrower than the audit
 loop. It can read campaign artifacts and write `/output/report.md`, but it
 does not receive shell, mapping, experiment, web, evidence-review, or
-submission tools. New audit work belongs in the campaign loop before report
-generation starts.
+submission tools. Its context budget reserves only this report-visible schema
+subset. New audit work belongs in the campaign loop before report generation
+starts.
 
 ## Artifact Contract
 
-Campaign tools are artifact-first. Full protocol graphs, action spaces, source
-slices (`source_slice` with `record_result`, under
+Campaign tools are artifact-first. Retained, bounded protocol graphs and action
+spaces record exact section-retention and omission metadata. State-transition
+models do the same for tracked state, entrypoints, and candidate invariants,
+including bounded omitted-identity/family frontiers; source slices
+(`source_slice` with `record_result`, under
 `/workspace/campaign/source-slices/ss-*.json`), state-transition models
 (`extract_state_transition_model`, under
 `/workspace/campaign/state-transition-models/stm-*.json`), live reachability
@@ -190,9 +223,10 @@ are written under `/workspace/campaign/` or
 `/workspace/experiments/`. Live inventory artifacts
 use `linv-*` ids to stay distinct from invariant `inv-*` ids. Tool responses
 return compact ranked digests, counts, next actions, and artifact paths.
-Campaign-controller and progress-review transitions also append compact JSONL
-events to `/workspace/campaign/trace.jsonl`; the trace is for debugging audit
-behavior without expanding model-visible context.
+Campaign-controller transitions append compact JSONL events to
+`/workspace/campaign/trace.jsonl`; the controller event includes its derived
+progress/coverage state, and the trace is for debugging audit behavior without
+expanding model-visible context.
 
 The chain/deployment registry (`inspect_scope`, written to
 `/workspace/campaign/chain-registry/registry.json`, versioned by `chainreg-NNN`
@@ -212,8 +246,18 @@ narrows. The truncation/aging estimates discount that same visible subset, so a
 turn is never measured against tools it did not send. An explicit `--max-context`
 is a hard ceiling the per-turn budget never exceeds; without it the budget is
 auto-derived (`max_context_is_user_cap` is False) and may legitimately exceed the
-static full-tool reserve — that reserve is still what seeds the report/chat
-phases and the recovery retries.
+static full-tool reserve. Report turns reserve their narrow read/write schemas;
+interactive chat turns reserve their current visible schemas plus the selected
+model's maximum output, rather than reusing the smaller audit-turn output
+reserve. Recovery retries use the same phase/turn budget.
+
+Model limits are provider-aware. The default model is `gpt-5.6-sol`; its
+OpenAI API profile uses the published 1,050,000-token context window, while the
+ChatGPT/Codex OAuth profile uses the Codex catalog's 272,000-token cap. The
+GPT-5.6 family supports reasoning through `max`; ReentbotPro defaults it to
+`xhigh` for the audit workload while keeping every supported effort selectable.
+Exact model membership and per-provider settings live in `llm.py` and are
+pinned by `tests/test_llm.py`.
 
 Long-run context compaction is designed to preserve audit state, not arbitrary
 prefixes. When old turns are aged out or truncated, key campaign tool results
@@ -222,23 +266,68 @@ prefixes. When old turns are aged out or truncated, key campaign tool results
 `run_experiment`, `attack_search`, and the two review gates) are replaced with
 semantic summaries that keep the result's skeleton — status, readiness/runnable
 flags, blockers, verdicts, objective markers, invariant kinds, and artifact
-paths — while eliding bulky bodies and logs. On every `attack_search` save, the selected branch is also persisted as a
-full-fidelity dossier under `branch-dossiers/`, and its `dossier_path` rides on
-`next_action` and into the truncation note. So after a compaction the agent can
-recover the current branch (hypothesis/objective, target actions, evidence,
-required args, last blocker, next tool) with a single artifact read instead of
-re-deriving it.
+paths — while eliding bulky bodies and logs. On every `attack_search` save, the
+selected branch is also persisted as a durable rich recovery dossier under
+`branch-dossiers/`, and its `dossier_path` rides on `next_action` and into the
+truncation note. So after a compaction the agent can recover the current branch
+(hypothesis/objective, target actions, evidence, required args, last blocker,
+next tool) with a single artifact read instead of re-deriving it.
 
 This contract exists to avoid context bloat. Broad Instascope-style workspaces
 can contain many copied profiles, dependency trees, generated tests, prior
-findings, and stale PoCs. The mapping tools use the ranked scope manifest for
-broad scans, default to top ranked profile roots for `/audit` or `/audit/src`,
+findings, and stale PoCs. `inspect_scope` persists every parsed Foundry profile;
+lexical/name signals order attention but never remove bland, infrastructure,
+proxy, provider, registry, or other parsed first-party profiles from scope. The
+mapping tools use that complete ranked manifest for broad scans. Large retained
+scope is processed as bounded cumulative batches for `/audit` or `/audit/src`,
 prune common third-party Solidity dependency trees from returned action
 surfaces, and store live code probes as code presence, byte length, and short
 hashes instead of raw bytecode. When a ranked or explicitly selected profile
 root stores the protocol implementation under its own nested `lib` directory,
 the mapping tools include those in-scope Solidity files while still pruning
 top-level dependency trees, generated tests, and common third-party packages.
+`max_roots` and `max_files` limit one batch/page, not scope membership:
+artifacts preserve a stable series id, exact profile and within-root file
+cursors, a source-inventory fingerprint, the prior cumulative snapshot,
+remaining counts, and continuation arguments. A root enters `processed_roots`
+only after its final file page. `attack_search` schedules each continuation
+before downstream graph, reachability, state-model, coverage, or experiment
+work; addressed live profiles use the same cumulative rule. Downstream protocol
+graphs and state-transition models consume the completed cumulative action-space
+inventory and explicitly project/merge definitions outside their bounded source
+scan, with richer missing context recorded as unmapped rather than rejected.
+Consumers use only the newest snapshot in each cumulative series (plus
+deliberately independent focused maps), avoiding quadratic reprocessing of batch
+ancestors. If an action-space section exceeds `max_items`, the controller starts
+a fresh series at a larger retention limit (up to the 10,000-item hard bound);
+remaining omissions at that bound become an explicit `parked_harness_limit`,
+never silent coverage or readiness.
+
+Hypotheses use a small structured admission contract rather than free-form text
+as implicit proof readiness. A `hypothesis_card` records `attacker_control`, an
+ordered `state_path`, `invariant_at_risk`, `impact_sink`,
+`material_preconditions`, a `falsifier`, and a measurable `objective`. Partial
+cards remain durable context or open questions. `attack_search` schedules
+experiment composition only after all seven fields and concrete source,
+deployment, or probe evidence exist. Mutation records adjacent hypotheses and
+their lineage only; it never manufactures placeholder experiments. A complete
+child becomes eligible for a later controller-routed sequence composition step.
+Attack-graph candidates, including candidates generated from state-transition
+models or economic analysis, pass through the same admission boundary. An
+explicit partial card stays partial; the controller never fills its omissions
+from generic prose. For older generated candidates that have no card at all,
+the controller may derive one only from concrete action, objective, target
+binding, blocker, and falsification facts already carried by the candidate. If
+that deterministic derivation is incomplete, the branch routes back to focused
+source or deployment-context work and does not expose sequence-composition
+arguments. This normalization remains part of `attack_search`; it is not a
+second planner. After that focused review, `attack_search action=advance` can
+attach a complete card plus its concrete evidence to the same branch. The
+controller validates all seven fields, persists the override in the branch and
+dossier, and then regenerates that branch's original graph-bound composition
+arguments. Partial cards and attempts to bypass a mapping, inventory,
+deployment, or experiment blocker cannot advance to `needs_harness`.
+This is an admission rule, not a vulnerability taxonomy.
 
 Action-space maps include duplicate-collapsed signature families, and
 live-reachability maps include profile-family summaries and target-binding
@@ -286,23 +375,26 @@ candidates capped by `max_candidates`, plus a `frontier_summary`); the artifact
 preserves a richer novelty frontier so low-score, unlabeled/renamed, and
 truncated branches are not silently dropped. The artifact records `mode`,
 `all_candidate_count`, the top `candidate_chains`, and a `frontier` bucketed
-into `omitted_by_score`, `omitted_by_truncation`, `low_signal_entrypoints`,
+  into `omitted_by_score`, `omitted_by_truncation`,
+  `causal_path_omissions`, `low_signal_entrypoints`,
 `source_only_needs_live_context`,
 `low_score_state_mutators`, `unlabeled_state_mutators`,
 `unusual_external_boundaries`, `generic_invariant_candidates`,
 `pattern_candidates`, and `diversity_sample`
-(reason buckets hold full entries; the rest hold compact references, bounded by
-`frontier_max_items`). `low_signal_entrypoints` is a terminal reason bucket: it
-preserves bare source-only entrypoints for the audit trail but is never reffed
-into the semantic/novelty buckets, the diversity sample, or the scheduler.
+  (reason buckets hold full entries; the rest hold compact references, bounded by
+  `frontier_max_items`). `causal_path_omissions` and `low_signal_entrypoints` are
+  terminal reason buckets: they preserve compatible-but-capped paths and bare
+  source-only entrypoints for the audit trail but are never reffed into the
+  semantic/novelty buckets, the diversity sample, or the scheduler.
 Frontier entries are planning leads, not findings.
-`attack_search` promotes a capped 1–3 of these frontier entries per run into
+`attack_search` promotes a capped 1–3 of the eligible score/truncation frontier
+entries per run into
 exploratory `attack_graph_frontier` branches (preferring the novelty-critical
 unlabeled-state-mutator / unusual-external-boundary entries) so the curiosity /
 diversity budget keeps an unusual lead or two visible — see the scheduling
 section below.
 Before live reachability exists, `attack_search` offers a source-only
-`build_attack_graph` branch as a planning artifact while keeping
+`build_attack_graph` mapping branch while keeping
 `map_live_reachability` the higher-priority next action when deployment/RPC
 context is available. If a live-reachability artifact exists but binds no
 deployed/exposed context, the scheduler treats it like missing live context for
@@ -335,7 +427,15 @@ extracted, it adds a `missing_state_transition_model` branch
 so generic invariants are built before the attack graph overfits to known
 economic lenses; it gates strictly on the model artifact not existing, so a
 `not_found`/empty extraction (which still writes a model artifact) cannot make
-this loop. When a model with invariants exists alongside an action space and no
+this loop. If a model omits tracked state, entrypoints, or candidate invariants
+at its retention limit, the
+controller first re-extracts the same persisted source inventory at a larger
+limit, up to the 200-item hard bound. Remaining omissions at that bound become
+an explicit readiness-blocking `parked_harness_limit` with the recorded
+family/source frontier available for focused models or an explicit decision;
+the controller does not build a graph from the truncated model and silently
+equate the omitted frontier with covered branches. When a model with invariants
+exists alongside an action space and no
 attack graph yet exists, the model path is threaded into the
 `build_attack_graph` branch's `required_args`. When an attack graph already
 exists but its recorded `state_transition_model` locator does not match the
@@ -350,33 +450,33 @@ branch, the `next_action`, and the durable branch dossier — planning context,
 never finding evidence. Lacking live context, such a branch prefers
 `map_live_reachability` (so its invariant binds to a deployed target); with live
 reachability already mapped it may advance only when that artifact binds real
-deployed/exposed context. If live reachability was attempted but returned no
+deployed/exposed context. Binding retains a bounded, diverse set of exact live
+targets per invariant and records every omitted compatible target in explicit
+frontier/omission metadata rather than treating it as covered. If live
+reachability was attempted but returned no
 deployed profiles, exposed actions, source-artifact actions, or target bindings,
 the branch is preserved as `parked_needs_live_context` instead of falling through
-to workbench or sequence composition. Strict claim/evidence branches
+to sequence composition. Strict claim/evidence branches
 (`needs_evidence` and later) always outrank these mapping or parked branches.
 
-`prepare_fork_exploit_workbench` consumes the same artifact. It loads an explicit
-`state_transition_model` (an `stm-NNN` id or absolute path; an invalid explicit ref
-errors) or, when absent, the candidate's own `source.state_transition_model`
-(best-effort). It then matches an invariant to the selected candidate — by an
-explicit invariant id (`candidate.invariant.id`, `candidate.invariant_id`, or
-`candidate.source.invariant_id`), otherwise by target contract/function/action,
-invariant kind, and referencing experiment prompts. When the workbench is
-`generic_state_transition` and an invariant matches, it adds `model_guidance`
-(model path, invariant id/kind/statement, falsification ideas, candidate
-observations), prepends a `Falsify invariant: <statement>` objective with a
-kind-specific note, derives setup tasks from the matched experiment prompts,
-folds the invariant's candidate observations into the snapshot templates and
-`compose_sequence_experiment_args` (with `mechanism=generic_state_transition`),
-and surfaces the same context in the workbench README. A model `vault_like`/
-`lending_like` lens only adds an annotation note; it never replaces the generic
-invariant objective. When no invariant matches, the workbench records the model
-locator but invents no invariant-specific guidance.
+`compose_sequence_experiment` consumes the same artifacts directly. Given an
+`attack_graph`, `candidate_id`, optional `mechanism`, and optional
+`state_transition_model`, it loads the selected candidate, infers or honors the
+candidate's mechanism, applies live blocker/setup checks, and writes the adapter,
+snapshot, objective, and state-model guidance into the sequence workspace. For a
+generic state-transition candidate it matches an invariant by explicit id or by
+target/action/kind, prepends `Falsify invariant: <statement>`, derives setup from
+the model's experiment prompts, and folds candidate observations into the
+sequence probes. A `vault_like`/`lending_like` lens is annotation only and never
+replaces a generic invariant objective. An invalid explicit model reference
+errors; an unmatched model records no invented invariant guidance. The direct
+path keeps the useful mechanism and state-model logic inside the sequence
+composer.
 
 Duplicated deployed profile scopes should be triaged at the family level before
-drilling into a specific address. Use explicit `files`, narrower `path`, or
-`max_roots` only when a campaign needs to expand or contract the default scan.
+drilling into a specific address. Explicit `files` or a narrower `path` create a
+deliberate independent focused map. `max_roots` only tunes the bounded page size
+of a cumulative broad scan; it never expands or contracts retained scope.
 
 At run completion, `_save_campaign_artifacts` copies:
 
@@ -388,7 +488,7 @@ The normal output directory also includes `report.md` and `findings.json`.
 (`provider` alchemy/explicit/none, target `network`/`chain_id`, `source`,
 `override`, `assumed_default_mainnet`, plus a legacy redacted `rpc_url` prefix
 kept for compatibility), saved artifact counts, submitted findings, and final
-readiness status when the audit stops with unresolved high-signal work.
+readiness status when the controller does not permit a clean stop.
 Interrupted or abnormal exits perform the same artifact copy best effort before
 container cleanup and write a partial `findings.json` with `partial` and
 `interrupted` markers when the normal report path did not finish.
@@ -434,8 +534,9 @@ The implementation currently supports:
   returns `chain_not_inferred` rather than silently querying Ethereum mainnet.
   Calls record lightweight CU telemetry and degrade capability cleanly
   when an API, tier, or chain is unavailable (account-level Alchemy usage limits
-  govern spend). Each call writes its full result under
-  `/workspace/campaign/probes/` and returns a compact digest. The results are
+  govern spend). Each successful call writes its full result under
+  `/workspace/campaign/probes/` and returns a compact digest; failures return a
+  redacted error digest without claiming an artifact. The results are
   corroboration only: they never relax
   `submit_finding`/`review_finding_evidence`, so a runnable forge PoC stays
   required for high/critical findings.
@@ -464,9 +565,10 @@ The implementation currently supports:
   usage so experiments avoid calldata/setup false negatives. The chain is
   selected per call or inferred at dispatch (fork context, chain-registry
   binding, latest `record_fork_context`, then run default; `chain_not_inferred`
-  when none), the key is host-resolved and redacted, the full result is written under
-  `/workspace/campaign/observed-txs/` (`otx-NNN`), and a compact digest is
-  returned. It degrades cleanly to `unavailable` (no key, or trace APIs not on
+  when none), the key is host-resolved and redacted, and successful calls write
+  the full result under `/workspace/campaign/observed-txs/` (`otx-NNN`) when
+  `record_result=true` (the default), while returning a compact digest. It
+  degrades cleanly to `unavailable` (no key, or trace APIs not on
   the key/chain) or `partial` (no matching txs, or enrichment unavailable) and is
   corroboration/context only — a runnable forge PoC stays required for findings.
 - Chain/deployment inference and a single shared tool-side RPC resolver. The
@@ -522,7 +624,11 @@ The implementation currently supports:
   chains is left ambiguous (not probed); a resolved chain with no endpoint marks
   its probes `rpc_not_configured`; an explicit `network`/`chain_id` (or
   `fork_context`) filters out targets the registry binds to a different chain
-  (`chain_mismatch`). Both the response and the artifact carry the chain grouping
+  (`chain_mismatch`). A target/profile may also carry its own explicit chain;
+  this is resolved independently, so the same 20-byte address on two chains is
+  retained as two inventory/profile entries instead of being deduplicated by
+  address. Every mapped action exposure carries the resolved `network`,
+  `chain_id`, and chain-qualified target identity. Both the response and the artifact carry the chain grouping
   (`chains`/`chains_probed`/`targets_by_chain`) plus `ambiguous_targets` and
   `skipped_targets`, so a multi-chain scope is never collapsed into one
   chain-blind target list.
@@ -532,7 +638,7 @@ The implementation currently supports:
   chain-specific endpoint(s) the run needs and inject them as per-exec env vars,
   reusing the same precedence as `_resolve_tool_rpc_endpoint`: an explicit
   `rpc_url`/`network`/`chain_id`/`fork_context` arg; then the experiment's own
-  sequence/workbench chain metadata — `primary_chain`, `required_chains`, a
+  sequence chain metadata — `primary_chain`, `required_chains`, a
   chain-bound `target_addresses` object form (`{address, network, chain_id}`,
   with the legacy plain-string form still supported), and the legacy `fork`
   block; then a deployment registry binding, the latest fork context, and run
@@ -560,11 +666,106 @@ The implementation currently supports:
   artifact records `source.parse_mode` (`ast`/`regex`/`mixed`). If compilation,
   build-info, or AST extraction is unavailable for a file, it falls back to the
   regex parser with no change in entry shape, so uncompilable targets keep
-  working. The regex parser can truncate signature tails or invent phantom
+  working. Cumulative pages reuse a valid series build-info path and remember a
+  series-level missing-Foundry-project result, avoiding a full Forge rebuild or
+  repeated project discovery on every page; a stale cached build-info path falls
+  back to one normal rebuild. The regex parser can truncate signature tails or invent phantom
   modifiers, so its reachability verdicts are trusted less than AST verdicts
   (below). Set `REENTBOTPRO_DISABLE_AST_MAP` to force the regex path.
   Follow-ups: AST-backed protocol-graph mapping and per-profile AST builds for
   Instascope one-profile-per-contract workspaces.
+- Bounded causal source facts and paths. Each action-space entry carries compact
+  storage reads/writes (including indexed/member access provenance),
+  internal/external calls, and write/call ordering facts derived from the same
+  AST-or-regex unit used by the existing maps. State dependencies require
+  compatible access paths, so a concrete mapping key does not feed an unrelated
+  caller key; only exact paths and a narrow caller-alias equivalence are joined.
+  Live-reachability clone/address exposures retain stable action identities but
+  do not duplicate these causal payloads; `build_attack_graph` joins the facts
+  back from the referenced cumulative action space in memory.
+  The protocol
+  graph exposes `reads_state`, `writes_state`, `feeds_state_to`, and call edges.
+  `build_attack_graph` composes deterministic writer-to-reader paths of at most
+  three actions and requires a value/right impact sink. Reachability-confirmed
+  paths require an attacker-callable start; source-only paths retain uncertain
+  or apparently gated starts as de-ranked candidates with an explicit
+  reachability blocker and caveat instead of silently suppressing them. The
+  source search hard-caps compatible-access comparisons and successful
+  expansions separately, admits at most 80 paths to a bounded pool, and limits
+  any one start action to eight pooled paths. Starts and final selection rotate
+  across source-file/storage-layout groups so an early dense file cannot consume
+  the entire 20-candidate result. Compatible pooled paths omitted by that result
+  cap remain as compact `causal_path_omissions` frontier entries; budget and
+  fanout exhaustion remain explicit in `causal_search` rather than looking like
+  complete coverage. Paths normally stay within one contract.
+  A bounded inheritance expansion may also connect a base-declared
+  action or state variable to a child entrypoint when the direct base and child
+  declarations are present in the same source file; storage facts retain their
+  declaring-contract provenance, and ambiguous names are omitted. This is not
+  a Solidity linearization engine: it performs no global imported-source or
+  general transitive-base resolution. `super`-qualified dispatch, overloads,
+  and other cross-contract dependencies the lean pass cannot bind remain
+  ordinary graph context and are not guessed.
+  In reachability-aware mode every action must bind to the same
+  `(canonical chain, lowercase address)` live target; equal address bytes on
+  different chains never form one causal or state-transition-model path.
+  Candidate/action metadata and attack keys retain that chain-qualified
+  identity. Legacy chainless artifacts keep address-only behavior only when no
+  concrete chain is known or one chain is unambiguous; a chainless row for an
+  address known on several chains is not guessed. For causal paths,
+  when more than two common targets exist they are ranked by the existing live
+  candidate score, and omitted targets plus truncation counts remain in the
+  causal-search metadata. Source-only paths retain live-context blockers. A
+  source-gated start remains visible for recall, but its card leaves the required
+  `attacker_control` field incomplete, so admission routes it to context work;
+  the candidate is de-ranked and requires live gate/bypass evidence. All
+  causal facts and paths are planning context and are never consumed by evidence
+  or submission gates.
+- Attack-graph topology separates definition identity from deployment identity.
+  A callable definition is represented by its source-stable `action_uid`, while
+  `action_definition_key` remains descriptive metadata and a legacy alias. Clone
+  deployments of the same source action on one chain therefore share
+  definition-to-gate and definition-to-concept edges, but equal signatures from
+  different source files do not collapse into one node. Legacy rows without an
+  `action_uid` retain the compact definition id when unambiguous and receive a
+  deterministic source suffix only when needed to avoid a collision.
+  Reachability-candidate dedupe keys, candidate attack keys, and the resulting
+  controller branch keys use the same `action_uid`-first identity, so equal
+  contract/signature definitions from different files remain separate through
+  scheduling; artifacts without an `action_uid` retain their legacy
+  `action_definition_key` identity.
+  Causal writer/reader dependencies also retain their source-stable action UIDs;
+  reachability-aware `feeds_state_to` edges resolve those endpoints onto the
+  existing UID entrypoint nodes instead of creating disconnected signature-only
+  nodes. Older dependency rows safely fall back to their compact definition
+  endpoints.
+  Contract-to-definition edges and attacker-call edges retain their
+  chain-qualified target metadata, so distinct deployments remain independently
+  inspectable without serializing the same definition-level edge once per clone.
+  The same chain identity scopes reachability-candidate dedupe keys, attack
+  keys, economic motif groups, queue request-to-settlement lifecycles, and
+  lending market/controller selection. Equal addresses or profile names on
+  Base and Ethereum remain separate candidates and cannot provide different
+  legs of one implicit economic sequence. Address-only keys and node ids remain
+  unchanged for genuinely chainless legacy artifacts.
+  When `compose_sequence_experiment` materializes an attack-graph candidate
+  directly, it derives the fork chain from candidate/action metadata or the
+  referenced live-reachability profile. Missing, conflicting, or same-address
+  multichain bindings require an explicit `fork_context`; the composer never
+  substitutes Ethereum mainnet. An explicit context must itself resolve to one
+  chain and must agree with any chain-qualified candidate/action metadata; for
+  a legacy unqualified candidate it must select one of the target's known live
+  chain bindings when present, never an unrelated deployment.
+- Source-definition graph identity. Protocol-graph nodes retain their compact
+  legacy ids when a definition is unique. Overloads and same-named definitions
+  in different files receive deterministic source/signature suffixes, with the
+  legacy id retained as metadata; affected edges are remapped together and
+  ambiguous internal overload calls are left unresolved instead of guessed.
+  Causal state edges honor each fact's declaring-contract provenance (including
+  inherited base state). Writer/reader compatibility work has a separate
+  per-file comparison cap in addition to the emitted-edge cap; affected files
+  and omissions are recorded as truncated/unmapped rather than silently treated
+  as complete.
 - Delexicalized structural affordances. Alongside the lexical
   `_action_affordances` (which keys off names/body substrings like
   deposit/withdraw/oracle/swap), `_structural_action_affordances` derives labels
@@ -589,72 +790,112 @@ The implementation currently supports:
   regex gate gets a softened penalty so a parser misparse cannot silently drop a
   real high-value surface below the candidate score floor. Live-authority and
   AST confirmation both keep the full de-ranking for genuinely privileged paths.
+  Profile source roots are also hard identity boundaries: same-named contracts
+  retained from another profile root never cross-bind. A public action declared
+  in a base contract from another file is executable for a child profile only
+  when the child and each inherited name resolve unambiguously within that same
+  profile root. Live artifacts retain a legacy action key for compatibility and
+  a signature-level `action_definition_key` so overloaded functions remain
+  distinct through live mapping, attack candidates, controller branches, and
+  experiment coverage.
 - Mechanism-aware planning for deployed candidates, including vault/share
   accounting, lending, AMM/oracle, bridge/message, queue/solver, staking, and
-  generic execution surfaces. These are experiment skeletons, not findings.
-  `plan_attack_campaign` skips action-gap (coverage high-attention,
-  hypothesized, open-gap) and protocol-graph hotspot levers whose action key is
-  already decided (rejected/blocked/objective-failed/superseded), mirroring the
-  `attack_search`/`review_campaign_progress` decided-key filter, so resolved
-  branches are not regenerated on every plan call.
+  generic execution surfaces. These are sequence inputs, not findings. Internal
+  controller branch synthesis skips coverage gaps and protocol-graph hotspot
+  levers whose action family is already decided
+  (rejected/blocked/objective-failed/superseded), so resolved branches are not
+  regenerated on every sync. The sequence composer consumes the selected
+  mechanism/state-model guidance directly.
 - Source/context review before harness work for coverage gaps. A coverage gap is
   an unreviewed surface, not an exploit hypothesis. The controller routes
   high-attention coverage gaps through focused source review, campaign-state
-  updates, open questions, parking, or rejection until the branch has an
-  attacker-controlled lever, target/action, value/right/invariant at risk,
-  setup precondition, measurable objective, and any required deployment/fork
-  binding. It must not jump directly from a coverage artifact to a sequence or
-  invariant harness.
+  updates, open questions, parking, or rejection until its structured hypothesis
+  card identifies attacker control, a state path, invariant at risk, impact sink,
+  material preconditions, falsifier, measurable objective, and any required
+  deployment/fork binding. It must not jump directly from a derived coverage gap
+  to a sequence.
+- Exact, batched coverage ownership. Coverage identity is
+  `Contract::signature@source-file`, with the coarser action key retained only
+  for compatibility. The signature-level portion is carried explicitly as
+  `action_definition_key`. Structured identities propagate through hypothesis,
+  experiment, result, and decision lineage; planning scaffolds and meta-artifacts
+  do not count as execution. A bare legacy `Contract::function` text mention is
+  context only when that identity names multiple source definitions, including
+  definitions split across current action-space artifacts; only structured
+  lineage can close one of those definitions. The controller surfaces a bounded
+  set of gaps per sync, preserves parked definitions durably, and advances to
+  later batches rather than reporting readiness after only the first batch. A
+  default branch decision closes only its exact definition. Wider `action_family`,
+  `clone_family`, or `target` propagation must be selected explicitly;
+  `target` additionally requires an objective inventory/binding hard blocker,
+  and decision prose never widens scope.
 - Source review before harness work when live context is empty. After
   `map_live_reachability` has run and bound no deployed profiles, exposed
   actions, source-artifact actions, or target bindings, high-attention coverage
   gaps and existing source-only hypotheses stay in cognitive/core work: source
   slice, record a decision, mutate to a concretely bound branch, or park as
   `parked_needs_live_context`. The controller must not ask for sequence
-  composition, invariant harness composition, workbench preparation, or
-  experiment runs until deployment metadata, chain binding, or fork context
-  exists.
+  composition or experiment runs until deployment metadata, chain binding, or
+  fork context exists. The advanced manual invariant composer remains available
+  only when a researcher explicitly supplies an executable property and concrete
+  handler actions; it is never the controller's fallback for an incomplete card.
 - Audit-loop persistence guards: the agent may not voluntarily stop before
   10000 audit turns unless wrap-up was requested, and a later voluntary stop gets
-  one final `attack_search` plus progress-review readiness check. The agent
-  loop also parses the latest attack-search and progress-review artifacts and
-  blocks voluntary stop only for clear unresolved high-signal work such as
-  ready reviews/submissions, objective-evidence branches, runnable/reduction
-  branches, economically significant live attack-graph branches, or unresolved
-  high-attention coverage gaps that are not merely low-signal helper/mock/test/
-  interface cleanup. During audit turns, the tool executor enforces
+  one final `attack_search` readiness sync. The agent trusts that fresh
+  controller result: a branchless `campaign_ready` action permits stopping only
+  when every controller branch is terminal or ordinarily parked. Any
+  nonterminal, non-parked branch blocks the stop; a campaign containing only
+  ordinary parked branches does not block readiness. A controller-derived
+  integrity limit may remain parked while setting
+  `readiness.blocks_campaign_ready=true` (for example, definitions omitted at
+  the hard map-retention bound); that exception remains actionable and blocks a
+  clean stop until focused coverage or an explicit resolution is recorded.
+  Wrap-up and wall-clock exits invoke that sync
+  directly before reading readiness; a failed or malformed sync fails closed
+  instead of accepting a stale `current.json`. The audit loop consumes the
+  controller-emitted `summary.actionable`/`summary.campaign_ready` contract and
+  does not maintain a second terminal/parked status taxonomy.
+  During audit turns, the tool executor enforces
   the active `attack_search.next_action.tool` for state-creating and submission
-  tools (compose/create/prepare experiments, non-diagnostic run_command,
-  write_file, plan_attack_campaign, map/inventory tools, review_* and
-  submit_finding, etc.). The required tool(s) are read from the next action's
+  tools (sequence composition, non-diagnostic run_command, write_file,
+  map/inventory tools, evidence/report review, submit_finding, etc.). The
+  required tool(s) are read from the next action's
   structured `expected_tools` list or ordered `pipeline` of `{"tool": ...}`
   steps when present, and otherwise from a scan of the free-text `tool` field.
   The controller is deliberately loose for learning/diagnosis and strict for
   claims/submission, so several exceptions exist so it cannot deadlock cognitive
   work the campaign authorised:
   1. An always-allowed cognitive-and-recording surface: `attack_search`,
-     `request_toolset`, `read_campaign`, `review_campaign_progress`,
-     `build_campaign_brief`, `inspect_scope`, `read_file`, `search_code`,
+     `request_toolset`, `read_campaign`, `build_campaign_brief`, `inspect_scope`,
+     `read_file`, `search_code`,
      `source_slice`, `list_files`, `fetch_url`, `web_search`,
-     `update_campaign`, `mutate_hypothesis`, `synthesize_args`, and
-     `diagnose_build` (plus the read-only host-side Alchemy/Etherscan
+     `update_campaign`, `mutate_hypothesis`, `synthesize_args`,
+     `extract_state_transition_model`, and `diagnose_build` (plus the
+     read-only host-side Alchemy/Etherscan
      investigation tools). These either read state, build derived views, record
      observations/pivots/decisions, classify build blockers, or propose
      candidate call arguments — they never invent evidence the submission gates
      rely on, so blocking them only creates deadlocks.
-  2. `run_experiment` whose `command` references the agent's own workspace
-     under `/workspace/experiments/`, and `repair_experiment` (which only ever
-     edits that workspace), are always allowed, so the controller cannot block
-     the agent from repairing or validating an experiment it has already
-     concretized. Non-workspace `run_experiment` usage (cast probes, generic
-     setup) still respects the controller.
+  2. `run_experiment` with a normalized `working_dir` below
+     `/workspace/experiments/`, or a conservatively parsed local `--root` / exact
+     `cd <workspace> && <single Foundry validation>` binding, and
+     `repair_experiment` (which only ever edits that workspace), are always
+     allowed so the controller cannot block validation of an already
+     concretized experiment. A mere workspace-path substring, traversal,
+     unrelated command, general shell chain, unsafe environment assignment, or
+     Foundry artifact/config path override outside scratch roots does not
+     qualify. Non-workspace
+     `run_experiment` usage (cast probes, generic setup) still respects the
+     controller.
   3. A clearly read-only diagnostic `run_command` — `forge build`/`config`/
      `inspect`, `forge test --list`, or `slither` (no shell chaining/expansion;
-     a single redirect only into a `/workspace/` or `/output/` log) — is always
-     allowed so the agent can compile, inspect, list tests, or run static
+     redirects and output paths stay inside dedicated diagnostic scratch roots;
+     controller/state/evidence/report destinations, compiler/config overrides,
+     and Slither execution/mutation/secret-bearing options are rejected) — is
+     always allowed so the agent can compile, inspect, list tests, or run static
      analysis while a different branch is "first". Any other `run_command`
-     (running stateful tests, installs, `cast send`, shell chains) still
-     respects the controller.
+     (running stateful tests, installs, `cast send`, shell chains) still respects
+     the controller.
 
   Progress counters in the run's explored state count successful outcomes, not
   attempted calls: a guard-blocked call, an invalid-arguments re-emit, or a tool
@@ -668,16 +909,18 @@ The implementation currently supports:
   successful sync reveals only the toolsets its selected next_action declares
   (`required_toolsets`) or pins (its `expected_tools`/`pipeline`/`tool`), so a
   single-tool next_action no longer unlocks the whole map+experiment+evidence
-  surface. Activation accumulates and never revokes a toolset the agent already
-  requested, so `request_toolset` stays a durable escape hatch. Because the
+  surface. Each successful sync replaces the prior controller-only activation,
+  while never revoking a toolset the agent explicitly requested, so
+  `request_toolset` stays a durable escape hatch without making every controller
+  transition permanently widen the schema surface. Because the
   always-allowed cognitive tools still respect this visibility (the guard only
   decides what is *blocked*, not what is *shown*), a tool the controller did not
   surface this turn is reached via `request_toolset`.
 
-  Wrap-up or wall-clock stops that still have unresolved high-signal work
-  record `audit_status: incomplete_no_validated_findings` plus
+  Wrap-up or wall-clock stops that do not satisfy the controller readiness
+  contract record `audit_status: incomplete_no_validated_findings` plus
   `final_readiness` in `findings.json`.
-- Fork workbench, sequence, invariant, fuzz, minimization, route-composition,
+- Sequence, advanced manual invariant, fuzz, minimization, route-composition,
   and run-capture helpers. `attack_search` keeps branches out of the run queue
   until target bindings, typed calls, live/manual blockers, and measurable
   objectives are sufficiently concrete. Sequence workspaces are self-contained
@@ -792,7 +1035,7 @@ The implementation currently supports:
   `generic_probe` run (an auto-generated `after != before`/`> before` delta
   guard, recorded as `probe_strength` on the run classification):
   `generic_probe` is setup/context evidence, not objective impact proof, so a
-  stronger artifact — a linked `objective_evaluation`, a preserved sequence
+  stronger artifact — a runtime-validated, run-linked `objective_evaluation`, a preserved sequence
   minimization, or a non-generic execution run — is needed for confidence. These
   caveats do not block readiness by themselves; they keep the weakness visible
   without suppressing a mechanically validated candidate. For a
@@ -900,9 +1143,15 @@ The implementation currently supports:
   as blocked results. They remain useful setup evidence, but they do not satisfy
   experiment execution or create objective-evidence branches.
 - Snapshot, comparison, objective-evaluation, trace-summary, evidence-review,
-  and report-review artifacts. Snapshot comparisons include exact-key objective
-  suggestions so objective evaluation can bind to the observed deltas without
-  fuzzy matching. Evidence review accepts source evidence references such as
+  and report-review artifacts. Snapshot comparisons preserve related campaign
+  ids and include exact-key objective suggestions so objective evaluation can
+  bind to observed deltas without fuzzy matching. Objective evaluations record
+  `objective_achieved` only when every nonempty objective passes; new
+  evaluations inherit the comparison lineage. Legacy artifacts without that
+  flag are accepted only when their complete summary, objective, match, and
+  comparison fields independently derive the same passing status. Evidence
+  review accepts source
+  evidence references such as
   `/audit/src/Vault.sol:42`, can infer affected code only from target source
   roots, and does not treat generated experiment PoCs as affected source. A
   passing PoC is treated as mechanics proof only: for medium/high/critical
@@ -933,19 +1182,29 @@ The implementation currently supports:
   presentation/completeness gaps are also persisted as warnings or confidence
   caveats rather than hard readiness blockers. Evidence review still blocks
   genuinely missing root-cause/impact/source/reproduction/evidence structure,
-  failed or empty validation output without objective evidence, failed
-  minimization evidence, and unvalidated high/critical claims.
+  failed or empty validation output, unrecognized runner output without a
+  separately validated objective evaluation, failed minimization evidence, and
+  unvalidated high/critical claims.
   The `test_output` heuristic is Foundry-aware (`_parse_forge_test_summary`):
   it consumes `Test result: ok. N passed; M failed` lines and `[PASS]`/`[FAIL]`
   per-test markers, so a passing suite using `vm.expectRevert` is never
-  classified as a failure on the basis of substring keywords. A non-empty
-  `objective_evaluation` reference downgrades the `test_output` heuristic
-  warning from blocker to warning at every gate site (`_finding_review_gap_summary`,
-  `_review_report_quality`, `_submission_review_blockers`, and the
-  `_submit_finding` contradiction check), consistent with
-  `_high_impact_objective_warnings`, which treats absent objective artifacts as
-  a confidence caveat for high/critical findings. The warning still appears in
-  the finding's `system_note` so reviewers can inspect.
+  classified as a failure on the basis of substring keywords. Arbitrary
+  nonempty text has no pass signal and fails closed. A legitimate custom or
+  non-Foundry runner may use an objective evaluation as the alternate signal,
+  but only after the runtime resolves a direct `eval-NNN` campaign artifact,
+  reloads its comparison, verifies internally consistent objective math and an
+  achieved objective, confirms the eval id/path are linked in
+  `campaign_ids`/`evidence`, and proves shared lineage to a successful,
+  objective-capable result for the same experiment. The same validated marker
+  controls high-impact and partial/generic-probe caveat suppression, report
+  review, submission, and exposure classification; raw reference truthiness is
+  never trusted. Submission revalidates the artifact and requires the evidence
+  and report reviews to have checked the same evaluation/lineage. This alternate
+  applies only to a nonempty custom-runner output with no recognized pass or
+  failure signal. A structured Foundry failure, zero-test run, explicit failed
+  count, or failure/error output always blocks or demotes validation even when
+  the objective evaluation passes. Any downgraded custom-runner warning still
+  appears in the finding's `system_note` so reviewers can inspect it.
 - Submission caveat preservation. Because many exploitability and proof-strength
   gaps are warnings rather than hard blockers, `submit_finding` copies linked
   evidence-review and report-review warnings into the final finding as
@@ -970,7 +1229,7 @@ classifiers and should not be treated as proof of exploitability by themselves.
 Highest-value improvements:
 
 1. **Attack-graph fork-test completion**
-   Generated attack-graph-to-workbench-to-sequence materialization now records
+   Direct attack-graph-to-sequence materialization now records
    whether the scaffold can execute and whether objective assertions are still
    missing, but workspaces still need stronger live precondition resolution,
    calldata inference, and protocol-specific objective assertions.
@@ -1009,8 +1268,9 @@ Highest-value improvements:
    are rejected with evidence.
 
 5. **Implementation decomposition**
-   `tools.py` is being split into the modules below. `tool_schemas.py` and
-   `host_tools.py` are extracted; the remaining campaign core is a
+   `tools.py` is being split into the modules below. `tool_schemas.py`,
+   `host_tools.py`, and the campaign-state foundation are extracted, as are
+   the base workspace primitives. The remaining campaign core is a
    tightly-coupled component that needs staged, cycle-aware extraction. The
    working plan, measured dependency structure, and ordering live in
    `docs/tools-split-plan.md`.
@@ -1031,18 +1291,18 @@ Module split (status and ordering tracked in `docs/tools-split-plan.md`):
 - `dispatcher.py`: tool dispatch and parallel-safety metadata. Keep `execute_tool`
   in the `tools.py` facade until the impl modules land.
 - `campaign_state.py`: state file loading, saving, ids, summaries, and the
-  state-only coverage/progress/brief helpers. **Extracted** as a foundation leaf
-  (imports only `AuditContainer` + stdlib); cross-controller orchestrators
-  (`_review_campaign_progress`, `_build_campaign_brief`, trace writers) stay in
-  core.
+  state-only derived progress/coverage and brief helpers. **Extracted** as a
+  foundation leaf (imports only `AuditContainer` + stdlib); the controller-aware
+  brief projection and trace writers stay in core.
 - `attack_search.py`: deterministic branch queue and next-action logic.
 - `source_mapping.py`: scope inspection, source roots, protocol graphs, action
-  spaces, and coverage review.
+  spaces, causal facts/edges, and derived coverage inputs.
 - `live_reachability.py`: deployed profile binding, RPC probes, profile
   families, and attack graph input.
 - `economics.py`: fork context, AMM, flash-loan, and lending-health estimates.
-- `experiments.py`: experiment creation, sequence/invariant scaffolds,
-  execution capture, fuzz capture, sequence extraction, and minimization.
+- `experiments.py`: sequence composition/concretization, advanced manual
+  invariant scaffolds, execution capture, fuzz capture, sequence extraction, and
+  minimization.
 - `evidence_review.py`: snapshots, comparisons, objective evaluation, trace
   summaries, evidence review, report review, and finding submission gates.
 - `workspace_tools.py`: list/read/write/run shell tools plus host web
@@ -1062,7 +1322,8 @@ Additional cleanup:
 - Delete local generated `findings-*` run outputs, logs, caches, and virtualenvs
   before committing. `.gitignore` already excludes the common generated paths.
 - Prefer enriching an existing artifact over inventing a new one. Add fields
-  only when a planner, scaffold, evidence gate, or report gate consumes them.
+  only when the controller, a scaffold, an evidence gate, or a report gate
+  consumes them.
 
 ## Architecture Guardrails
 
@@ -1084,7 +1345,7 @@ framework:
   and test the issue itself.
 - Prefer consolidation over expansion once a capability exists: remove duplicate
   prompt text, share helper logic, and tighten evidence flow before creating
-  another artifact or planner branch.
+  another artifact or parallel controller branch.
 
 ## Settled Defaults
 
@@ -1093,5 +1354,5 @@ framework:
 - Generate experiments under `/workspace/experiments` unless the target build
   requires repo-local tests.
 - Keep terminal/report output as the primary interface for now.
-- Prefer protocol models, invariants, action maps, planner briefs, and
-  experiments over hard-coded exploit taxonomies.
+- Prefer protocol models, invariants, action maps, controller branch dossiers,
+  and experiments over hard-coded exploit taxonomies.

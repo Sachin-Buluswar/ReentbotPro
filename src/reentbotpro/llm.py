@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
-DEFAULT_MODEL = "gpt-5.5"
+DEFAULT_MODEL = "gpt-5.6-sol"
 
 OPENAI_API_BASE_URL = "https://api.openai.com/v1"
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
@@ -33,7 +33,7 @@ OAUTH_SCOPE = "openid profile email offline_access"
 CODEX_ORIGINATOR = os.environ.get("REENTBOTPRO_CODEX_ORIGINATOR", "pi")
 TOKEN_REFRESH_MARGIN_SECONDS = 120
 
-REASONING_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh")
+REASONING_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
 @dataclass(frozen=True)
@@ -57,44 +57,28 @@ class ReasoningResolution:
 
 
 _API_MODEL_SETTINGS = {
-    "gpt-5.5": ModelSettings(
+    # GPT-5.6 API models share the same published context/output limits and
+    # reasoning-effort surface. ReentbotPro keeps xhigh as its quality-first
+    # audit default; the API default when effort is omitted is medium.
+    "gpt-5.6-sol": ModelSettings(
         context_window=1_050_000,
-        reasoning_efforts=("low", "medium", "high", "xhigh"),
+        reasoning_efforts=("none", "low", "medium", "high", "xhigh", "max"),
         default_reasoning="xhigh",
     ),
-    "gpt-5.4-pro": ModelSettings(
+    "gpt-5.6-terra": ModelSettings(
         context_window=1_050_000,
-        reasoning_efforts=("medium", "high", "xhigh"),
+        reasoning_efforts=("none", "low", "medium", "high", "xhigh", "max"),
         default_reasoning="xhigh",
     ),
-    "gpt-5.4-mini": ModelSettings(context_window=400_000),
-    "gpt-5.4-nano": ModelSettings(context_window=400_000),
-    "gpt-5.4": ModelSettings(context_window=1_050_000),
-    "gpt-5.3-codex": ModelSettings(
-        context_window=400_000,
-        reasoning_efforts=("low", "medium", "high", "xhigh"),
+    "gpt-5.6-luna": ModelSettings(
+        context_window=1_050_000,
+        reasoning_efforts=("none", "low", "medium", "high", "xhigh", "max"),
         default_reasoning="xhigh",
     ),
     "gpt-5.3-codex-spark": ModelSettings(
         context_window=128_000,
         reasoning_efforts=("low", "medium", "high", "xhigh"),
         default_reasoning="xhigh",
-    ),
-    "gpt-5.2-codex": ModelSettings(
-        context_window=400_000,
-        reasoning_efforts=("low", "medium", "high", "xhigh"),
-        default_reasoning="xhigh",
-    ),
-    "gpt-5.2": ModelSettings(context_window=400_000),
-    "gpt-5.1": ModelSettings(
-        context_window=400_000,
-        reasoning_efforts=("none", "low", "medium", "high"),
-        default_reasoning="high",
-    ),
-    "gpt-5": ModelSettings(
-        context_window=400_000,
-        reasoning_efforts=("minimal", "low", "medium", "high"),
-        default_reasoning="minimal",
     ),
     # Non-OpenAI models served via OpenRouter (OPENAI_BASE_URL override, API-key
     # path). Listed for correct context-window budgeting; reasoning effort is
@@ -116,46 +100,31 @@ _API_MODEL_SETTINGS = {
     "google/gemini-3.5-flash": ModelSettings(context_window=1_048_576),
     "xiaomi/mimo-v2.5-pro": ModelSettings(context_window=1_048_576),
     "qwen/qwen3.7-max": ModelSettings(context_window=1_000_000),
-    "tencent/hy3-preview": ModelSettings(context_window=262_144),
-    "nex-agi/nex-n2-pro:free": ModelSettings(context_window=262_144),
     "moonshotai/kimi-k2.7-code": ModelSettings(context_window=262_144),
 }
 
 _CODEX_MODEL_SETTINGS = {
-    # The Codex (ChatGPT OAuth) backend hard-caps gpt-5.5 at 272k
-    # (max_context_window in the Codex catalog, codex-rs/models-manager/models.json).
-    # Unlike the OpenAI API's 1.05M window, 1M context is NOT available for gpt-5.5
-    # on the subscription; requesting it causes "exceeds context window" errors.
-    "gpt-5.5": ModelSettings(
+    # The live Codex catalog hard-caps each GPT-5.6 variant at 272k. Unlike the
+    # OpenAI API's 1.05M window, the larger context is not available through
+    # ChatGPT/Codex OAuth. Ultra is a separate multi-agent mode, not a raw
+    # Responses API reasoning effort supported by this harness.
+    "gpt-5.6-sol": ModelSettings(
         context_window=272_000,
-        reasoning_efforts=("low", "medium", "high", "xhigh"),
+        reasoning_efforts=("low", "medium", "high", "xhigh", "max"),
         default_reasoning="xhigh",
     ),
-    # The Codex catalog advertises gpt-5.4 with a 272k default window and a
-    # 1,000,000-token max_context_window. ReentbotPro is an autonomous long-runner,
-    # so use the advertised maximum by default for this model.
-    "gpt-5.4": ModelSettings(
-        context_window=1_000_000,
-        reasoning_efforts=("low", "medium", "high", "xhigh"),
+    "gpt-5.6-terra": ModelSettings(
+        context_window=272_000,
+        reasoning_efforts=("low", "medium", "high", "xhigh", "max"),
         default_reasoning="xhigh",
     ),
-    "gpt-5.4-mini": ModelSettings(
+    "gpt-5.6-luna": ModelSettings(
         context_window=272_000,
-        reasoning_efforts=("low", "medium", "high", "xhigh"),
-        default_reasoning="xhigh",
-    ),
-    "gpt-5.3-codex": ModelSettings(
-        context_window=272_000,
-        reasoning_efforts=("low", "medium", "high", "xhigh"),
+        reasoning_efforts=("low", "medium", "high", "xhigh", "max"),
         default_reasoning="xhigh",
     ),
     "gpt-5.3-codex-spark": ModelSettings(
         context_window=128_000,
-        reasoning_efforts=("low", "medium", "high", "xhigh"),
-        default_reasoning="xhigh",
-    ),
-    "gpt-5.2": ModelSettings(
-        context_window=272_000,
         reasoning_efforts=("low", "medium", "high", "xhigh"),
         default_reasoning="xhigh",
     ),
@@ -164,6 +133,12 @@ _CODEX_MODEL_SETTINGS = {
 _MODEL_SETTINGS_BY_PROVIDER = {
     OPENAI_API_PROVIDER: _API_MODEL_SETTINGS,
     OPENAI_CODEX_PROVIDER: _CODEX_MODEL_SETTINGS,
+}
+
+_MODEL_ALIASES = {
+    # Official GPT-5.6 alias; keep aliases out of the registry so model
+    # membership remains the set of concrete model ids.
+    "gpt-5.6": "gpt-5.6-sol",
 }
 
 # Unknown / un-tabulated models (including non-OpenAI OpenRouter models without an
@@ -188,7 +163,8 @@ def get_model_settings(
 
     Matches the full id first (so namespaced OpenRouter entries like
     ``minimax/minimax-m3`` win), then retries with the bare id after a leading
-    ``vendor/`` prefix (so ``openai/gpt-5.4`` resolves to ``gpt-5.4``), matching
+    ``vendor/`` prefix (so ``openai/gpt-5.6-sol`` resolves to
+    ``gpt-5.6-sol``), matching
     dated ``-20xx`` snapshots by prefix. Unknown models fall back to a
     conservative window to avoid over-sizing a smaller real context window.
     """
@@ -200,6 +176,7 @@ def get_model_settings(
     candidates = [model_name]
     if "/" in model_name:
         candidates.append(model_name.split("/", 1)[1])
+    candidates = [_MODEL_ALIASES.get(candidate, candidate) for candidate in candidates]
     for candidate in candidates:
         for key in sorted(settings_by_model, key=len, reverse=True):
             if candidate == key or candidate.startswith(f"{key}-20"):
@@ -218,11 +195,24 @@ def resolve_reasoning_effort(
     supported = settings.reasoning_efforts
 
     if requested_effort in supported:
-        api_effort = None if requested_effort == "none" else requested_effort
-        return ReasoningResolution(requested_effort, requested_effort, api_effort)
+        # `none` is an explicit supported API value. Omitting the reasoning
+        # field would select the provider/model default (medium for GPT-5.6),
+        # which is observably different from the user's request.
+        return ReasoningResolution(
+            requested_effort,
+            requested_effort,
+            requested_effort,
+        )
 
-    fallback = _nearest_reasoning_effort(requested_effort, supported)
-    api_effort = None if fallback == "none" else fallback
+    if requested_effort not in REASONING_ORDER:
+        fallback = (
+            settings.default_reasoning
+            if settings.default_reasoning in supported
+            else _nearest_reasoning_effort(settings.default_reasoning, supported)
+        )
+    else:
+        fallback = _nearest_reasoning_effort(requested_effort, supported)
+    api_effort = fallback if supported else None
     model_name = model or DEFAULT_MODEL
     note = (
         f"{model_name} does not support reasoning effort '{requested_effort}'; "

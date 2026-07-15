@@ -13,6 +13,7 @@ from rich.panel import Panel
 
 from reentbotpro.agent import (
     DEFAULT_MAX_TIME_MINUTES,
+    _report_visible_tools,
     calculate_max_context,
     chat_loop,
     get_model_max_output_tokens,
@@ -55,12 +56,15 @@ def _resolve_context_budgets(
     full-tool reserve (``calculate_max_context``) and ``max_context_is_user_cap``
     is False, so run_audit may reclaim the unused tool-schema space per turn from
     ``context_window`` (a demand-driven turn sends far fewer than the full tool
-    set). With an explicit cap it is a hard ceiling: both budgets are clamped to
-    it so the user's limit is always honored. The report phase keeps its larger
-    output reserve, so its budget is the smaller of the two.
+    set). The report budget reserves only the small read/write schema surface it
+    actually sends. With an explicit cap it is a hard ceiling: both budgets are
+    clamped to it so the user's limit is always honored. The report phase also
+    keeps its larger output reserve, so its history budget can still be smaller.
     """
     report_budget = calculate_max_context(
-        context_window, output_reserve=report_output_reserve
+        context_window,
+        output_reserve=report_output_reserve,
+        tools=_report_visible_tools(),
     )
     if user_max_context is not None:
         return user_max_context, min(user_max_context, report_budget), True
@@ -991,7 +995,10 @@ async def _run(
 )
 @click.option(
     "--reasoning", default=None,
-    type=click.Choice(["none", "minimal", "low", "medium", "high", "xhigh"], case_sensitive=False),
+    type=click.Choice(
+        ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+        case_sensitive=False,
+    ),
     help="OpenAI reasoning effort; unsupported values are adjusted for the selected model",
 )
 @click.option("--login", "force_login", is_flag=True, help="Force a fresh ChatGPT/Codex browser login")

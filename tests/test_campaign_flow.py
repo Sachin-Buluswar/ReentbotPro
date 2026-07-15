@@ -3,14 +3,14 @@ import unittest
 
 from reentbotpro.tools import (
     _CAMPAIGN_STATE_PATH,
+    _attack_search,
     _compare_snapshots,
+    _complete_sequence_experiment,
     _compose_sequence_experiment,
     _evaluate_objective,
     _map_action_space,
     _mutate_hypothesis,
-    _plan_attack_campaign,
     _record_fork_context,
-    _review_attack_surface_coverage,
     _review_finding_evidence,
     _review_report_quality,
     _run_experiment,
@@ -275,35 +275,75 @@ contract DonationVault {
         )
         self.assertIn("// donationVault.donate(donationAmount);", sequence_contract)
 
-        coverage = _json_result(await _review_attack_surface_coverage(container, {
-            "action_space": "as-001",
-            "title": "DonationVault campaign coverage",
-            "focus_contracts": ["DonationVault"],
-            "record_result": False,
-        }))
-        self.assertEqual(coverage["summary"]["reviewed"], 3)
-        self.assertEqual(coverage["summary"]["covered"], 3)
-        self.assertEqual(coverage["summary"]["high_attention_gaps"], 0)
-        self.assertIn(
-            "/workspace/campaign/coverage-reviews/cov-001.json",
-            container.files,
-        )
-        campaign_plan = _json_result(await _plan_attack_campaign(container, {
-            "title": "DonationVault next campaign branch",
+        controller = _json_result(await _attack_search(container, {
+            "action": "sync",
             "focus": "donation redeem",
-            "coverage_review": "cov-001",
             "record_result": False,
         }))
-        self.assertEqual(campaign_plan["plan_id"], "plan-001")
-        self.assertEqual(campaign_plan["summary"]["branches"], 1)
+        experiment_branch = next(
+            branch
+            for branch in controller["active_branches"]
+            if branch["source"] == "experiment_without_result"
+        )
         self.assertEqual(
-            campaign_plan["branches"][0]["recommended_next_tool"],
-            "run_experiment",
+            experiment_branch["next_tool"],
+            "complete_sequence_experiment",
         )
-        self.assertIn(
-            "/workspace/campaign/plans/plan-001.json",
-            container.files,
+        selected = _json_result(await _attack_search(container, {
+            "action": "select",
+            "branch_id": experiment_branch["id"],
+            "record_result": False,
+        }))
+        self.assertEqual(selected["next_action"]["branch_id"], experiment_branch["id"])
+        self.assertEqual(
+            selected["next_action"]["tool"],
+            "complete_sequence_experiment",
         )
+        controller_text = json.dumps(selected, sort_keys=True)
+        for retired_tool in (
+            "plan_attack_campaign",
+            "prepare_fork_exploit_workbench",
+            "review_attack_surface_coverage",
+            "review_campaign_progress",
+        ):
+            self.assertNotIn(retired_tool, controller_text)
+
+        completion = _json_result(await _complete_sequence_experiment(container, {
+            "sequence": "exp-001",
+            "target_addresses": {"USDC": usdc},
+            "observations": [{
+                "label": "vault total assets",
+                "contract": "DonationVault",
+                "function": "totalAssets",
+                "returns": "uint256",
+            }],
+            "actions": [
+                {
+                    "actor": "attacker",
+                    "contract": "DonationVault",
+                    "function": "donate",
+                    "args": ["1000000"],
+                    "expected_effect": "increase vault assets without minting shares",
+                },
+                {
+                    "actor": "attacker",
+                    "contract": "DonationVault",
+                    "function": "deposit",
+                    "args": ["1"],
+                    "expected_effect": "mint shares using donated balance",
+                },
+                {
+                    "actor": "attacker",
+                    "contract": "DonationVault",
+                    "function": "redeem",
+                    "args": ["1"],
+                    "expected_effect": "return more assets than the deposit amount",
+                },
+            ],
+            "objective_probe_strategy": "accounting_delta",
+            "record_result": False,
+        }))
+        self.assertTrue(completion["scaffold_quality"]["runnable"], completion)
 
         forge_output = """
 [PASS] test_donation_deposit_redeem_profit() (gas: 210000)
@@ -382,7 +422,13 @@ Suite result: ok. 1 passed; 0 failed; 0 skipped
                 "price_usd": "1",
                 "role": "attacker",
             }],
-            "related_ids": ["hyp-001", "exp-001", "cmp-001", "trace-001"],
+            "related_ids": [
+                "hyp-001",
+                "exp-001",
+                "res-002",
+                "cmp-001",
+                "trace-001",
+            ],
         }))
         self.assertEqual(evaluation["evaluation_id"], "eval-001")
         self.assertEqual(evaluation["summary"]["passed"], 1)
@@ -430,6 +476,13 @@ Suite result: ok. 1 passed; 0 failed; 0 skipped
         self.assertEqual(review["review_id"], "fr-001")
         self.assertTrue(review["ready"])
         self.assertEqual(review["blocking_gaps"], [])
+
+        finding_ready = _json_result(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
+        self.assertEqual(finding_ready["next_action"]["tool"], "review_report_quality")
+        self.assertEqual(finding_ready["next_action"]["source"], "ready_finding_review")
 
         report_review = _json_result(await _review_report_quality(container, {
             "title": "Donation accounting lets attacker redeem more assets than deposited",
@@ -503,6 +556,17 @@ Suite result: ok. 1 passed; 0 failed; 0 skipped
         self.assertTrue(report_review["ready"])
         self.assertEqual(report_review["blocking_gaps"], [])
 
+        report_ready = _json_result(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
+        self.assertEqual(
+            report_ready["next_action"]["tool"],
+            "submit_finding",
+            report_ready,
+        )
+        self.assertEqual(report_ready["next_action"]["source"], "ready_report_review")
+
         findings: list[dict] = []
         submit = _submit_finding({
             "title": "Donation accounting lets attacker redeem more assets than deposited",
@@ -559,6 +623,15 @@ Suite result: ok. 1 passed; 0 failed; 0 skipped
         self.assertEqual(len(state["sections"]["hypothesis"]), 1)
         self.assertEqual(len(state["sections"]["experiment"]), 1)
         self.assertGreaterEqual(len(state["sections"]["result"]), 8)
+        for legacy_directory in (
+            "/workspace/campaign/coverage-reviews/",
+            "/workspace/campaign/fork-workbenches/",
+            "/workspace/campaign/plans/",
+            "/workspace/campaign/progress-reviews/",
+        ):
+            self.assertFalse(any(
+                path.startswith(legacy_directory) for path in container.files
+            ))
 
     async def test_failed_objective_can_mutate_campaign_without_losing_lineage(self):
         container = FakeContainer()
@@ -624,7 +697,7 @@ Suite result: ok. 1 passed; 0 failed; 0 skipped
         }))
         self.assertEqual(mutation["mutation_id"], "mut-001")
         self.assertEqual(mutation["mutations"][0]["hypothesis_id"], "hyp-002")
-        self.assertEqual(mutation["mutations"][0]["experiment_id"], "exp-001")
+        self.assertNotIn("experiment_id", mutation["mutations"][0])
 
         state = json.loads(container.files[_CAMPAIGN_STATE_PATH])
         source = state["sections"]["hypothesis"][0]
@@ -632,5 +705,5 @@ Suite result: ok. 1 passed; 0 failed; 0 skipped
         self.assertEqual(source["status"], "rejected")
         self.assertIn("mut-001", source["related_ids"])
         self.assertEqual(state["sections"]["hypothesis"][1]["id"], "hyp-002")
-        self.assertEqual(state["sections"]["experiment"][0]["id"], "exp-001")
+        self.assertEqual(state["sections"]["experiment"], [])
         self.assertEqual(state["sections"]["open_question"][0]["id"], "oq-001")

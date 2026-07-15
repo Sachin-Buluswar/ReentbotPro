@@ -1,8 +1,8 @@
 # `tools.py` Split Plan
 
 This is the working plan for decomposing `src/reentbotpro/tools.py` into the
-modules named in `CLAUDE.md` (cleanup priority #1) and
-`docs/attack-campaign-engine.md`. It records the **actual** dependency structure
+modules described below and in `docs/attack-campaign-engine.md`. It records the
+**actual** dependency structure
 of the file (measured, not assumed), what has already been extracted, and the
 staged, cycle-aware order for the rest.
 
@@ -13,22 +13,22 @@ Keep this in sync with the code as modules land.
 | Module | State | Lines moved | Notes |
 | --- | --- | --- | --- |
 | `tool_schemas.py` | **done** | ~4.3k | Clean leaf: `TOOLS`, toolset defs, `_compact_*`, `expand/tool_names/tools_for_toolsets`. Imports nothing internal. |
-| `host_tools.py` | **done** | ~2.0k | Alchemy + Etherscan + redaction + runtime. Self-contained sink; lazy-imports the 5 core helpers it reuses. |
+| `host_tools.py` | **done** | ~2.0k | Alchemy + Etherscan + redaction + runtime. Self-contained sink; lazy-imports the small core-helper surface it reuses. |
 | `dispatcher.py` | pending | — | `execute_tool` references ~55 impl symbols; keep in the `tools.py` facade until the impl modules land. |
-| `campaign_state.py` | **done** | ~1.3k | Foundation leaf: state load/save, ids, entry helpers, derived summaries, coverage/progress/brief helpers that depend only on the state file. True leaf (imports only `AuditContainer` + stdlib). 8 cross-controller orchestrators (`_review_campaign_progress`, `_build_campaign_brief`, `_append_campaign_trace`, `_compact_trace_value`, and 4 progress/coverage fns that reach into the controller/experiments) stay in core. |
-| `economics.py` | pending | ~1.8k | **Not a clean leaf** — cyclic with `attack_search`/`experiments`. Needs cycle-breaking. |
-| `source_mapping.py` | pending | ~2k+ | AST extraction, parsed-file model, protocol graphs, action spaces. Untested low-level helpers. |
-| `live_reachability.py` | pending | ~1.3k | Reachability classify, profile binding, attack-graph input. Cyclic with `attack_search`. |
-| `experiments.py` | pending | ~7.7k | Largest sub-mass. Scaffolds, run capture, fuzz, minimization, mutation. Cyclic with `attack_search`/`campaign_state`. |
-| `evidence_review.py` | pending | ~1.8k | Gates: finding/report review, submit. Depends on `experiments`/`source_mapping` loaders. |
+| `campaign_state.py` | **done** | ~1.1k | Foundation leaf: state load/save, ids, entry helpers, structured hypothesis-card normalization, and state-only derived summaries. True leaf (imports only `AuditContainer` + stdlib). Controller-aware brief projection, trace writing, and derived coverage orchestration stay in core. |
+| `economics.py` | pending | remeasure at extraction | **Not a clean leaf** — cyclic with `attack_search`/`experiments`. Needs cycle-breaking. |
+| `source_mapping.py` | pending | remeasure at extraction | AST extraction, parsed-file model, protocol graphs, action spaces, bounded causal facts/edges/paths, and derived coverage inputs. Low-level helpers need direct characterization before moving. |
+| `live_reachability.py` | pending | remeasure at extraction | Reachability classify, profile binding, attack-graph input. Cyclic with `attack_search`. |
+| `experiments.py` | pending | remeasure at extraction | Largest sub-mass. Direct attack-graph sequence composition with integrated mechanism/state-model guidance, advanced manual invariant scaffolds, run capture, fuzz, minimization, and mutation. Cyclic with `attack_search`/`campaign_state`. |
+| `evidence_review.py` | pending | remeasure at extraction | Gates: finding/report review, submit. Depends on `experiments`/`source_mapping` loaders. |
 | `workspace_tools.py` | **done (base primitives)** | ~0.2k | 7 file/shell/web primitives (`_truncate`, `_read_file`, `_write_file`, `_list_files`, `_run_command`, `_web_search`, `_fetch_url`) + the `_FIND_PRUNE_*` prune constants extracted as a base layer (imports only stdlib + `AuditContainer`, re-exported from the facade). `_search_code` and `_inspect_scope` deferred: they pull the action-source-path / `source_mapping` helpers, which belong with that split. |
 
-Despite the completed extractions, `tools.py` is currently **~43.5k lines** — it
+Despite the completed extractions, `tools.py` is currently **~49.8k lines** — it
 has *grown* well past its pre-split size because substantial tooling landed after
 the split paused (host-side Alchemy/Etherscan investigation, observed-tx mining,
 economics estimators, and richer experiment scaffolds). Four extractions have
-moved ~7.8k lines out (`tool_schemas` ~4.3k, `host_tools` ~2.0k, `campaign_state`
-~1.3k, and the `workspace_tools` base primitives ~0.2k). What remains in the
+moved ~7.6k lines out (`tool_schemas` ~4.3k, `host_tools` ~2.0k, `campaign_state`
+~1.1k, and the `workspace_tools` base primitives ~0.2k). What remains in the
 single file is the tightly-coupled campaign core (`attack_search`, `economics`,
 `source_mapping`, `live_reachability`, `experiments`, `evidence_review`, plus the
 `dispatcher` and the `_search_code`/`_inspect_scope` remainder of
@@ -55,22 +55,23 @@ leaf that depends on core.
 
 Consequence: the remaining modules **cannot be split by moving code alone** — a
 naive move produces import cycles that fail at load time. Each remaining module
-needs one of the cycle-breaking techniques below. This is why only the two
-genuinely-acyclic pieces (`tool_schemas`, `host_tools`) were extracted as
-mechanical moves; the rest is staged with explicit dependency surgery.
+needs one of the cycle-breaking techniques below. The acyclic pieces were
+extracted first (`tool_schemas`, `host_tools`, the campaign-state foundation,
+and the workspace base primitives); the rest is staged with explicit dependency
+surgery.
 
 ### What makes a piece "cleanly extractable today"
 
 A symbol set `S` is a safe mechanical move when **no non-`S` core symbol
 references into `S`** (a sink) or **`S` references no core symbol** (a leaf), and
 its test coupling is understood. `tool_schemas` is a pure leaf; `host_tools` is a
-sink whose only inbound edge is `execute_tool` and whose only outbound edges are
-5 low-level helpers (made lazy). Everything else currently fails this test.
+sink whose only inbound edge is `execute_tool` and whose small set of outbound
+low-level helper imports is lazy. Everything else currently fails this test.
 
 ## Cycle-breaking techniques (in order of preference)
 
 1. **Lazy (function-local) imports at the few back-edge call sites.** Used for
-   `host_tools` (5 sites). Best when the cross-module references are few and at
+   `host_tools`. Best when the cross-module references are few and at
    call time, not module load time. Keeps the module importable in any order.
 2. **A `campaign_state` foundation module imported by everyone.** Most cycles
    route through campaign-state load/save/id/trace helpers. Extracting
@@ -92,7 +93,7 @@ helpers, not a hidden structural cycle.)
 ## The facade contract (how nothing breaks)
 
 `tools.py` stays the public module. The rest of the codebase and the tests
-import ~60 public **and private** names from `reentbotpro.tools`
+import many public **and private** names from `reentbotpro.tools`
 (`agent.py`, `cli.py`, `tests/`). Each extracted module is re-exported from
 `tools.py` so every `from reentbotpro.tools import X` keeps working.
 
@@ -109,7 +110,7 @@ import ~60 public **and private** names from `reentbotpro.tools`
 Tests patch module attributes with `mock.patch.object(<module>, name)`. Because
 patching rebinds the name on the *patched* module's namespace, the patch must
 target the module where the **callee looks the name up**, not the facade. When a
-patched function moves, repoint its patch sites in lockstep (done for the 24
+patched function moves, repoint its patch sites in lockstep (done for the
 `_alchemy_http_post` / `_etherscan_http_get` sites → `host_tools`, plus the
 `_ALCHEMY_USAGE` state reads). Run the suite with the patch active and assert the
 mock was called so a silent no-op patch fails loudly.
@@ -117,8 +118,8 @@ mock was called so a silent no-op patch fails loudly.
 ## Pre-move characterization tests (do before each risky module)
 
 The integration suite masks drift in low-level helpers. Before moving
-`source_mapping` / `attack_search`, add direct tests for the currently-untested
-helpers a move could silently break:
+`source_mapping` / `attack_search`, keep existing direct characterization and
+add it for any remaining helpers a move could silently break:
 
 - AST offset/slicing: `_ast_byte_to_char` (multibyte UTF-8), `_ast_type_string`
   (array/mapping/struct), `_action_stable_uid`, `_action_logical_key`.
@@ -126,26 +127,25 @@ helpers a move could silently break:
   `_attack_search_branch_action_key_set`, `_candidate_clone_fingerprint`,
   `_attack_search_new_id`.
 
-These govern branch supersession and AST keying and have no direct coverage
-today; a behavior-preserving move must keep them byte-identical.
+These govern branch supersession and AST keying; a behavior-preserving move must
+preserve their tested behavior.
 
 ## Recommended remaining order
 
 1. **`campaign_state.py`** (foundation) — **done**. The closed leaf subset was
    computed by fixpoint (drop any section symbol that references outside the
-   set, repeat) and extracted per-symbol since it is non-contiguous. The 8
-   cross-controller orchestrators that reach into the controller/experiments
-   (`_review_campaign_progress`, `_build_campaign_brief`, `_append_campaign_trace`,
-   `_compact_trace_value`, and the progress/coverage fns that query controller
-   state) stay in core and re-import the leaf. Note: a few action/coverage
-   constants physically grouped in the original "Attack campaign state" section
-   moved with it (faithful to the original grouping).
+   set, repeat) and extracted per-symbol since it is non-contiguous.
+   Controller-aware brief projection, trace writing, and derived coverage logic
+   stay in core and re-import the leaf. Note: a few action/coverage constants
+   physically grouped in the original "Attack campaign state" section moved
+   with it (faithful to the original grouping).
 2. **`economics.py`** — after `campaign_state`. Lazy-import the few
    `attack_search`/`experiments` back-edges; the rest of its deps become
    `→ campaign_state`.
 3. **`source_mapping.py`** + **`live_reachability.py`** — after the AST/identity
-   characterization tests land. `live_reachability` stays a mandatory map input;
-   only its file location moves.
+   characterization tests land. Live reachability remains the controller-routed
+   deployed-context input; source-only mapping degrades explicitly when it is
+   unavailable. Only the implementation's file location moves.
 4. **`experiments.py`** — largest mass. Externalize the forge-std `Test.sol`
    shim and `foundry.toml` into `reentbotpro/templates/` via
    `importlib.resources`, and add the templates dir to package-data, or the

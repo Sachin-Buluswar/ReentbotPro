@@ -358,11 +358,6 @@ def _tool_summary(name: str, args: dict) -> str:
             if len(reason) > 50:
                 reason = reason[:47] + "..."
             return f"{toolset}{f': {reason}' if reason else ''}"
-        case "create_experiment":
-            title = args.get("title", "?")
-            if len(title) > 50:
-                title = title[:47] + "..."
-            return f"{args.get('template', 'blank')}: {title}"
         case "run_experiment":
             cmd = args.get("command", "?")
             if len(cmd) > 80:
@@ -458,12 +453,6 @@ def _tool_summary(name: str, args: dict) -> str:
             if len(title) > 60:
                 title = title[:57] + "..."
             return title
-        case "review_campaign_progress":
-            focus = args.get("focus", "")
-            title = args.get("title", "campaign progress")
-            if len(title) > 50:
-                title = title[:47] + "..."
-            return f"{title}{f' ({focus})' if focus else ''}"
         case "build_campaign_brief":
             focus = args.get("focus", "")
             title = args.get("title", "campaign resume brief")
@@ -486,18 +475,6 @@ def _tool_summary(name: str, args: dict) -> str:
             if len(path) > 70:
                 path = path[:67] + "..."
             return path
-        case "review_attack_surface_coverage":
-            title = args.get("title", "attack surface coverage")
-            action_space = args.get("action_space", "?")
-            if len(title) > 50:
-                title = title[:47] + "..."
-            return f"{title} ({action_space})"
-        case "plan_attack_campaign":
-            title = args.get("title", "attack campaign plan")
-            focus = args.get("focus", "")
-            if len(title) > 50:
-                title = title[:47] + "..."
-            return f"{title}{f' ({focus})' if focus else ''}"
         case "summarize_trace":
             path = args.get("path", "?")
             if len(path) > 70:
@@ -538,11 +515,6 @@ def _tool_summary(name: str, args: dict) -> str:
             action_space = args.get("action_space") or "latest action space"
             reachability = args.get("live_reachability") or "latest reachability"
             return f"{action_space} + {reachability}"
-        case "prepare_fork_exploit_workbench":
-            candidate = args.get("candidate_id") or args.get("attack_key") or "top candidate"
-            if len(candidate) > 60:
-                candidate = candidate[:57] + "..."
-            return candidate
         case "compose_sequence_experiment":
             title = args.get("title", "?")
             actions = args.get("actions") or []
