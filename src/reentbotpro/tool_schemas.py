@@ -622,7 +622,12 @@ TOOLS = [
                     },
                     "update_related": {
                         "type": "boolean",
-                        "description": "Whether to update linked hypothesis/experiment statuses",
+                        "description": (
+                            "Whether to update the branch's controller-owned "
+                            "hypothesis/experiment status targets (default: true). "
+                            "Generic related_ids are provenance only and are never "
+                            "status-mutated."
+                        ),
                         "default": True,
                     },
                     "notes": {

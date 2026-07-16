@@ -1010,6 +1010,7 @@ def _attack_search_candidate(
     source_ids: list[str] | None = None,
     source_artifacts: list[str] | None = None,
     related_ids: list[str] | None = None,
+    status_targets: list[str] | None = None,
     evidence: list[str] | None = None,
     instructions: str = "",
     required_evidence: list[str] | None = None,
@@ -1048,6 +1049,14 @@ def _attack_search_candidate(
         "source_ids": [str(item) for item in (source_ids or []) if item],
         "source_artifacts": [str(item) for item in (source_artifacts or []) if item],
         "related_ids": [str(item) for item in (related_ids or []) if item],
+        # Typed lifecycle ownership. Generic related_ids are provenance/context
+        # only and must never grant a branch permission to rewrite hypothesis or
+        # experiment status.
+        "status_targets": [
+            str(item)
+            for item in (status_targets or [])
+            if re.fullmatch(r"(?:hyp|exp)-\d{3,}", str(item))
+        ],
         "evidence": [str(item) for item in (evidence or []) if item],
         "instructions": instructions,
         "required_evidence": [
@@ -1781,6 +1790,289 @@ def _attack_search_results_without_objective(state: dict) -> list[dict]:
     return missing
 
 
+def _attack_search_state_conflict(
+    state: dict,
+    *,
+    artifact_id: str,
+    previous_status: str,
+    preserved_status: str,
+    reason: str,
+    source_id: str,
+) -> None:
+    """Record a deterministic lifecycle conflict without duplicating it.
+
+    These conflicts are controller integrity telemetry, not campaign findings.
+    They preserve the fact that stale or unrelated work attempted to downgrade
+    an artifact whose validated evidence lineage must remain actionable.
+    """
+    store = state.setdefault("attack_search", {})
+    conflicts = store.setdefault("state_conflicts", [])
+    key = (
+        artifact_id,
+        previous_status,
+        preserved_status,
+        reason,
+        source_id,
+    )
+    for item in conflicts:
+        if (
+            str(item.get("artifact_id") or ""),
+            str(item.get("previous_status") or ""),
+            str(item.get("preserved_status") or ""),
+            str(item.get("reason") or ""),
+            str(item.get("source_id") or ""),
+        ) == key:
+            return
+    conflicts.append({
+        "artifact_id": artifact_id,
+        "previous_status": previous_status,
+        "preserved_status": preserved_status,
+        "reason": reason,
+        "source_id": source_id,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    })
+    # Keep telemetry bounded in long-running campaigns.
+    if len(conflicts) > 200:
+        del conflicts[:-200]
+
+
+def _attack_search_validated_result_lineage(result: dict) -> set[str]:
+    return {
+        str(item)
+        for item in [result.get("id"), *_entry_related_ids(result)]
+        if re.fullmatch(
+            r"(?:hyp|exp|res|eval|cmp|trace|min|econ|flash)-\d{3,}",
+            str(item or ""),
+        )
+    }
+
+
+def _attack_search_reconcile_validated_lineage(state: dict) -> None:
+    """Promote direct hypothesis/experiment owners of validated results.
+
+    Older controller versions allowed generic related_ids on an unrelated
+    branch decision to overwrite these statuses. Reconciliation is monotonic:
+    it never deletes the bad decision/history, but restores the lifecycle state
+    derived from the stronger validated result and records the conflict.
+    """
+    owners: dict[str, list[dict]] = {}
+    for result in state["sections"].get("result", []):
+        if str(result.get("status") or "") != "validated":
+            continue
+        lineage = _attack_search_validated_result_lineage(result)
+        # A normal run/result has one owning hypothesis and one owning
+        # experiment. Multiple ids of the same kind are contextual aggregation,
+        # so do not grant them all lifecycle promotion authority.
+        for prefix in ("hyp-", "exp-"):
+            direct = sorted(item for item in lineage if item.startswith(prefix))
+            if len(direct) == 1:
+                owners.setdefault(direct[0], []).append(result)
+    if not owners:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    for section in ("hypothesis", "experiment"):
+        for entry in state["sections"].get(section, []):
+            artifact_id = str(entry.get("id") or "")
+            validated_results = owners.get(artifact_id) or []
+            if not validated_results:
+                continue
+            previous = str(entry.get("status") or "open")
+            if previous == "validated":
+                continue
+            if previous in {"rejected", "blocked", "inconclusive", "superseded"}:
+                _attack_search_state_conflict(
+                    state,
+                    artifact_id=artifact_id,
+                    previous_status=previous,
+                    preserved_status="validated",
+                    reason="validated_result_lineage_outranks_stale_status",
+                    source_id=str(validated_results[-1].get("id") or ""),
+                )
+            entry["status"] = "validated"
+            entry["updated_at"] = now
+
+
+async def _attack_search_validated_results_without_review(
+    container: AuditContainer,
+    state: dict,
+) -> list[dict]:
+    """Group validated result lineages that have no finding-evidence review."""
+    reviewed_ids: set[str] = set()
+    for path in _progress_evidence_paths(
+        state,
+        "/workspace/campaign/finding-reviews/",
+    ):
+        payload = await _load_campaign_json_if_exists(container, path)
+        if not isinstance(payload, dict):
+            continue
+        candidate = payload.get("candidate") or {}
+        if not isinstance(candidate, dict):
+            continue
+        reviewed_ids.update(
+            str(item)
+            for item in candidate.get("campaign_ids") or []
+            if str(item).strip()
+        )
+
+    groups: dict[str, dict] = {}
+    for result in state["sections"].get("result", []):
+        if str(result.get("status") or "") != "validated":
+            continue
+        lineage = _attack_search_validated_result_lineage(result)
+        hypotheses = sorted(item for item in lineage if item.startswith("hyp-"))
+        experiments = sorted(item for item in lineage if item.startswith("exp-"))
+        if len(hypotheses) == 1:
+            group_key = "hypothesis:" + hypotheses[0]
+            owner_ids = hypotheses
+        elif len(experiments) == 1:
+            group_key = "experiment:" + experiments[0]
+            owner_ids = experiments
+        else:
+            group_key = f"result:{result.get('id')}"
+            owner_ids = [str(result.get("id") or "")]
+        group = groups.setdefault(group_key, {
+            "group_key": group_key,
+            "owner_ids": owner_ids,
+            "results": [],
+            "campaign_ids": set(),
+            "evidence": set(),
+        })
+        group["results"].append(result)
+        group["campaign_ids"].update(lineage)
+        group["evidence"].update(_entry_evidence(result))
+
+    for path in _progress_evidence_paths(
+        state,
+        "/workspace/campaign/evaluations/",
+    ):
+        evaluation = await _load_campaign_json_if_exists(container, path)
+        if not isinstance(evaluation, dict):
+            continue
+        summary = evaluation.get("summary") or {}
+        objectives = int(summary.get("objectives") or 0)
+        passed = int(summary.get("passed") or 0)
+        failed = int(summary.get("failed") or 0)
+        unmatched = int(summary.get("unmatched") or 0)
+        objective_achieved = bool(
+            evaluation.get("objective_achieved")
+            or (objectives and passed == objectives and not failed and not unmatched)
+        )
+        if not objective_achieved:
+            continue
+        evaluation_id = str(evaluation.get("id") or "")
+        lineage = {
+            str(item)
+            for item in [
+                evaluation_id,
+                *(evaluation.get("related_ids") or []),
+                (evaluation.get("comparison") or {}).get("id"),
+            ]
+            if re.fullmatch(
+                r"(?:hyp|exp|res|eval|cmp|trace|min|econ|flash)-\d{3,}",
+                str(item or ""),
+            )
+        }
+        linked_results = [
+            result
+            for result in state["sections"].get("result", [])
+            if str(result.get("id") or "") in lineage
+        ]
+        if not any(
+            str(result.get("status") or "") == "validated"
+            or _attack_search_result_is_experiment_run(result)
+            for result in linked_results
+        ):
+            # A passing comparison over synthetic/manual state is objective
+            # context, not mechanically validated finding evidence. Keep the
+            # runnable PoC/result requirement before entering the strict review
+            # tier.
+            continue
+        hypotheses = sorted(item for item in lineage if item.startswith("hyp-"))
+        experiments = sorted(item for item in lineage if item.startswith("exp-"))
+        if len(hypotheses) == 1:
+            group_key = "hypothesis:" + hypotheses[0]
+            owner_ids = hypotheses
+        elif len(experiments) == 1:
+            group_key = "experiment:" + experiments[0]
+            owner_ids = experiments
+        else:
+            group_key = f"evaluation:{evaluation_id or path}"
+            owner_ids = [evaluation_id] if evaluation_id else []
+        group = groups.setdefault(group_key, {
+            "group_key": group_key,
+            "owner_ids": owner_ids,
+            "results": [],
+            "campaign_ids": set(),
+            "evidence": set(),
+        })
+        group["results"].append({
+            "id": evaluation_id,
+            "title": evaluation.get("title") or "Passing objective evaluation",
+            "created_at": evaluation.get("created_at"),
+            "priority": "high",
+        })
+        group["campaign_ids"].update(lineage)
+        group["evidence"].add(path)
+        for result in linked_results:
+            group["evidence"].update(_entry_evidence(result))
+        comparison_path = str(
+            (evaluation.get("comparison") or {}).get("path") or ""
+        )
+        if comparison_path:
+            group["evidence"].add(comparison_path)
+
+    pending = []
+    priority_order = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+    for group in groups.values():
+        campaign_ids = sorted(group["campaign_ids"])
+        results = sorted(
+            group["results"],
+            key=lambda item: (
+                str(item.get("created_at") or ""),
+                str(item.get("id") or ""),
+            ),
+        )
+        latest = results[-1]
+        evidence_ids = {
+            str(item.get("id") or "")
+            for item in results
+            if str(item.get("id") or "")
+        }
+        review_match_ids = {
+            *[str(item) for item in group.get("owner_ids") or [] if str(item)],
+            *evidence_ids,
+        }
+        if reviewed_ids.intersection(review_match_ids):
+            continue
+        priorities = [
+            _attack_search_priority(item.get("priority"))
+            for item in results
+        ]
+        priority = max(
+            priorities,
+            key=lambda item: priority_order.get(item, 0),
+            default="high",
+        )
+        pending.append({
+            "group_key": group["group_key"],
+            "title": latest.get("title") or "Validated result",
+            "priority": priority,
+            "evidence_ids": sorted(evidence_ids),
+            "owner_ids": group["owner_ids"],
+            "campaign_ids": campaign_ids,
+            "evidence": sorted(group["evidence"]),
+            "created_at": latest.get("created_at"),
+        })
+    return sorted(
+        pending,
+        key=lambda item: (
+            -priority_order.get(str(item.get("priority") or ""), 0),
+            str(item.get("created_at") or ""),
+            str(item.get("group_key") or ""),
+        ),
+    )
+
+
 def _action_space_invalid_for_attack_search(action_space: dict | None) -> bool:
     if not isinstance(action_space, dict):
         return False
@@ -2399,6 +2691,53 @@ async def _attack_search_candidates(
 
     def add(candidate: dict) -> None:
         candidates.setdefault(candidate["key"], candidate)
+
+    validated_review_items = await _attack_search_validated_results_without_review(
+        container,
+        state,
+    )
+    for item in validated_review_items:
+        result_ids = item.get("evidence_ids") or []
+        campaign_ids = item.get("campaign_ids") or []
+        evidence = item.get("evidence") or []
+        add(_attack_search_candidate(
+            key=f"validated_review:{item.get('group_key')}",
+            source="validated_result_without_finding_review",
+            title=f"Review validated finding evidence: {item.get('title')}",
+            status="needs_finding_review",
+            next_tool="review_finding_evidence",
+            required_toolsets=["report"],
+            priority=_attack_search_priority(item.get("priority")),
+            priority_score=30,
+            source_ids=result_ids,
+            source_artifacts=evidence,
+            related_ids=campaign_ids,
+            evidence=evidence,
+            instructions=(
+                "One or more results in this hypothesis/experiment lineage are "
+                "already marked validated, but no finding-evidence review consumes "
+                "that lineage. Review the runnable PoC, objective measurements, "
+                "production reachability, precondition provenance, funds at risk, "
+                "and negative controls now. Multiple scaling results for the same "
+                "root cause belong in one review with explicit economic caveats."
+            ),
+            required_evidence=[
+                "/workspace/campaign/finding-reviews/*.json",
+                "runnable PoC/test output plus objective evidence linked to the validated result ids",
+            ],
+            stop_condition=(
+                "If the validation is mechanically sound but production context is "
+                "uncertain, preserve that uncertainty as review caveats; do not "
+                "silently return to exploratory coverage."
+            ),
+            required_args={
+                "review_finding_evidence": {
+                    "campaign_ids": campaign_ids,
+                    "evidence": evidence,
+                    "validated": True,
+                },
+            },
+        ))
 
     missing_foundation = _progress_missing_foundation(state)
     if missing_foundation:
@@ -4203,15 +4542,20 @@ async def _attack_search_candidates(
         )
         unique_gaps = []
         for gap in all_gaps:
-            coverage_key = str(
-                gap.get("coverage_key") or _coverage_definition_key(gap)
-            ).strip()
-            if coverage_key in parked_coverage_keys:
+            coverage_keys = [
+                str(item)
+                for item in (
+                    gap.get("coverage_keys")
+                    or [gap.get("coverage_key") or _coverage_definition_key(gap)]
+                )
+                if str(item).strip()
+            ]
+            if parked_coverage_keys.intersection(coverage_keys):
                 continue
             identity = (
-                str(gap.get("key") or ""),
-                str(gap.get("file") or ""),
-                str(gap.get("signature") or gap.get("function") or ""),
+                str(gap.get("coverage_group_key") or gap.get("key") or ""),
+                "",
+                "",
             )
             if identity in seen_coverage_keys:
                 continue
@@ -4242,6 +4586,19 @@ async def _attack_search_candidates(
             coverage_key = str(
                 gap.get("coverage_key") or _coverage_definition_key(gap)
             ).strip()
+            coverage_keys = [
+                str(value)
+                for value in (gap.get("coverage_keys") or [coverage_key])
+                if str(value).strip()
+            ]
+            clone_family_keys = [
+                str(value)
+                for value in gap.get("clone_family_keys") or []
+                if str(value).strip()
+            ]
+            equivalent_definitions = int(
+                gap.get("equivalent_definitions") or 1
+            )
             source_slice_args = {
                 key: value
                 for key, value in {
@@ -4274,10 +4631,15 @@ async def _attack_search_candidates(
                 "deployment/fork binding. "
                 f"Selected gap: {action_key or 'unknown'} ({affordances}). "
                 + (
+                    f"This definition represents {equivalent_definitions} "
+                    "source-identical copies grouped by retained source identity. "
+                    if equivalent_definitions > 1 else ""
+                )
+                + (
                     f"When recording the outcome, set action_keys to "
                     f"[{action_key!r}] and coverage_keys to "
-                    f"[{coverage_key!r}] so this exact source definition "
-                    "transfers ownership without lexical matching."
+                    f"{coverage_keys!r} so the identical source-definition "
+                    "family transfers ownership without lexical matching."
                     if action_key else ""
                 )
             )
@@ -4291,7 +4653,10 @@ async def _attack_search_candidates(
                 if source_slice_args else None
             )
             add(_attack_search_candidate(
-                key=f"coverage:action:{coverage_key or action_key or item.get('id')}",
+                key=(
+                    "coverage:action:"
+                    f"{gap.get('coverage_group_key') or coverage_key or action_key or item.get('id')}"
+                ),
                 source="coverage_high_attention_gap",
                 title=f"Source-review coverage gap: {action_key or item.get('id')}",
                 status=branch_status,
@@ -4317,8 +4682,9 @@ async def _attack_search_candidates(
                 required_evidence=branch_required_evidence,
                 stop_condition="If the gap is expected, gated, or dormant behavior, record a rejection decision.",
                 action_keys=[action_key] if action_key else [],
-                coverage_keys=[coverage_key] if coverage_key else [],
+                coverage_keys=coverage_keys,
                 action_family_keys=[_coverage_action_family_key(gap)],
+                clone_family_keys=clone_family_keys,
                 target_actions=[{
                     "key": action_key,
                     "contract": gap.get("contract"),
@@ -4326,6 +4692,7 @@ async def _attack_search_candidates(
                     "file": gap.get("file"),
                     "line": gap.get("line"),
                     "affordances": gap.get("affordances") or [],
+                    "source_role": gap.get("source_role"),
                 }],
                 required_args=branch_required_args,
             ))
@@ -4419,6 +4786,7 @@ async def _attack_search_candidates(
             source_ids=[entry.get("id")],
             source_artifacts=[*(entry.get("evidence") or []), *action_space_paths, *protocol_graph_paths],
             related_ids=[entry.get("id")],
+            status_targets=[entry.get("id")],
             instructions=hypothesis_instructions,
             required_evidence=hypothesis_required_evidence,
             stop_condition=(
@@ -4523,6 +4891,7 @@ async def _attack_search_candidates(
             priority_score=15,
             source_ids=[entry.get("id")],
             related_ids=[entry.get("id")],
+            status_targets=[entry.get("id")],
             evidence=entry.get("evidence") or [],
             required_args=completion_args,
             instructions=(
@@ -4629,6 +4998,7 @@ async def _attack_search_candidates(
             source_ids=[entry.get("id")],
             source_artifacts=entry.get("evidence") or [],
             related_ids=related_ids,
+            status_targets=experiment_ids,
             instructions=(
                 "This result blocked before it produced objective exploit evidence. "
                 "Treat the diagnosis as a PoC/harness repair prompt, not proof that "
@@ -5759,6 +6129,34 @@ def _attack_search_branch_clone_family_key_set(branch: dict) -> set[str]:
     return keys
 
 
+def _attack_search_branch_status_target_set(branch: dict) -> set[str]:
+    """Return the hypothesis/experiment ids this branch owns.
+
+    Explicit status_targets are authoritative. The source-based fallback is a
+    narrow migration path for persisted searches created before typed lifecycle
+    ownership existed; it never consumes generic related_ids.
+    """
+    stored = {
+        str(item).strip()
+        for item in branch.get("status_targets") or []
+        if re.fullmatch(r"(?:hyp|exp)-\d{3,}", str(item).strip())
+    }
+    if stored:
+        return stored
+    source = str(branch.get("source") or "")
+    if source == "hypothesis_without_experiment":
+        prefix = "hyp-"
+    elif source in {"experiment_without_result", "blocked_result"}:
+        prefix = "exp-"
+    else:
+        return set()
+    return {
+        str(item).strip()
+        for item in branch.get("source_ids") or []
+        if str(item).strip().startswith(prefix)
+    }
+
+
 def _candidate_clone_fingerprint(candidate: dict) -> str:
     for key in ("clone_fingerprint", "code_hash", "profile_src", "source_hash"):
         value = str(candidate.get(key) or "").strip()
@@ -6206,6 +6604,7 @@ async def _attack_search_decision(
         *related_ids,
     ]
     branch_related = sorted(dict.fromkeys(branch_related))
+    status_targets = sorted(_attack_search_branch_status_target_set(branch))
     action_keys = sorted(dict.fromkeys([
         *[str(item) for item in branch.get("action_keys") or [] if item],
         *[
@@ -6262,6 +6661,7 @@ async def _attack_search_decision(
         "clone_family_keys": clone_family_keys,
         "attack_keys": attack_keys,
         "decision_scope": decision_scope,
+        "status_targets": status_targets,
     })
     # A definition-scoped coverage decision must not suppress same-named
     # definitions elsewhere. Legacy/non-coverage branches still use action keys.
@@ -6294,7 +6694,7 @@ async def _attack_search_decision(
         decided.update(attack_keys)
         state["attack_search"]["decided_attack_keys"] = sorted(decided)
 
-    if args.get("update_related", True):
+    if args.get("update_related", True) and status_targets:
         related_status = {
             "rejected": "rejected",
             "superseded": "superseded",
@@ -6309,7 +6709,19 @@ async def _attack_search_decision(
         }[raw_status]
         for section in ("hypothesis", "experiment"):
             for entry in state["sections"].get(section, []):
-                if str(entry.get("id") or "") not in branch_related:
+                artifact_id = str(entry.get("id") or "")
+                if artifact_id not in status_targets:
+                    continue
+                previous_status = str(entry.get("status") or "open")
+                if previous_status == "validated" and related_status != "validated":
+                    _attack_search_state_conflict(
+                        state,
+                        artifact_id=artifact_id,
+                        previous_status=previous_status,
+                        preserved_status="validated",
+                        reason="branch_decision_cannot_downgrade_validated_lineage",
+                        source_id=decision_id,
+                    )
                     continue
                 entry["status"] = related_status
                 entry["updated_at"] = now
@@ -6319,7 +6731,7 @@ async def _attack_search_decision(
                 )
                 entry["related_ids"] = _merge_unique_strings(
                     entry.get("related_ids"),
-                    [decision_id, branch_id, *branch_related],
+                    [decision_id, branch_id],
                 )
                 entry["content"] = (
                     f"{str(entry.get('content') or '').rstrip()}\n\n"
@@ -6340,6 +6752,7 @@ async def _attack_search_decision(
     branch["action_family_keys"] = action_family_keys
     branch["clone_family_keys"] = clone_family_keys
     branch["attack_keys"] = attack_keys
+    branch["status_targets"] = status_targets
     branch["updated_at"] = now
     branch["evidence"] = sorted(dict.fromkeys([
         *(branch.get("evidence") or []),
@@ -6469,6 +6882,7 @@ def _attack_search_next_action(search: dict) -> dict:
         "source_ids": branch.get("source_ids") or [],
         "source_artifacts": branch.get("source_artifacts") or [],
         "related_ids": branch.get("related_ids") or [],
+        "status_targets": branch.get("status_targets") or [],
         "action_keys": branch.get("action_keys") or [],
         "coverage_keys": branch.get("coverage_keys") or [],
         "clone_family_keys": branch.get("clone_family_keys") or [],
@@ -6538,7 +6952,7 @@ def _attack_search_summary(search: dict) -> dict:
         and str(branch.get("status") or "") in _ATTACK_SEARCH_PARKED_STATUSES
     )
     actionable = sum(1 for branch in branches if _attack_search_branch_actionable(branch))
-    return {
+    summary = {
         "branches": len(branches),
         "active": active,
         "actionable": actionable,
@@ -6551,6 +6965,10 @@ def _attack_search_summary(search: dict) -> dict:
         "by_source": by_source,
         "campaign_ready": actionable == 0,
     }
+    integrity = search.get("integrity") or {}
+    if integrity.get("state_conflicts"):
+        summary["state_conflicts"] = int(integrity.get("state_conflicts") or 0)
+    return summary
 
 
 def _truncate_response_text(value: object, limit: int = 600) -> str:
@@ -6605,6 +7023,7 @@ def _compact_target_action(action: dict) -> dict:
             "normalized_call_target": action.get("normalized_call_target"),
             "file": action.get("file"),
             "line": action.get("line"),
+            "source_role": action.get("source_role"),
             "affordances": (action.get("affordances") or [])[:8],
             "modifiers": (action.get("modifiers") or [])[:6],
         }.items()
@@ -6715,6 +7134,7 @@ def _compact_attack_branch(branch: dict, *, terminal: bool = False) -> dict:
         "source_ids": (branch.get("source_ids") or [])[:8],
         "source_artifacts": (branch.get("source_artifacts") or [])[:5],
         "related_ids": (branch.get("related_ids") or [])[:8],
+        "status_targets": (branch.get("status_targets") or [])[:8],
         "evidence": (branch.get("evidence") or [])[:12],
         "action_keys": (branch.get("action_keys") or [])[:12],
         "coverage_keys": (branch.get("coverage_keys") or [])[:12],
@@ -6785,6 +7205,7 @@ def _compact_attack_next_action(next_action: dict) -> dict:
     ]
     compact["source_artifacts"] = (compact.get("source_artifacts") or [])[:5]
     compact["source_ids"] = (compact.get("source_ids") or [])[:8]
+    compact["status_targets"] = (compact.get("status_targets") or [])[:8]
     compact["action_keys"] = (compact.get("action_keys") or [])[:12]
     compact["coverage_keys"] = (compact.get("coverage_keys") or [])[:12]
     compact["clone_family_keys"] = (compact.get("clone_family_keys") or [])[:12]
@@ -6926,6 +7347,7 @@ def _attack_search_branch_dossier(search: dict, branch: dict) -> dict:
         "source_artifacts": branch.get("source_artifacts") or [],
         "source_ids": branch.get("source_ids") or [],
         "related_ids": branch.get("related_ids") or [],
+        "status_targets": branch.get("status_targets") or [],
         "evidence": branch.get("evidence") or [],
         "action_keys": branch.get("action_keys") or [],
         "coverage_keys": branch.get("coverage_keys") or [],
@@ -7043,11 +7465,17 @@ async def _attack_search(container: AuditContainer, args: dict) -> str:
     args = {**args, "evidence": evidence, "related_ids": related_ids}
 
     state = await _load_campaign_state(container)
+    _attack_search_reconcile_validated_lineage(state)
     search = _attack_search_current(
         state,
         args,
         reset=bool(args.get("reset", False)) or action == "start",
     )
+    conflicts = (state.get("attack_search") or {}).get("state_conflicts") or []
+    search["integrity"] = {
+        "state_conflicts": len(conflicts),
+        "recent_state_conflicts": conflicts[-5:],
+    }
     focus = str(args.get("focus") or search.get("focus") or "").strip()
     if focus:
         search["focus"] = focus
@@ -10718,6 +11146,8 @@ _CHAIN_URL_RE = re.compile(r"https?://[a-z0-9.\-/]+", re.IGNORECASE)
 # Bounded repo scan: deployment files to read and docs/config to text-scan.
 _CHAIN_SCAN_MAX_FILES = 40
 _CHAIN_DOC_FILES = (
+    "_manifest.json",
+    "scope.json",
     "README.md",
     "README",
     "readme.md",
@@ -10826,6 +11256,18 @@ def _deployments_from_obj(value, source: str, depth: int = 0) -> list[dict]:
     two levels for chain-grouped maps.
     """
     out: list[dict] = []
+    if isinstance(value, list):
+        if depth >= 3:
+            return out
+        for item in value:
+            out.extend(
+                _deployments_from_obj(
+                    item,
+                    source=source,
+                    depth=depth + 1,
+                )
+            )
+        return _dedupe_deployments(out)
     if isinstance(value, str):
         text = value.strip()
         if _DEPLOY_ADDRESS_RE.fullmatch(text):
@@ -10836,7 +11278,12 @@ def _deployments_from_obj(value, source: str, depth: int = 0) -> list[dict]:
     if isinstance(value, dict):
         addr = value.get("address")
         if isinstance(addr, str) and _DEPLOY_ADDRESS_RE.fullmatch(addr.strip()):
-            name = value.get("contractName") or value.get("name")
+            name = (
+                value.get("contractName")
+                or value.get("onchain_name")
+                or value.get("name")
+                or value.get("label")
+            )
             out.append(
                 {
                     "name": name,
@@ -10874,6 +11321,15 @@ def _chain_hints_from_json_obj(obj, source: str) -> list[dict]:
     is an address map is recorded as an ambiguous hint rather than dropped.
     """
     hints: list[dict] = []
+    if isinstance(obj, list):
+        for index, item in enumerate(obj):
+            hints.extend(
+                _chain_hints_from_json_obj(
+                    item,
+                    source=f"{source}[{index}]",
+                )
+            )
+        return hints
     if not isinstance(obj, dict):
         return hints
 
@@ -10905,6 +11361,13 @@ def _chain_hints_from_json_obj(obj, source: str) -> list[dict]:
                     "evidence": [f"{source}: unresolved group key '{key}'"],
                     "deployments": _deployments_from_obj(value, source=source),
                 }
+            )
+        elif isinstance(value, list):
+            hints.extend(
+                _chain_hints_from_json_obj(
+                    value,
+                    source=f"{source}.{key}",
+                )
             )
 
     field_net = obj.get("network") or obj.get("chain") or obj.get("chainName")
@@ -14883,6 +15346,7 @@ def _is_third_party_action_source(path: str) -> bool:
         for marker in (
             "/contracts/external/",
             "/external/openzeppelin/",
+            "/@openzeppelin/",
             "/openzeppelin/",
             "/node_modules/",
             "/forge-std/",
@@ -14911,13 +15375,12 @@ async def _manifest_source_root_batch(
     max_roots: int,
 ) -> dict | None:
     normalized = _normalize_action_source_path(root)
-    if normalized not in {"/audit", "/audit/src"}:
-        return None
+    manifest: dict = {}
     try:
         manifest_raw = await container.read_file(_SCOPE_MANIFEST_PATH)
         manifest = json.loads(manifest_raw)
     except (FileNotFoundError, json.JSONDecodeError):
-        return None
+        manifest = {}
     roots = []
     seen = set()
     for profile in manifest.get("ranked_profiles") or []:
@@ -14934,8 +15397,16 @@ async def _manifest_source_root_batch(
             continue
         seen.add(normalized_src)
         roots.append(normalized_src)
+    scope_source = "manifest"
     if not roots:
-        return None
+        roots = await _default_source_scan_roots(container, normalized)
+        if not roots:
+            roots = [normalized]
+        roots = list(dict.fromkeys(
+            _normalize_action_source_path(item)
+            for item in roots
+        ))
+        scope_source = "fallback_source_roots"
     if cursor < 0 or cursor > len(roots):
         raise ValueError(
             f"profile_cursor must be between 0 and {len(roots)} for this scope"
@@ -14944,7 +15415,10 @@ async def _manifest_source_root_batch(
     selected = roots[cursor:end]
     return {
         "kind": "source_roots",
-        "scope_manifest_path": _SCOPE_MANIFEST_PATH,
+        "scope_manifest_path": (
+            _SCOPE_MANIFEST_PATH if scope_source == "manifest" else None
+        ),
+        "scope_source": scope_source,
         "scope_fingerprint": _scope_batch_fingerprint(roots),
         "cursor": cursor,
         "limit": max(max_roots, 1),
@@ -14983,6 +15457,7 @@ async def _discover_action_source_files(
     max_roots: int = 12,
     scan_roots_override: list[str] | None = None,
     file_cursor: int = 0,
+    retain_dependency_sources: bool = False,
 ) -> tuple[list[str], int, dict]:
     nested_profile_lib_roots: set[str] = set()
     if files:
@@ -15048,7 +15523,10 @@ async def _discover_action_source_files(
             nested_profile_lib_roots=nested_profile_lib_roots,
         ):
             continue
-        if _is_third_party_action_source(candidate):
+        if (
+            _is_third_party_action_source(candidate)
+            and not retain_dependency_sources
+        ):
             continue
         if not include_tests and _is_test_action_source(candidate):
             continue
@@ -18315,6 +18793,13 @@ async def _map_action_space(container: AuditContainer, args: dict) -> str:
                 if scope_batch is not None else None
             ),
             file_cursor=source_file_cursor,
+            retain_dependency_sources=bool(
+                files is not None
+                or (
+                    scope_batch is not None
+                    and scope_batch.get("scope_source") == "manifest"
+                )
+            ),
         )
     except ValueError as exc:
         return f"Error: {exc}"
@@ -21216,6 +21701,7 @@ def _live_reachability_clone_family_key(
     fingerprint = (
         str(target_binding.get("code_hash") or "").strip()
         or str(values.get("code_sha256_16") or "").strip()
+        or str(profile.get("source_hash") or "").strip()
         or str(profile.get("src") or "").strip()
     )
     if not fingerprint:
@@ -22376,6 +22862,8 @@ def _compact_profile_reachability(profile: dict, *, max_exposures: int) -> dict:
             "contract": profile.get("contract"),
             "address": profile.get("address"),
             "src": profile.get("src"),
+            "instance_src": profile.get("instance_src"),
+            "source_hash": profile.get("source_hash"),
             "network": profile.get("network"),
             "chain_id": profile.get("chain_id"),
             "chain_status": profile.get("chain_status"),
@@ -23235,6 +23723,8 @@ async def _map_live_reachability(
             "contract": profile.get("contract"),
             "address": address,
             "src": profile.get("src"),
+            "instance_src": profile.get("instance_src"),
+            "source_hash": profile.get("source_hash"),
             "tags": profile.get("tags") or [],
             "priority_score": profile.get("priority_score"),
             "network": assignment.get("network"),
@@ -33144,6 +33634,7 @@ def _coverage_action_summary(entry: dict, references: list[dict]) -> dict:
         "key": _coverage_action_key(entry),
         "coverage_key": _coverage_definition_key(entry),
         "contract": entry.get("contract"),
+        "contract_kind": entry.get("contract_kind"),
         "function": entry.get("function"),
         "signature": entry.get("signature"),
         "parameters": entry.get("parameters") or [],
@@ -33157,6 +33648,118 @@ def _coverage_action_summary(entry: dict, references: list[dict]) -> dict:
         "attention_reasons": reasons,
         "coverage": _coverage_level(references),
         "references": references[:8],
+    }
+
+
+async def _coverage_scope_profiles(container: AuditContainer) -> list[dict]:
+    manifest = await _load_campaign_json_if_exists(
+        container,
+        _SCOPE_MANIFEST_PATH,
+    )
+    if not isinstance(manifest, dict):
+        return []
+    return [
+        profile
+        for profile in manifest.get("ranked_profiles") or []
+        if isinstance(profile, dict)
+    ]
+
+
+def _coverage_action_scope_metadata(
+    entry: dict,
+    *,
+    profiles: list[dict],
+    bases_by_contract: dict[tuple[str, str], set[str]],
+    definitions_by_name: dict[str, list[tuple[str, str]]],
+) -> dict:
+    """Classify whether a source definition deserves controller coverage."""
+    contract_kind = str(entry.get("contract_kind") or "contract").lower()
+    file_path = str(entry.get("file") or "")
+    if contract_kind == "interface":
+        return {
+            "eligible": False,
+            "source_role": "source_interface_only",
+            "reason": "interface declarations are ABI/dependency context, not executable entrypoints",
+        }
+    if contract_kind == "library":
+        return {
+            "eligible": False,
+            "source_role": "source_library_only",
+            "reason": "library declarations are dependency context, not deployed entrypoints",
+        }
+
+    matched_profiles = [
+        profile
+        for profile in profiles
+        if _action_matches_profile(entry, profile)
+    ]
+    relations = [
+        {
+            "profile": profile.get("profile"),
+            "contract": profile.get("contract"),
+            "address": profile.get("address"),
+            "source_hash": profile.get("source_hash"),
+            **_action_source_relation(
+                entry,
+                profile,
+                bases_by_contract=bases_by_contract,
+                definitions_by_name=definitions_by_name,
+            ),
+        }
+        for profile in matched_profiles
+    ]
+    executable = [
+        relation for relation in relations
+        if relation.get("executable_source")
+    ]
+    if executable:
+        source_hashes = sorted({
+            str(relation.get("source_hash") or "").strip()
+            for relation in executable
+            if str(relation.get("source_hash") or "").strip()
+        })
+        family = _action_family_from_action_key(_coverage_action_key(entry))
+        clone_family_keys = [
+            f"coverage-source:{source_hash}:{family}"
+            for source_hash in source_hashes
+        ]
+        return {
+            "eligible": True,
+            "source_role": (
+                "profile_contract"
+                if any(item.get("kind") == "profile_contract" for item in executable)
+                else "inherited_executable"
+            ),
+            "relations": relations[:12],
+            "clone_family_keys": clone_family_keys,
+        }
+    if relations:
+        kinds = sorted({
+            str(item.get("kind") or "unknown")
+            for item in relations
+        })
+        return {
+            "eligible": False,
+            "source_role": kinds[0] if len(kinds) == 1 else "non_executable_dependency",
+            "reason": "definition is not executable on any retained deployment profile",
+            "relations": relations[:12],
+        }
+    if _is_third_party_action_source(file_path):
+        return {
+            "eligible": False,
+            "source_role": "unbound_third_party_dependency",
+            "reason": "third-party definition has no executable retained profile binding",
+        }
+    return {
+        "eligible": True,
+        "source_role": (
+            "unbound_first_party_contract"
+            if profiles else "source_contract"
+        ),
+        "reason": (
+            "focused first-party definition is outside retained deployment profiles"
+            if profiles else "no deployment profiles are available; retain concrete first-party source"
+        ),
     }
 
 
@@ -33200,10 +33803,24 @@ async def _derive_attack_surface_gaps(
     decided_action_family_keys = set(
         (state.get("attack_search") or {}).get("decided_action_family_keys") or []
     )
+    decided_clone_family_keys = set(
+        (state.get("attack_search") or {}).get("decided_clone_family_keys") or []
+    )
     if text_identity_definitions is None:
         text_identity_definitions = _coverage_text_identity_definitions([action_space])
-    gaps = []
+    profiles = await _coverage_scope_profiles(container)
+    bases_by_contract = _action_space_contract_bases(action_space)
+    definitions_by_name = _contract_definitions_by_name(bases_by_contract)
+    grouped: dict[str, list[dict]] = {}
     for entry in action_space.get("actions") or []:
+        scope_metadata = _coverage_action_scope_metadata(
+            entry,
+            profiles=profiles,
+            bases_by_contract=bases_by_contract,
+            definitions_by_name=definitions_by_name,
+        )
+        if not scope_metadata.get("eligible"):
+            continue
         text_identity = _coverage_text_identity(entry)
         references = _coverage_references_for_action(
             entry,
@@ -33214,15 +33831,11 @@ async def _derive_attack_surface_gaps(
             record_index=record_index,
         )
         summary = _coverage_action_summary(entry, references)
+        summary.update(scope_metadata)
         action_key = str(summary.get("key") or "")
         coverage_key = _coverage_definition_key(entry)
         coverage_family_key = _coverage_action_family_key(entry)
-        if (
-            action_key in decided_action_keys
-            or coverage_key in decided_coverage_keys
-            or coverage_family_key in decided_action_family_keys
-        ):
-            continue
+        clone_family_keys = scope_metadata.get("clone_family_keys") or []
         sections = {
             str(item.get("section") or "")
             for item in references
@@ -33237,10 +33850,57 @@ async def _derive_attack_surface_gaps(
             not sections.intersection({"experiment", "result", "decision"})
             and not structured_hypothesis
         )
-        if is_open and int(summary.get("attention_score") or 0) >= attention_threshold:
-            summary["is_open_gap"] = True
-            summary["is_high_attention_gap"] = True
-            gaps.append(summary)
+        summary.update({
+            "coverage_key": coverage_key,
+            "coverage_family_key": coverage_family_key,
+            "clone_family_keys": clone_family_keys,
+            "is_open_gap": is_open,
+            "is_decided": bool(
+                action_key in decided_action_keys
+                or coverage_key in decided_coverage_keys
+                or coverage_family_key in decided_action_family_keys
+                or decided_clone_family_keys.intersection(clone_family_keys)
+            ),
+        })
+        clone_group = "|".join(sorted(clone_family_keys))
+        group_key = clone_group or coverage_key or action_key
+        grouped.setdefault(group_key, []).append(summary)
+
+    gaps = []
+    for group_key, definitions in grouped.items():
+        # A source-hash family is one source-coverage obligation. Coverage,
+        # evidence, or an exact decision on any identical definition closes the
+        # family; live deployment/economic differences remain separate work in
+        # reachability and attack-graph branches.
+        if any(item.get("is_decided") for item in definitions):
+            continue
+        if any(not item.get("is_open_gap") for item in definitions):
+            continue
+        representative = sorted(
+            definitions,
+            key=lambda item: (
+                -int(item.get("attention_score") or 0),
+                str(item.get("file") or ""),
+                int(item.get("line") or 0),
+            ),
+        )[0]
+        if int(representative.get("attention_score") or 0) < attention_threshold:
+            continue
+        representative = dict(representative)
+        representative["is_high_attention_gap"] = True
+        representative["coverage_group_key"] = group_key
+        representative["coverage_keys"] = sorted({
+            str(item.get("coverage_key") or "")
+            for item in definitions
+            if str(item.get("coverage_key") or "")
+        })
+        representative["equivalent_definitions"] = len(definitions)
+        representative["equivalent_files"] = sorted({
+            str(item.get("file") or "")
+            for item in definitions
+            if str(item.get("file") or "")
+        })[:20]
+        gaps.append(representative)
     gaps.sort(key=lambda item: (
         -int(item.get("attention_score") or 0),
         str(item.get("contract") or ""),
@@ -45640,6 +46300,166 @@ def _parse_foundry_profiles(raw: str) -> list[dict]:
     return profiles
 
 
+def _scope_inventory_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes"}
+
+
+def _scope_inventory_records(payload: object) -> list[dict]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    records: list[dict] = []
+    for key in ("assets", "contracts", "deployments", "targets"):
+        values = payload.get(key)
+        if isinstance(values, list):
+            records.extend(item for item in values if isinstance(item, dict))
+    # A single deployment object is also a valid generic inventory.
+    if payload.get("address") or payload.get("dir") or payload.get("src"):
+        records.append(payload)
+    return records
+
+
+def _scope_inventory_profile(
+    record: dict,
+    *,
+    root: str,
+    source: str,
+) -> dict | None:
+    address = str(record.get("address") or "").strip()
+    if address and not _SCOPE_ADDRESS_RE.fullmatch(address):
+        # A non-EVM address cannot become a Solidity deployment binding. Keep
+        # any accompanying source directory as a source-only scope profile so
+        # the inventory entry is not silently lost.
+        address = ""
+    raw_src = str(
+        record.get("dir")
+        or record.get("src")
+        or record.get("source_dir")
+        or record.get("sourceRoot")
+        or ""
+    ).strip()
+    if not address and not raw_src:
+        return None
+    source_path = _profile_source_path(root, raw_src) if raw_src else ""
+    contract = str(
+        record.get("onchain_name")
+        or record.get("contractName")
+        or record.get("contract")
+        or record.get("implementation_name")
+        or record.get("label")
+        or "UnknownContract"
+    ).strip()
+    chain_id = record.get("chainId", record.get("chain_id"))
+    try:
+        chain_id = int(chain_id) if chain_id not in (None, "") else None
+    except (TypeError, ValueError):
+        chain_id = None
+    network, canonical_chain_id = _canonical_chain(
+        record.get("network") or record.get("chain"),
+        chain_id,
+        strict=True,
+    )
+    chain_id = canonical_chain_id if canonical_chain_id is not None else chain_id
+    suffix = address[-6:].lower() if address else hashlib.sha256(
+        source_path.encode()
+    ).hexdigest()[:6]
+    profile = {
+        "profile": f"inventory_{re.sub(r'[^A-Za-z0-9]+', '_', contract).strip('_')}_{suffix}",
+        "contract": contract,
+        "address": address or None,
+        "src": source_path,
+        "instance_src": source_path,
+        "source_hash": str(
+            record.get("sourceHash")
+            or record.get("source_hash")
+            or ""
+        ).strip() or None,
+        "chain_id": chain_id,
+        "network": network,
+        "proxy": _scope_inventory_bool(record.get("proxy")),
+        "implementation": str(record.get("implementation") or "").strip() or None,
+        "role": record.get("role"),
+        "tier": record.get("tier"),
+        "label": record.get("immunefi_label") or record.get("label"),
+        "inventory_source": source,
+        "solc": record.get("solc"),
+        "build_command": None,
+    }
+    return profile
+
+
+async def _load_scope_inventory_profiles(
+    container: AuditContainer,
+    root: str,
+) -> tuple[list[dict], list[str]]:
+    profiles: list[dict] = []
+    sources: list[str] = []
+    for name in ("_manifest.json", "scope.json"):
+        path = posixpath.join(root, name)
+        content = await _safe_read(container, path, max_bytes=2_000_000)
+        if not content:
+            continue
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError):
+            continue
+        sources.append(path)
+        for record in _scope_inventory_records(payload):
+            profile = _scope_inventory_profile(
+                record,
+                root=root,
+                source=path,
+            )
+            if profile:
+                profiles.append(profile)
+
+    # Merge duplicate asset records (for example scope.json + _manifest.json)
+    # while retaining the richer source-directory/source-hash metadata.
+    merged: dict[tuple[str, str], dict] = {}
+    order: list[tuple[str, str]] = []
+    for profile in profiles:
+        address = str(profile.get("address") or "").lower()
+        chain_key = str(profile.get("chain_id") or profile.get("network") or "")
+        key = (
+            chain_key,
+            address or str(profile.get("src") or profile.get("profile") or ""),
+        )
+        current = merged.get(key)
+        if current is None:
+            merged[key] = dict(profile)
+            order.append(key)
+            continue
+        for field, value in profile.items():
+            if current.get(field) in (None, "", [], {}) and value not in (
+                None,
+                "",
+                [],
+                {},
+            ):
+                current[field] = value
+
+    retained = [merged[key] for key in order]
+    # Identical verified-source bundles share one canonical source root for
+    # mapping while every deployed instance/address remains a separate profile.
+    canonical_roots: dict[str, str] = {}
+    family_sizes: dict[str, int] = {}
+    for profile in retained:
+        source_hash = str(profile.get("source_hash") or "")
+        src = str(profile.get("src") or "")
+        if source_hash and src:
+            canonical_roots.setdefault(source_hash, src)
+            family_sizes[source_hash] = family_sizes.get(source_hash, 0) + 1
+    for profile in retained:
+        source_hash = str(profile.get("source_hash") or "")
+        if source_hash and source_hash in canonical_roots:
+            profile["src"] = canonical_roots[source_hash]
+            profile["source_family_size"] = family_sizes[source_hash]
+    return retained, sources
+
+
 _SCOPE_PRIORITY_RULES = (
     ("bridge", 7, "bridge/cross-chain"),
     ("router", 6, "router"),
@@ -45770,6 +46590,10 @@ async def _inspect_scope(container: AuditContainer, args: dict) -> str:
         foundry_raw = ""
 
     profiles = _parse_foundry_profiles(foundry_raw) if foundry_raw else []
+    inventory_profiles, inventory_sources = await _load_scope_inventory_profiles(
+        container,
+        root,
+    )
     sol_files = await _workspace_sol_files(container, root)
     source_roots = await _default_source_scan_roots(container, root)
     artifacts = await _artifact_dirs(container, root)
@@ -45794,6 +46618,40 @@ async def _inspect_scope(container: AuditContainer, args: dict) -> str:
                 f"{shlex.quote(build_path)}"
             ),
         })
+    for profile in inventory_profiles:
+        source_path = str(profile.get("src") or "")
+        score, tags = _score_scope_profile(profile)
+        if profile.get("proxy") and "proxy/infrastructure" not in tags:
+            tags.append("proxy/infrastructure")
+        ranked.append({
+            **profile,
+            "source_files": _count_profile_files(source_path, sol_files)
+            if source_path else 0,
+            "priority_score": score,
+            "tags": tags,
+        })
+    deduped_ranked: dict[tuple[str, str, str], dict] = {}
+    for profile in ranked:
+        address = str(profile.get("address") or "").lower()
+        chain_key = str(profile.get("chain_id") or profile.get("network") or "")
+        key = (
+            chain_key,
+            address,
+            str(profile.get("src") or profile.get("profile") or ""),
+        )
+        current = deduped_ranked.get(key)
+        if current is None:
+            deduped_ranked[key] = profile
+            continue
+        for field, value in profile.items():
+            if current.get(field) in (None, "", [], {}) and value not in (
+                None,
+                "",
+                [],
+                {},
+            ):
+                current[field] = value
+    ranked = list(deduped_ranked.values())
     ranked.sort(key=lambda item: (
         -int(bool(item.get("address"))),
         -int(int(item.get("source_files") or 0) > 0),
@@ -45808,6 +46666,13 @@ async def _inspect_scope(container: AuditContainer, args: dict) -> str:
         "source_roots_for_default_scans": source_roots,
         "solidity_files_in_default_source_roots": len(sol_files),
         "foundry_profiles": len(profiles),
+        "inventory_profiles": len(inventory_profiles),
+        "inventory_sources": inventory_sources,
+        "source_families": len({
+            str(profile.get("source_hash") or "")
+            for profile in inventory_profiles
+            if str(profile.get("source_hash") or "")
+        }),
         "ranked_profiles": ranked,
         "scope_policy": {
             "profiles_retained": len(ranked),
@@ -45820,6 +46685,7 @@ async def _inspect_scope(container: AuditContainer, args: dict) -> str:
             "Default list/search/map tools ignore generated build output, prior findings, and stale PoC folders.",
             "Treat existing findings, prior campaign state, and PoC files inside the target tree as contamination unless the user explicitly asks for regression comparison.",
             "For Instascope-style projects, prefer each profile's build_command; broad forge build can compile stale tests or unrelated profiles.",
+            "Generic _manifest.json/scope.json deployment inventory is retained when present; identical sourceHash bundles share a canonical source root while every deployed address remains in scope.",
             "Lexical tags and priority scores are attention hints only; every parsed profile remains in scope, including infrastructure and bland names.",
         ],
         "recommended_start": [

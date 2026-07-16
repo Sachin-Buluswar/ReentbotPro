@@ -930,16 +930,74 @@ async def _progress_blocked_results(
     state: dict,
 ) -> list[dict]:
     items = []
-    for result in state["sections"].get("result", []):
+    results = state["sections"].get("result", [])
+    for result_index, result in enumerate(results):
         if result.get("status") not in {"blocked", "inconclusive"}:
             continue
         result_id = str(result.get("id") or "")
         decisions = _entries_referencing(state, "decision", result_id)
+        related_ids = _entry_related_ids(result)
+        linked_hypotheses = {
+            item for item in related_ids
+            if re.fullmatch(r"hyp-\d{3,}", item)
+        }
+        linked_experiments = {
+            item for item in related_ids
+            if re.fullmatch(r"exp-\d{3,}", item)
+        }
         has_mutation = any(
             item.startswith("mut-")
-            for item in _entry_related_ids(result)
+            for item in related_ids
         )
         if decisions or has_mutation:
+            continue
+        # A blocked setup/run is no longer actionable after its owning
+        # hypothesis or experiment reached a terminal outcome. Generic
+        # campaign lineage must not keep obsolete repair work alive.
+        terminal_owner = any(
+            str(entry.get("id") or "") in linked_hypotheses
+            and str(entry.get("status") or "") in {
+                "validated",
+                "rejected",
+                "superseded",
+            }
+            for entry in state["sections"].get("hypothesis", [])
+        ) or any(
+            str(entry.get("id") or "") in linked_experiments
+            and str(entry.get("status") or "") in {
+                "validated",
+                "rejected",
+                "superseded",
+            }
+            for entry in state["sections"].get("experiment", [])
+        )
+        if terminal_owner:
+            continue
+        # Results are append-only campaign observations. A later successful
+        # objective-capable result for the same experiment supersedes an older
+        # compile/setup/revert blocker even when no explicit decision was
+        # recorded against the old result id.
+        result_created = str(result.get("created_at") or "")
+        superseded_by_newer_result = False
+        for sibling_index, sibling in enumerate(results):
+            if sibling is result:
+                continue
+            if not linked_experiments.intersection(_entry_related_ids(sibling)):
+                continue
+            sibling_created = str(sibling.get("created_at") or "")
+            if result_created and sibling_created:
+                if sibling_created <= result_created:
+                    continue
+            elif sibling_index <= result_index:
+                continue
+            classification = sibling.get("run_classification") or {}
+            if (
+                str(sibling.get("status") or "") == "validated"
+                or bool(classification.get("satisfies_experiment_run"))
+            ):
+                superseded_by_newer_result = True
+                break
+        if superseded_by_newer_result:
             continue
         evidence = _entry_evidence(result)
         failure_diagnosis = None
@@ -961,7 +1019,7 @@ async def _progress_blocked_results(
         items.append({
             **_entry_summary(result, section="result"),
             "evidence": evidence,
-            "related_ids": _entry_related_ids(result),
+            "related_ids": related_ids,
             "failure_diagnosis": failure_diagnosis,
             "suggested_action": suggested_action,
         })

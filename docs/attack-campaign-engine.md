@@ -44,6 +44,15 @@ Responsibilities:
   maps, folds unique planning signals into the branch queue, and returns one
   authoritative `next_action`. A branch changes course only through an explicit
   `action=advance`, `action=decision`, mutation, or state-backed transition.
+  Branch lifecycle ownership is typed: `status_targets` names the exact
+  hypothesis/experiment records a decision may update, while `related_ids` is
+  provenance only and grants no write authority. Coverage and mapping decisions
+  therefore cannot reject a hypothesis merely because it was carried as
+  contextual lineage. Validated result lineage is monotonic; if stale persisted
+  state says a directly linked hypothesis/experiment is rejected, blocked,
+  inconclusive, or superseded, sync restores its validated status, preserves the
+  conflicting history under controller integrity telemetry, and routes the
+  evidence to review.
 - **State**: `read_campaign`, `update_campaign`, and `build_campaign_brief`
   preserve the protocol model, value flows, assumptions, structured hypotheses,
   results, decisions, and process gaps. The brief is an exact compact projection
@@ -275,17 +284,25 @@ next tool) with a single artifact read instead of re-deriving it.
 
 This contract exists to avoid context bloat. Broad Instascope-style workspaces
 can contain many copied profiles, dependency trees, generated tests, prior
-findings, and stale PoCs. `inspect_scope` persists every parsed Foundry profile;
-lexical/name signals order attention but never remove bland, infrastructure,
-proxy, provider, registry, or other parsed first-party profiles from scope. The
-mapping tools use that complete ranked manifest for broad scans. Large retained
-scope is processed as bounded cumulative batches for `/audit` or `/audit/src`,
-prune common third-party Solidity dependency trees from returned action
-surfaces, and store live code probes as code presence, byte length, and short
-hashes instead of raw bytecode. When a ranked or explicitly selected profile
-root stores the protocol implementation under its own nested `lib` directory,
-the mapping tools include those in-scope Solidity files while still pruning
-top-level dependency trees, generated tests, and common third-party packages.
+findings, and stale PoCs. `inspect_scope` persists every parsed Foundry profile
+and also consumes generic `_manifest.json` / `scope.json` deployment inventory
+when present. Inventory profiles retain chain, address, proxy/implementation,
+source-directory, role/tier, and source-hash metadata. Identical `sourceHash`
+bundles share one canonical mapping root while every deployed instance remains
+a separate live profile; source deduplication never collapses deployment state
+or economics. Lexical/name signals order attention but never remove bland,
+infrastructure, proxy, provider, registry, or other parsed first-party profiles
+from scope. The mapping tools use that complete ranked manifest for broad scans.
+Large retained scope is processed as bounded cumulative batches for `/audit`,
+`/audit/src`, or a fallback source root even when no manifest exists. Dependency
+definitions inside a retained profile root remain available for inheritance and
+source-identity classification, but interfaces, libraries, and non-executable
+third-party dependencies are excluded from controller coverage. Live probes
+store code presence, byte length, and short hashes instead of raw bytecode. When
+a ranked or explicitly selected profile root stores the protocol implementation
+under its own nested `lib` directory, the mapping tools include those in-scope
+Solidity files while still pruning generated tests and unrelated top-level
+dependency trees.
 `max_roots` and `max_files` limit one batch/page, not scope membership:
 artifacts preserve a stable series id, exact profile and within-root file
 cursors, a source-inventory fingerprint, the prior cumulative snapshot,
@@ -506,8 +523,9 @@ should add size limits, compression, or skip metadata for large raw artifacts.
 The implementation currently supports:
 
 - Scope inspection with Foundry profile ranking, source-root hints, deployed
-  address extraction, generated-artifact warnings, and dependency pruning for
-  broad workspaces.
+  address extraction, generic `_manifest.json` / `scope.json` inventory,
+  source-hash family normalization, generated-artifact warnings, and dependency
+  classification for broad workspaces.
 - Source, action-space, live-reachability, live-inventory, and attack-graph
   mapping. These maps distinguish deployed entrypoints from imported
   interfaces, flattened dependencies, sibling source artifacts, privileged
@@ -821,9 +839,15 @@ The implementation currently supports:
   definitions split across current action-space artifacts; only structured
   lineage can close one of those definitions. The controller surfaces a bounded
   set of gaps per sync, preserves parked definitions durably, and advances to
-  later batches rather than reporting readiness after only the first batch. A
-  default branch decision closes only its exact definition. Wider `action_family`,
-  `clone_family`, or `target` propagation must be selected explicitly;
+  later batches rather than reporting readiness after only the first batch.
+  Source-identical definitions carrying the same retained source hash are one
+  source-coverage obligation: the branch carries every exact coverage key in
+  that family, so reviewing or deciding the canonical definition closes copied
+  verified-source instances without weakening exact identity for different
+  implementations. Interfaces, libraries, and dependency-only definitions
+  remain map context but do not become ordinary coverage or curiosity branches.
+  Wider `action_family`, `clone_family`, or `target` propagation beyond that
+  deterministic source family must be selected explicitly;
   `target` additionally requires an objective inventory/binding hard blocker,
   and decision prose never widens scope.
 - Source review before harness work when live context is empty. After
@@ -1138,7 +1162,10 @@ The implementation currently supports:
   unknown, or architecture-incompatible."
 - Run capture treats successful `forge test` invocations that execute no tests
   as blocked results. They remain useful setup evidence, but they do not satisfy
-  experiment execution or create objective-evidence branches.
+  experiment execution or create objective-evidence branches. Blocked-result
+  progress is lineage- and chronology-aware: an older blocker is not resurfaced
+  after its owning hypothesis/experiment is terminal or a newer
+  objective-capable run succeeds for the same experiment.
 - Snapshot, comparison, objective-evaluation, trace-summary, evidence-review,
   and report-review artifacts. Snapshot comparisons preserve related campaign
   ids and include exact-key objective suggestions so objective evaluation can
@@ -1146,8 +1173,14 @@ The implementation currently supports:
   `objective_achieved` only when every nonempty objective passes; new
   evaluations inherit the comparison lineage. Legacy artifacts without that
   flag are accepted only when their complete summary, objective, match, and
-  comparison fields independently derive the same passing status. Evidence
-  review accepts source
+  comparison fields independently derive the same passing status. Evidence from
+  a runnable experiment plus a passing objective evaluation, or an explicitly
+  validated result, creates a strict
+  `validated_result_without_finding_review` controller branch until a finding
+  review consumes that lineage. Multiple scaling results under the same
+  hypothesis are grouped into one review obligation, which preempts mapping and
+  exploratory coverage. A passing synthetic/manual comparison without a
+  runnable result does not enter this tier. Evidence review accepts source
   evidence references such as
   `/audit/src/Vault.sol:42`, can infer affected code only from target source
   roots, and does not treat generated experiment PoCs as affected source. A

@@ -434,6 +434,25 @@ Suite result: ok. 1 passed; 0 failed; 0 skipped
         self.assertEqual(evaluation["summary"]["passed"], 1)
         self.assertEqual(evaluation["objectives"][0]["matches"][0]["delta"], "1.5")
 
+        review_routing = _json_result(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
+        self.assertEqual(
+            review_routing["next_action"]["source"],
+            "validated_result_without_finding_review",
+        )
+        self.assertEqual(
+            review_routing["next_action"]["status"],
+            "needs_finding_review",
+        )
+        self.assertEqual(
+            review_routing["next_action"]["tool"],
+            "review_finding_evidence",
+        )
+        self.assertIn("eval-001", review_routing["next_action"]["source_ids"])
+        self.assertIn("res-002", review_routing["next_action"]["related_ids"])
+
         review = _json_result(await _review_finding_evidence(container, {
             "title": "Donation accounting lets attacker redeem more assets than deposited",
             "severity": "high",
