@@ -670,6 +670,81 @@ src = "src/TransparentUpgradeableProxy_dead"
             0,
         )
 
+    async def test_inspect_scope_ingests_generic_inventory_and_source_families(self):
+        container = FakeContainer()
+        first_root = "/audit/contracts/ethereum/Vault_111111"
+        second_root = "/audit/contracts/ethereum/Vault_222222"
+        container.files[f"{first_root}/Vault.sol"] = (
+            "pragma solidity ^0.8.20; contract Vault {}"
+        )
+        container.files[f"{second_root}/Vault.sol"] = (
+            "pragma solidity ^0.8.20; contract Vault {}"
+        )
+        container.files["/audit/_manifest.json"] = json.dumps([
+            {
+                "address": "0x1111111111111111111111111111111111111111",
+                "chainId": 1,
+                "onchain_name": "Vault",
+                "sourceHash": "same-source",
+                "dir": "contracts/ethereum/Vault_111111",
+                "proxy": "0",
+            },
+            {
+                "address": "0x2222222222222222222222222222222222222222",
+                "chainId": 1,
+                "onchain_name": "Vault",
+                "sourceHash": "same-source",
+                "dir": "contracts/ethereum/Vault_222222",
+                "proxy": "0",
+            },
+        ])
+        container.files["/audit/scope.json"] = json.dumps({
+            "assets": [{
+                "address": "0x1111111111111111111111111111111111111111",
+                "chainId": 1,
+                "kind": "address",
+                "label": "PRIMARY_VAULT",
+                "onchain_name": "Vault",
+            }],
+        })
+        container.exec_results = [
+            (0, ""),  # /audit/src existence probe; fake output stays empty
+            (
+                0,
+                f"{first_root}/Vault.sol\n{second_root}/Vault.sol\n",
+            ),
+            (0, ""),  # artifact dirs
+            (0, ""),  # deployment file scan
+        ]
+
+        result = json.loads(await _inspect_scope(container, {}))
+
+        self.assertEqual(result["foundry_profiles"], 0)
+        self.assertEqual(result["inventory_profiles"], 2)
+        self.assertEqual(result["source_families"], 1)
+        self.assertEqual(len(result["ranked_profiles"]), 2)
+        self.assertEqual(
+            {item["address"] for item in result["ranked_profiles"]},
+            {
+                "0x1111111111111111111111111111111111111111",
+                "0x2222222222222222222222222222222222222222",
+            },
+        )
+        self.assertEqual(
+            {item["src"] for item in result["ranked_profiles"]},
+            {first_root},
+        )
+        self.assertEqual(
+            {item["instance_src"] for item in result["ranked_profiles"]},
+            {first_root, second_root},
+        )
+        self.assertEqual(result["chain_registry"]["chain_count"], 1)
+        registry = json.loads(
+            container.files["/workspace/campaign/chain-registry/registry.json"]
+        )
+        self.assertEqual(registry["chains"][0]["chain_id"], 1)
+        self.assertEqual(len(registry["chains"][0]["deployments"]), 2)
+
     async def test_search_code_defaults_to_source_root_and_excludes_artifacts(self):
         container = FakeContainer()
         container.exec_results = [
@@ -1037,7 +1112,11 @@ class ScopeBatchingTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
             action_space = json.loads(await _map_action_space(container, {}))
 
-        self.assertIsNone(action_space["scope_batch"])
+        self.assertFalse(action_space["scope_batch"]["has_more"])
+        self.assertEqual(
+            action_space["scope_batch"]["scope_source"],
+            "fallback_source_roots",
+        )
         search = json.loads(await _attack_search(container, {"action": "sync"}))
         current = json.loads(
             container.files["/workspace/campaign/attack-search/current.json"]
@@ -1048,6 +1127,34 @@ class ScopeBatchingTests(unittest.IsolatedAsyncioTestCase):
             for branch in current["branches"]
         ))
         self.assertNotEqual(search["next_action"]["tool"], "map_action_space")
+
+    async def test_no_manifest_file_limit_requires_controller_continuation(self):
+        container = FakeContainer()
+        await _record_test_foundation(container)
+        paths = ["/audit/src/A.sol", "/audit/src/B.sol"]
+        for name, path in zip(("A", "B"), paths, strict=True):
+            container.files[path] = (
+                "pragma solidity ^0.8.20; "
+                f"contract {name} {{ function run() external {{}} }}"
+            )
+        listing = "\n".join(paths) + "\n"
+        container.exec_results = [
+            (0, ""),  # /audit/src exists
+            (0, listing),
+        ]
+
+        with mock.patch.dict(os.environ, {"REENTBOTPRO_DISABLE_AST_MAP": "1"}):
+            first = json.loads(await _map_action_space(container, {
+                "max_files": 1,
+            }))
+
+        self.assertTrue(first["scope_batch"]["has_more"])
+        self.assertEqual(first["source"]["files_truncated_by_limit"], 1)
+        search = json.loads(await _attack_search(container, {"action": "sync"}))
+        self.assertEqual(search["next_action"]["source"], "incomplete_scope_batch")
+        continuation = search["next_action"]["required_args"]["map_action_space"]
+        self.assertEqual(continuation["source_file_cursor"], 1)
+        self.assertEqual(continuation["previous_action_space"], first["path"])
 
 
 class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
@@ -1567,6 +1674,397 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["sections"]["decision"][0]["id"], "dec-001")
         self.assertIn("No value flow exists", state["sections"]["decision"][0]["content"])
 
+    async def test_coverage_decision_does_not_mutate_contextual_hypothesis(self):
+        container = FakeContainer()
+        for section, title in (
+            ("protocol_model", "Protocol model"),
+            ("value_flow", "Value flow"),
+            ("invariant", "Invariant"),
+            ("hypothesis", "Validated candidate context"),
+        ):
+            await _update_campaign(container, {
+                "section": section,
+                "title": title,
+                "content": f"{title} with concrete source references.",
+            })
+        action_space_path = "/workspace/campaign/action-spaces/as-001.json"
+        container.files[action_space_path] = json.dumps({
+            "id": "as-001",
+            "actions": [{
+                "contract": "Vault",
+                "contract_kind": "contract",
+                "function": "withdraw",
+                "signature": "withdraw(uint256)",
+                "file": "/audit/src/Vault.sol",
+                "line": 20,
+                "mutability": "nonpayable",
+                "affordances": ["value_out_or_burn"],
+            }],
+            "observations": [],
+        })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Action space",
+            "content": "Mapped action space.",
+            "evidence": [action_space_path],
+        })
+
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
+        branch = next(
+            item for item in search["active_branches"]
+            if item["source"] == "coverage_high_attention_gap"
+        )
+        self.assertEqual(branch.get("status_targets", []), [])
+
+        await _attack_search(container, {
+            "action": "decision",
+            "branch_id": branch["id"],
+            "decision_status": "rejected",
+            "decision": "The withdrawal is correctly bounded by caller shares.",
+            "related_ids": ["hyp-001"],
+            "record_result": False,
+        })
+
+        state = json.loads(container.files[_CAMPAIGN_STATE_PATH])
+        hypothesis = state["sections"]["hypothesis"][0]
+        self.assertEqual(hypothesis["status"], "open")
+        self.assertNotIn("dec-001", hypothesis.get("related_ids", []))
+        decision = state["sections"]["decision"][0]
+        self.assertIn("hyp-001", decision["related_ids"])
+        self.assertEqual(decision["status_targets"], [])
+
+    async def test_owned_hypothesis_decision_updates_only_its_status_target(self):
+        container = FakeContainer()
+        for section, title in (
+            ("protocol_model", "Protocol model"),
+            ("value_flow", "Value flow"),
+            ("invariant", "Invariant"),
+        ):
+            await _update_campaign(container, {
+                "section": section,
+                "title": title,
+                "content": f"{title} with concrete source references.",
+            })
+        await _update_campaign(container, {
+            "section": "hypothesis",
+            "title": "Concrete hypothesis",
+            "content": "A concrete but unproven source hypothesis.",
+            "evidence": ["/audit/src/Vault.sol:20"],
+        })
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
+        branch = next(
+            item for item in search["active_branches"]
+            if item["source"] == "hypothesis_without_experiment"
+        )
+        self.assertEqual(branch["status_targets"], ["hyp-001"])
+
+        await _attack_search(container, {
+            "action": "decision",
+            "branch_id": branch["id"],
+            "decision_status": "rejected",
+            "decision": "Source review falsified the hypothesis.",
+            "related_ids": ["pm-001", "vf-001"],
+            "record_result": False,
+        })
+
+        state = json.loads(container.files[_CAMPAIGN_STATE_PATH])
+        hypothesis = state["sections"]["hypothesis"][0]
+        self.assertEqual(hypothesis["status"], "rejected")
+        self.assertIn("dec-001", hypothesis["related_ids"])
+        self.assertNotIn("pm-001", hypothesis["related_ids"])
+
+    async def test_owned_branch_decision_cannot_downgrade_validated_status(self):
+        container = FakeContainer()
+        for section, title in (
+            ("protocol_model", "Protocol model"),
+            ("value_flow", "Value flow"),
+            ("invariant", "Invariant"),
+        ):
+            await _update_campaign(container, {
+                "section": section,
+                "title": title,
+                "content": f"{title} with concrete source references.",
+            })
+        await _update_campaign(container, {
+            "section": "hypothesis",
+            "title": "Validated hypothesis",
+            "content": "The evidence gate has already validated this branch.",
+            "evidence": ["/audit/src/Vault.sol:20"],
+        })
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
+        branch = next(
+            item for item in search["active_branches"]
+            if item["source"] == "hypothesis_without_experiment"
+        )
+        state = json.loads(container.files[_CAMPAIGN_STATE_PATH])
+        state["sections"]["hypothesis"][0]["status"] = "validated"
+        container.files[_CAMPAIGN_STATE_PATH] = json.dumps(state)
+
+        await _attack_search(container, {
+            "action": "decision",
+            "branch_id": branch["id"],
+            "decision_status": "rejected",
+            "decision": "A stale source-review branch tried to reject validated evidence.",
+            "record_result": False,
+        })
+
+        state = json.loads(container.files[_CAMPAIGN_STATE_PATH])
+        hypothesis = state["sections"]["hypothesis"][0]
+        self.assertEqual(hypothesis["status"], "validated")
+        conflicts = state["attack_search"]["state_conflicts"]
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["artifact_id"], "hyp-001")
+        self.assertEqual(
+            conflicts[0]["reason"],
+            "branch_decision_cannot_downgrade_validated_lineage",
+        )
+
+    async def test_validated_lineage_is_reconciled_and_promoted_to_review(self):
+        container = FakeContainer()
+        for section, title in (
+            ("protocol_model", "Protocol model"),
+            ("value_flow", "Value flow"),
+            ("invariant", "Invariant"),
+        ):
+            await _update_campaign(container, {
+                "section": section,
+                "title": title,
+                "content": f"{title} with concrete source references.",
+            })
+        await _update_campaign(container, {
+            "section": "hypothesis",
+            "title": "Validated drain",
+            "content": "The branch has runnable objective evidence.",
+            "status": "rejected",
+        })
+        await _update_campaign(container, {
+            "section": "experiment",
+            "title": "Drain replay",
+            "content": "Run the deployed-state drain replay.",
+            "status": "blocked",
+            "related_ids": ["hyp-001"],
+        })
+        for index in (1, 2):
+            log_path = f"/workspace/campaign/results/validated-{index}.log"
+            container.files[log_path] = "Suite result: ok. 1 passed; 0 failed\n"
+            await _update_campaign(container, {
+                "section": "result",
+                "title": f"Validated scaling result {index}",
+                "content": "Measured attacker profit and protocol loss.",
+                "status": "validated",
+                "priority": "critical",
+                "related_ids": ["hyp-001", "exp-001"],
+                "evidence": [log_path],
+            })
+
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
+
+        self.assertEqual(
+            search["next_action"]["source"],
+            "validated_result_without_finding_review",
+        )
+        self.assertEqual(search["next_action"]["status"], "needs_finding_review")
+        self.assertEqual(
+            set(search["next_action"]["source_ids"]),
+            {"res-001", "res-002"},
+        )
+        review_branches = [
+            item for item in search["active_branches"]
+            if item["source"] == "validated_result_without_finding_review"
+        ]
+        self.assertEqual(len(review_branches), 1)
+        self.assertEqual(search["summary"]["state_conflicts"], 2)
+        state = json.loads(container.files[_CAMPAIGN_STATE_PATH])
+        self.assertEqual(state["sections"]["hypothesis"][0]["status"], "validated")
+        self.assertEqual(state["sections"]["experiment"][0]["status"], "validated")
+        self.assertEqual(len(state["attack_search"]["state_conflicts"]), 2)
+
+    async def test_validated_review_preempts_pinned_exploratory_branch(self):
+        container = FakeContainer()
+        for section, title in (
+            ("protocol_model", "Protocol model"),
+            ("value_flow", "Value flow"),
+            ("invariant", "Invariant"),
+        ):
+            await _update_campaign(container, {
+                "section": section,
+                "title": title,
+                "content": f"{title} with concrete source references.",
+            })
+        action_space_path = "/workspace/campaign/action-spaces/as-001.json"
+        container.files[action_space_path] = json.dumps({
+            "id": "as-001",
+            "actions": [{
+                "contract": "Vault",
+                "contract_kind": "contract",
+                "function": "withdraw",
+                "signature": "withdraw(uint256)",
+                "file": "/audit/src/Vault.sol",
+                "line": 20,
+                "mutability": "nonpayable",
+                "affordances": ["value_out_or_burn"],
+            }],
+            "observations": [],
+        })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Action space",
+            "content": "Mapped action space.",
+            "evidence": [action_space_path],
+        })
+        exploratory = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
+        exploratory_branch_id = exploratory["next_action"]["branch_id"]
+        self.assertEqual(
+            exploratory["next_action"]["source"],
+            "coverage_high_attention_gap",
+        )
+
+        await _update_campaign(container, {
+            "section": "hypothesis",
+            "title": "Validated drain",
+            "content": "A runnable replay proves loss.",
+        })
+        await _update_campaign(container, {
+            "section": "experiment",
+            "title": "Drain replay",
+            "content": "Run the fork replay.",
+            "related_ids": ["hyp-001"],
+        })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Validated replay",
+            "content": "The replay measured attacker profit and protocol loss.",
+            "status": "validated",
+            "priority": "critical",
+            "related_ids": ["hyp-001", "exp-001"],
+            "evidence": ["/workspace/campaign/results/validated.log"],
+        })
+
+        strict = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
+
+        self.assertEqual(
+            strict["next_action"]["source"],
+            "validated_result_without_finding_review",
+        )
+        self.assertNotEqual(strict["next_action"]["branch_id"], exploratory_branch_id)
+        pinned_exploratory = next(
+            item for item in strict["active_branches"]
+            if item["id"] == exploratory_branch_id
+        )
+        self.assertFalse(pinned_exploratory.get("selected", False))
+
+    async def test_newer_successful_result_suppresses_stale_blocked_result(self):
+        container = FakeContainer()
+        for section, title in (
+            ("protocol_model", "Protocol model"),
+            ("value_flow", "Value flow"),
+            ("invariant", "Invariant"),
+            ("hypothesis", "Open candidate"),
+        ):
+            await _update_campaign(container, {
+                "section": section,
+                "title": title,
+                "content": f"{title} with concrete source references.",
+            })
+        await _update_campaign(container, {
+            "section": "experiment",
+            "title": "Fork replay",
+            "content": "Run the candidate replay.",
+            "related_ids": ["hyp-001"],
+        })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Initial setup failure",
+            "content": "The first run failed during setup.",
+            "status": "blocked",
+            "related_ids": ["hyp-001", "exp-001"],
+        })
+        await _update_campaign(container, {
+            "section": "result",
+            "title": "Successful rerun",
+            "content": "The repaired experiment executed its test.",
+            "status": "observed",
+            "related_ids": ["hyp-001", "exp-001"],
+        })
+        state = json.loads(container.files[_CAMPAIGN_STATE_PATH])
+        state["sections"]["result"][1]["run_classification"] = {
+            "satisfies_experiment_run": True,
+            "requires_objective_reduction": False,
+        }
+        container.files[_CAMPAIGN_STATE_PATH] = json.dumps(state)
+
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
+
+        self.assertFalse([
+            item for item in search["active_branches"]
+            if item["source"] == "blocked_result"
+        ])
+
+    async def test_passing_objective_without_runnable_result_does_not_force_review(self):
+        container = FakeContainer()
+        for section, title in (
+            ("protocol_model", "Protocol model"),
+            ("value_flow", "Value flow"),
+            ("invariant", "Invariant"),
+            ("hypothesis", "Synthetic comparison candidate"),
+        ):
+            await _update_campaign(container, {
+                "section": section,
+                "title": title,
+                "content": f"{title} with concrete source references.",
+            })
+        comparison_path = "/workspace/campaign/comparisons/cmp-001.json"
+        container.files[comparison_path] = json.dumps({
+            "id": "cmp-001",
+            "changed": [{
+                "key": "attacker balance",
+                "before": "0",
+                "after": "1",
+                "delta": 1,
+            }],
+            "related_ids": ["hyp-001"],
+        })
+        await _evaluate_objective(container, {
+            "comparison": "cmp-001",
+            "objectives": [{
+                "label": "synthetic increase",
+                "match": "attacker balance",
+                "direction": "increase",
+            }],
+            "related_ids": ["hyp-001", "cmp-001"],
+        })
+
+        search = json.loads(await _attack_search(container, {
+            "action": "sync",
+            "record_result": False,
+        }))
+
+        self.assertFalse([
+            item for item in search["active_branches"]
+            if item["source"] == "validated_result_without_finding_review"
+        ])
+
     async def test_attack_search_decision_parks_branch_as_harness_limited(self):
         # A harness-limit park is terminal-ish for this pass but must never be
         # summarized as a rejection: it preserves a plausible-but-hard branch.
@@ -1796,6 +2294,142 @@ class CampaignToolTests(unittest.IsolatedAsyncioTestCase):
             path.startswith("/workspace/campaign/coverage-reviews/")
             for path in container.files
         ))
+
+    async def test_coverage_filters_interfaces_and_keeps_executable_inherited_base(self):
+        container = FakeContainer()
+        root = "/audit/contracts/Vault_family"
+        container.files["/workspace/campaign/scope-manifest.json"] = json.dumps({
+            "ranked_profiles": [{
+                "profile": "inventory_Vault_111111",
+                "contract": "Vault",
+                "address": "0x1111111111111111111111111111111111111111",
+                "src": root,
+                "source_hash": "vault-source",
+            }],
+        })
+        action_space = {
+            "id": "as-001",
+            "contracts": [
+                {
+                    "name": "Vault",
+                    "kind": "contract",
+                    "bases": ["ERC4626"],
+                    "file": f"{root}/Vault.sol",
+                },
+                {
+                    "name": "ERC4626",
+                    "kind": "contract",
+                    "bases": [],
+                    "file": f"{root}/@openzeppelin/ERC4626.sol",
+                },
+                {
+                    "name": "IERC1363",
+                    "kind": "interface",
+                    "bases": [],
+                    "file": f"{root}/@openzeppelin/IERC1363.sol",
+                },
+            ],
+            "actions": [
+                {
+                    "contract": "ERC4626",
+                    "contract_kind": "contract",
+                    "function": "withdraw",
+                    "signature": "withdraw(uint256,address,address)",
+                    "file": f"{root}/@openzeppelin/ERC4626.sol",
+                    "line": 40,
+                    "mutability": "nonpayable",
+                    "affordances": ["value_out_or_burn"],
+                },
+                {
+                    "contract": "IERC1363",
+                    "contract_kind": "interface",
+                    "function": "transferFromAndCall",
+                    "signature": "transferFromAndCall(address,address,uint256)",
+                    "file": f"{root}/@openzeppelin/IERC1363.sol",
+                    "line": 10,
+                    "mutability": "nonpayable",
+                    "affordances": ["value_in_or_mint", "generic_execution"],
+                },
+            ],
+            "observations": [],
+        }
+        state = await _load_campaign_state(container)
+
+        gaps = await _derive_attack_surface_gaps(container, state, action_space)
+
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["contract"], "ERC4626")
+        self.assertEqual(gaps[0]["source_role"], "inherited_executable")
+        self.assertEqual(len(gaps[0]["clone_family_keys"]), 1)
+        self.assertTrue(
+            gaps[0]["clone_family_keys"][0].startswith(
+                "coverage-source:vault-source:"
+            )
+        )
+        self.assertIn("withdraw", gaps[0]["clone_family_keys"][0])
+
+    async def test_coverage_collapses_identical_source_hash_definitions(self):
+        container = FakeContainer()
+        first_root = "/audit/contracts/Vault_A"
+        second_root = "/audit/contracts/Vault_B"
+        container.files["/workspace/campaign/scope-manifest.json"] = json.dumps({
+            "ranked_profiles": [
+                {
+                    "profile": "vault-a",
+                    "contract": "Vault",
+                    "address": "0x1111111111111111111111111111111111111111",
+                    "src": first_root,
+                    "source_hash": "identical-vault",
+                },
+                {
+                    "profile": "vault-b",
+                    "contract": "Vault",
+                    "address": "0x2222222222222222222222222222222222222222",
+                    "src": second_root,
+                    "source_hash": "identical-vault",
+                },
+            ],
+        })
+        actions = [
+            {
+                "contract": "Vault",
+                "contract_kind": "contract",
+                "function": "withdraw",
+                "signature": "withdraw(uint256)",
+                "file": f"{root}/Vault.sol",
+                "line": 20,
+                "mutability": "nonpayable",
+                "affordances": ["value_out_or_burn"],
+            }
+            for root in (first_root, second_root)
+        ]
+        action_space = {
+            "id": "as-001",
+            "contracts": [
+                {
+                    "name": "Vault",
+                    "kind": "contract",
+                    "bases": [],
+                    "file": action["file"],
+                }
+                for action in actions
+            ],
+            "actions": actions,
+            "observations": [],
+        }
+        state = await _load_campaign_state(container)
+
+        gaps = await _derive_attack_surface_gaps(container, state, action_space)
+
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["equivalent_definitions"], 2)
+        self.assertEqual(len(gaps[0]["coverage_keys"]), 2)
+
+        state.setdefault("attack_search", {})["decided_coverage_keys"] = [
+            gaps[0]["coverage_keys"][0]
+        ]
+        closed = await _derive_attack_surface_gaps(container, state, action_space)
+        self.assertEqual(closed, [])
 
     async def test_attack_search_source_reviews_coverage_gap_after_empty_live_map(self):
         container = FakeContainer()
